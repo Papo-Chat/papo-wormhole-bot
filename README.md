@@ -61,10 +61,10 @@ para o shortcode `:nome:` literal.
 
 ```
 /help                instruções
-/link-channel        papo_channel:<uuid>  discord_channel:#canal
+/link-channel        papo_channel:<nome ou uuid>  discord_channel:#canal
 /unlink-channel      discord_channel:#canal
-/link-server         papo_server:<uuid>
-/link-user           papo_user:<uuid>  discord_user:@alguém
+/link-server         papo_server:<nome ou uuid>
+/link-user           papo_user:<nome ou uuid>  discord_user:@alguém
 /unlink-user         discord_user:@alguém
 /bridges             lista os canal-links e flags
 /bridge-config       mode, attachments, embeds, reactions, edits, deletes, pins, mentions
@@ -73,6 +73,11 @@ para o shortcode `:nome:` literal.
 /retry               re-enfileira itens falhos (com dead=true, também os mortos)
 /online              quem está online na plataforma inversa
 ```
+
+Em `papo_channel`, `papo_server` e `papo_user` serve o nome (`#geral`, `Cyber Asilo`, `@jonas`) ou o
+uuid: o bot resolve o nome contra `GET /channels`, `GET /server` e `GET /users` (ignorando caixa,
+`#`/`@` e aceitando substring única). Nome que casa com mais de um item é recusado com a lista de
+candidatos — nesse caso o uuid resolve.
 
 Fluxo mínimo: `/link-channel` → pronto. O resto é ajuste.
 
@@ -100,14 +105,15 @@ Papo REST/WS ──► Bridge (tradução, chunking, embeds) ──► SQLite ou
   `deferred_events` e é enfileirada junto do envio que cria o mapeamento.
 - **Mídia**: cache content-addressable (sha256) em `WORMHOLE_DATA_DIR/media`. O Discord exige
   URL absoluta para `author.icon_url`, então o avatar do autor Papo é servido pelo media
-  server embutido (`WORMHOLE_MEDIA_BASE_URL`).
+  server embutido (`WORMHOLE_MEDIA_BASE_URL`); sem ele o avatar é enviado como anexo da
+  mensagem e o embed referencia `attachment://avatar-<sha256>.<ext>`.
 
 ## Mapeamento de identidade
 
 | Lado | Como a autoria aparece |
 | --- | --- |
-| Discord | embed author: `nickname > username` do Papo + avatar (via media server) + rodapé com data |
-| Papo | embed author: `displayName` do Discord + avatar na thumbnail + rodapé com data |
+| Discord | embed author: `nickname > username` do Papo + avatar (media server ou anexo `attachment://`) + rodapé com data |
+| Papo | embed author: `displayName` do Discord no topo do card + avatar do Discord no selo do topo (`author_media`) + rodapé com data |
 
 `/link-user` liga as duas identidades para que menções possam ser propagadas.
 
@@ -147,7 +153,35 @@ docker run --env-file .env -v "$PWD/data:/app/data" -p 8787:8787 papo-wormhole
 ```
 
 Se você expor o media server, publique-o atrás de HTTPS e defina `WORMHOLE_MEDIA_BASE_URL`
-com a URL pública — sem isso o Discord não mostra o avatar do autor do lado Papo.
+com a URL pública: é a forma mais limpa de o Discord mostrar o avatar do autor do lado Papo.
+Sem essa variável o bot envia o avatar como anexo da mensagem (`attachment://avatar-<sha>.png`),
+que também funciona, mas ocupa um dos dez anexos da mensagem.
+
+### systemd
+
+`scripts/deploy.sh` faz o ciclo completo: `git pull` → `npm install` → `npm run build` →
+instala o unit, habilita e sobe o serviço.
+
+```bash
+scripts/deploy.sh              # serviço de usuário + linger (sobe no boot, sem login, sem sudo)
+scripts/deploy.sh --system     # serviço de sistema em /etc/systemd/system (pede sudo)
+scripts/deploy.sh --test       # roda a suíte de testes antes de subir
+scripts/deploy.sh --no-service # só atualiza o código
+```
+
+O unit gerado (`~/.config/systemd/user/papo-wormhole.service`, ou `/etc/systemd/system/…` com
+`--system`) roda `node dist/index.js` com `WorkingDirectory` no repositório — o `.env` é lido
+de lá — e `Restart=always`. Logs e controle:
+
+```bash
+journalctl --user -u papo-wormhole -f        # --user cai com --system
+systemctl --user status|restart|stop papo-wormhole
+systemctl --user disable --now papo-wormhole       # remover o serviço
+rm ~/.config/systemd/user/papo-wormhole.service && systemctl --user daemon-reload
+```
+
+O `git pull` é `--ff-only`: com alterações locais não commitadas ele para em vez de sobrescrever
+trabalho (commite ou `git stash` antes).
 
 ## Limites e escolhas documentadas
 
@@ -168,6 +202,10 @@ com a URL pública — sem isso o Discord não mostra o avatar do autor do lado 
   em vez de descartá-la.
 - As chamadas ao Papo passam por um token bucket (`PAPO_RATE_LIMIT_RPS=8`, `PAPO_RATE_BURST=12`)
   porque o limite do backend é por IP e vale para todas as rotas.
+- Servidor Papo privado (`GET /server` → `"public": false`): o backend recusa `POST /auth/login`
+  com 401 `server-access-required` sem o token temporário (30 min) que `POST /auth/login_server`
+  coloca no cookie `Auth`. Configure `PAPO_SERVER_PASSWORD` — é a senha do servidor, não a senha da
+  conta do bot. `npm run check-auth` confirma o fluxo de sessão antes de subir.
 - Threads do Discord não são bridgeadas na v1.
 
 Detalhes completos do design (incluindo o algoritmo de chunking e o esquema SQLite) estão em

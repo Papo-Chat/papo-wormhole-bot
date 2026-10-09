@@ -166,6 +166,25 @@ export class Store {
 	}
 
 	// ── channel links ──────────────────────────────────────
+	/**
+	 * Ponto de partida do fluxo Papo → Discord de um canal: o instante em que o link
+	 * foi criado. Histórico anterior ao link nunca é reenviado; `backfill` de restart
+	 * só recupera o que ficou para trás depois desse ponto.
+	 */
+	getPapoCursor(linkId: number): string | undefined {
+		return this.getMeta(`papo_cursor:${linkId}`);
+	}
+	setPapoCursor(linkId: number, value: string): void {
+		this.setMeta(`papo_cursor:${linkId}`, value);
+	}
+	/** Semeia o cursor (não sobrescreve) e devolve o valor vigente. */
+	seedPapoCursor(linkId: number, at: Date = new Date()): string {
+		this.db
+			.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
+			.run(`papo_cursor:${linkId}`, at.toISOString());
+		return this.getPapoCursor(linkId)!;
+	}
+
 	upsertChannelLink(l: {
 		papo_channel_id: string;
 		discord_channel_id: string;
@@ -173,6 +192,7 @@ export class Store {
 		identity?: IdentityMode;
 		color?: string | null;
 	}): ChannelLink {
+		const isNew = !this.getChannelLinkByPapo(l.papo_channel_id);
 		this.db
 			.prepare(
 				`INSERT INTO channel_links (papo_channel_id, discord_channel_id, mode, identity, color)
@@ -190,7 +210,9 @@ export class Store {
 				l.identity ?? 'embed',
 				l.color ?? null
 			);
-		return this.getChannelLinkByPapo(l.papo_channel_id)!;
+		const link = this.getChannelLinkByPapo(l.papo_channel_id)!;
+		if (isNew) this.seedPapoCursor(link.id);
+		return link;
 	}
 	getChannelLinkByPapo(papoChannelId: string): ChannelLink | undefined {
 		return rows<ChannelLink>(
@@ -206,7 +228,10 @@ export class Store {
 		)[0];
 	}
 	removeChannelLink(discordChannelId: string): boolean {
-		return this.db.prepare('DELETE FROM channel_links WHERE discord_channel_id = ?').run(discordChannelId).changes > 0;
+		const link = this.getChannelLinkByDiscord(discordChannelId);
+		const removed = this.db.prepare('DELETE FROM channel_links WHERE discord_channel_id = ?').run(discordChannelId).changes > 0;
+		if (link) this.db.prepare('DELETE FROM meta WHERE key = ?').run(`papo_cursor:${link.id}`);
+		return removed;
 	}
 	listChannelLinks(): ChannelLink[] {
 		return rows<ChannelLink>(this.db.prepare('SELECT * FROM channel_links ORDER BY created_at').all());

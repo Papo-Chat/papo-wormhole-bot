@@ -4,6 +4,7 @@ import {
 	Partials,
 	TextChannel,
 	type APIEmbed,
+	type APIEmoji,
 	type Guild,
 	type Message,
 	type MessageCreateOptions,
@@ -77,6 +78,12 @@ export const buildSendPayload = (
 export class DiscordBridge {
 	readonly client: Client;
 	private readonly log: Logger;
+	/**
+	 * IDs de emoji do guild que o Discord marca como `available: false`. O gateway mantém
+	 * esses emojis no cache, mas reação com eles responde 10014 Unknown Emoji — o discord.js
+	 * não expõe a flag, então ela é lida da rota REST de emojis do guild.
+	 */
+	private unavailableEmojis = new Map<string, Set<string>>();
 
 	constructor(
 		private opts: { token: string; handlers: DiscordHandlers; logger?: Logger; presences?: boolean },
@@ -178,10 +185,19 @@ export class DiscordBridge {
 		return channel.messages.fetch(messageId).catch(() => undefined);
 	}
 
-	async edit(channelId: string, messageId: string, options: { content?: string; embeds?: APIEmbed[] }): Promise<void> {
+	async edit(
+		channelId: string,
+		messageId: string,
+		options: { content?: string; embeds?: APIEmbed[]; files?: { name: string; buffer: Buffer }[] }
+	): Promise<void> {
 		const message = await this.fetchMessage(channelId, messageId);
 		if (!message) return;
-		await message.edit(options);
+		await message.edit({
+			...(options.content !== undefined ? { content: options.content } : {}),
+			...(options.embeds ? { embeds: options.embeds } : {}),
+			// embed que referencia `attachment://` precisa do arquivo reenviado no edit
+			...(options.files?.length ? { files: options.files.map((f) => ({ attachment: f.buffer, name: f.name })) } : {})
+		});
 	}
 
 	async delete(channelId: string, messageId: string): Promise<void> {
@@ -225,13 +241,35 @@ export class DiscordBridge {
 		return this.client.guilds.cache.size > 0;
 	}
 
-	/** Emoji do guild por nome (usado na conversão Papo → Discord). */
+	/** Emoji do guild por nome (usado na conversão Papo → Discord), ignorando os indisponíveis. */
 	findGuildEmoji(name: string): { id: string; name: string; animated: boolean } | undefined {
 		for (const guild of this.client.guilds.cache.values()) {
-			const emoji = guild.emojis.cache.find((e) => e.name === name);
+			const blocked = this.unavailableEmojis.get(guild.id);
+			const emoji = guild.emojis.cache.find((e) => e.name === name && !(blocked?.has(e.id) ?? false));
 			if (emoji) return { id: emoji.id, name: emoji.name ?? name, animated: Boolean(emoji.animated) };
 		}
 		return undefined;
+	}
+
+	/**
+	 * Recarrega de cada guild acessível a lista de emojis indisponíveis (apagados por
+	 * moderação pelo Discord). Retorna quantos emojis foram bloqueados.
+	 */
+	async loadUnavailableEmojis(): Promise<number> {
+		let total = 0;
+		for (const guild of this.client.guilds.cache.values()) {
+			try {
+				const list = (await this.client.rest.get(`/guilds/${guild.id}/emojis`)) as APIEmoji[];
+				const ids = new Set<string>();
+				for (const e of list) if (e.available === false && e.id) ids.add(e.id);
+				this.unavailableEmojis.set(guild.id, ids);
+				total += ids.size;
+			} catch (err) {
+				this.unavailableEmojis.delete(guild.id);
+				this.log.debug({ err, guildId: guild.id }, 'lista de emojis indisponíveis não carregada');
+			}
+		}
+		return total;
 	}
 
 	channelName(channelId: string): string | undefined {

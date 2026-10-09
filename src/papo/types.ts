@@ -85,7 +85,7 @@ export interface PapoEmbedInput {
 	url?: string;
 	color?: string;
 	site_name?: string;
-	author?: { name?: string; url?: string };
+	author?: { name?: string; url?: string; icon_url?: string };
 	footer?: { text?: string };
 	thumbnail?: { url: string; mime_type?: string };
 	image?: { url: string; mime_type?: string };

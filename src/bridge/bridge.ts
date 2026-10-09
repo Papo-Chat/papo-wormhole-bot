@@ -27,10 +27,13 @@ import { DiscordBridge } from '../discord/bridge.js';
 import { chunkLabel, chunkText } from './chunk.js';
 import { authorLabel, discordToPapoContent, formatDate, papoToDiscordContent, type TranslateResolvers } from './translator.js';
 import {
+	attachmentRef,
+	avatarAttachmentName,
 	buildDiscordBridgeEmbed,
 	buildPapoBridgeEmbed,
 	discordEmbedsToPapo,
 	papoEmbedsToDiscord,
+	shaFromAttachmentRef,
 	type DiscordEmbedPayload
 } from './embeds.js';
 import { prepareAttachments, type SourceAttachment } from './attachments.js';
@@ -40,7 +43,7 @@ import {
 	reactionSummaryText,
 	type ReactionDisplay
 } from './reactions.js';
-import { EMBED_CHUNK_CHARS, PAPO_LIMITS, DISCORD_LIMITS, clampText } from './limits.js';
+import { EMBED_CHUNK_CHARS, PAPO_LIMITS, PAPO_EMBED_CHUNK_CHARS, DISCORD_LIMITS, clampText } from './limits.js';
 import { EmojiBridge } from './emoji.js';
 import type { MediaStore } from './media.js';
 import { PapoIdentity } from './identity.js';
@@ -54,6 +57,9 @@ class RetryableError extends Error {}
 
 /** Janela em que uma reação vista no Papo é tratada como eco da nossa própria aplicação. */
 const SELF_REACTION_TTL_SECONDS = 120;
+
+/** Janela em que uma edição do Discord ainda pode estar esperando o mapeamento da ponte. */
+const EDIT_MAP_GRACE_MS = 5 * 60_000;
 
 /** Identidade de uma reação do Papo, estável entre o evento WS e a execução do job. */
 const papoReactionKey = (e: { emoji_id: string | null; unicode: string | null }): string =>
@@ -87,6 +93,12 @@ const isDiscordTransient = (err: unknown): boolean => {
 
 const isPapoPermanent = (err: unknown): boolean =>
 	err instanceof PapoApiError && (err.status === 400 || err.status === 403 || err.status === 404);
+
+/** Discord 10014: o emoji não existe (ou está indisponível) para aquela mensagem. */
+const isUnknownEmoji = (err: unknown): boolean => {
+	const e = err as { code?: number; message?: string };
+	return e?.code === 10014 || /unknown emoji/i.test(e?.message ?? '');
+};
 
 export class Bridge {
 	private readonly log: Logger;
@@ -144,14 +156,15 @@ export class Bridge {
 	private async backfill(): Promise<void> {
 		for (const link of this.store.listChannelLinks()) {
 			try {
-				const cursorKey = `papo_cursor:${link.id}`;
-				const since = this.store.getMeta(cursorKey);
+				// A fila começa no instante em que o link foi criado (cursor semeado por
+				// `upsertChannelLink`): sem cursor não se busca histórico nenhum.
+				const since = this.store.getPapoCursor(link.id) ?? this.store.seedPapoCursor(link.id);
 				const messages = await this.api.listAllMessages(link.papo_channel_id, since, 2);
 				const fresh = messages.filter((m) => this.store.findMapByPapo(m.id).length === 0);
-				this.log.info({ linkId: link.id, total: messages.length, fresh: fresh.length }, 'backfill');
+				if (fresh.length) this.log.info({ linkId: link.id, total: messages.length, fresh: fresh.length }, 'backfill');
 				for (const m of fresh) {
 					await this.onPapoMessage(m);
-					this.store.setMeta(cursorKey, m.created_at);
+					if (m.created_at) this.store.setPapoCursor(link.id, m.created_at);
 				}
 			} catch (err) {
 				this.log.error({ err, linkId: link.id }, 'backfill falhou');
@@ -287,7 +300,7 @@ export class Bridge {
 				payload: { job, embed } satisfies Envelope
 			});
 		}
-		this.store.setMeta(`papo_cursor:${link.id}`, msg.created_at);
+		this.store.setPapoCursor(link.id, msg.created_at);
 		this.scheduleLink(link.id);
 	}
 
@@ -295,11 +308,17 @@ export class Bridge {
 		const link = this.linkForPapoChannel(e.channel_id);
 		if (!link || !link.bridge_edits) return;
 		const maps = this.store.findMapByPapo(e.id);
+		if (this.allCopiesHere(maps, 'papo')) {
+			// eco: foi o próprio bridge que reescreveu o embed da cópia (rodapé de reação).
+			// A mensagem do Discord é de outro autor e o Discord recusa a edição (50005).
+			this.log.debug({ messageId: e.id }, 'edição de cópia do bot no Papo: eco ignorado');
+			return;
+		}
 		const chunks = chunkText(papoToDiscordContent(e.content ?? '', this.resolvers()), EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
 			? maps
-					.filter((m) => m.discord_message_id)
+					.filter((m) => m.discord_message_id && m.direction === 'papo_to_discord')
 					.map((m) => ({ chunkIndex: m.chunk_index, chunkTotal: Math.max(chunks.length, m.chunk_total) }))
 			: chunks.map((_, i) => ({ chunkIndex: i, chunkTotal: chunks.length }));
 		for (const target of targets) {
@@ -327,6 +346,15 @@ export class Bridge {
 	private async onPapoDelete(e: PapoWsDeleteEvent): Promise<void> {
 		const link = this.store.getChannelLinkByPapo(e.channel_id);
 		if (!link || !link.bridge_deletes) return;
+		const maps = this.store.findMapByPapo(e.id);
+		if (this.allCopiesHere(maps, 'papo')) {
+			// A cópia do bot no Papo sumiu (eco de deleção nascida no Discord, ou moderação):
+			// o mapa não vale mais, mas a mensagem original do Discord é de outro autor e
+			// não pode ser apagada por reflexo.
+			this.store.markMapDeleted(e.id);
+			this.log.debug({ messageId: e.id }, 'deleção de cópia do bot no Papo: original do Discord preservado');
+			return;
+		}
 		const job: DeleteJob = { kind: 'delete', side: 'papo', linkId: link.id, sourceMessageId: e.id };
 		this.outbox.enqueue({
 			linkId: link.id,
@@ -339,6 +367,16 @@ export class Bridge {
 		this.scheduleLink(link.id);
 	}
 
+	/**
+	 * `true` quando existe mapeamento e todas as linhas apontam para uma cópia criada pelo
+	 * bot naquele lado — o evento é eco do que o próprio bridge fez, não ação de um usuário.
+	 */
+	private allCopiesHere(maps: MessageMapRow[], side: 'papo' | 'discord'): boolean {
+		if (!maps.length) return false;
+		const copyDirection = side === 'papo' ? 'discord_to_papo' : 'papo_to_discord';
+		return maps.every((m) => m.direction === copyDirection);
+	}
+
 	private async onPapoEmbeds(e: PapoWsEmbedsEvent): Promise<void> {
 		const link = this.linkForPapoChannel(e.channel_id);
 		if (!link || !link.bridge_embeds) return;
@@ -349,7 +387,7 @@ export class Bridge {
 			thumbnailUrlFor: (embed) => (embed.id ? mediaUrls.get(embed.id) : undefined)
 		});
 		for (const map of maps) {
-			if (!map.discord_message_id) continue;
+			if (!map.discord_message_id || map.direction !== 'papo_to_discord') continue;
 			const job: EditJob = {
 				kind: 'edit',
 				side: 'papo',
@@ -573,7 +611,7 @@ export class Bridge {
 		});
 
 		const content = discordToPapoContent(m.content ?? '', this.resolvers());
-		const chunks = chunkText(content, PAPO_LIMITS.contentMax - 256);
+		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
 		const linkEmbeds = link.bridge_embeds ? discordEmbedsToPapo(m.embeds as APIEmbed[]) : [];
 		const sources: SourceRef[] = link.bridge_attachments
 			? m.attachments.map((a) => ({
@@ -591,7 +629,9 @@ export class Bridge {
 		const avatarUrl = m.author.displayAvatarURL({ extension: 'png', size: 256 });
 
 		for (let i = 0; i < total; i++) {
-			const chunkContent = chunks[i] ?? (i === 0 ? (linkEmbeds[0]?.url ?? '[mensagem sem texto]') : '');
+			// sem texto mas com anexo/embed o card já mostra a mídia: não precisa de marcador
+			const fallback = sources.length || linkEmbeds.length ? '' : '[mensagem sem texto]';
+			const chunkContent = chunks[i] ?? (i === 0 ? (linkEmbeds[0]?.url ?? fallback) : '');
 			const job: ToPapoMessageJob = {
 				kind: 'message',
 				linkId: link.id,
@@ -635,8 +675,18 @@ export class Bridge {
 			this.log.debug({ messageId: after.id }, 'edição do Discord sem conteúdo acessível');
 			return;
 		}
+		if (this.discord.isSelf(fresh.author.id)) {
+			// eco: foi o próprio bridge que reescreveu o embed (rodapé de reação).
+			this.log.debug({ messageId: fresh.id }, 'edição de embed ponte: eco ignorado');
+			return;
+		}
 		const maps = this.store.findMapByDiscord(fresh.id);
-		const chunks = chunkText(discordToPapoContent(fresh.content ?? '', this.resolvers()), PAPO_LIMITS.contentMax - 256);
+		if (!maps.length && Date.now() - fresh.createdTimestamp > EDIT_MAP_GRACE_MS) {
+			// mensagem antiga que nunca foi ponte: não há destino a atualizar
+			this.log.debug({ messageId: fresh.id }, 'edição sem mapeamento: mensagem não ponte');
+			return;
+		}
+		const chunks = chunkText(discordToPapoContent(fresh.content ?? '', this.resolvers()), PAPO_EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
 			? maps
@@ -668,6 +718,16 @@ export class Bridge {
 	async onDiscordDelete(m: DiscordMessage | PartialDiscordMessage): Promise<void> {
 		const link = this.store.getChannelLinkByDiscord(m.channelId);
 		if (!link || !link.bridge_deletes) return;
+		if (!m.partial && this.discord.isSelf(m.author.id)) {
+			// eco: o bridge apagou a própria cópia (deleção nascida no Papo).
+			this.log.debug({ messageId: m.id }, 'deleção de embed ponte: eco ignorado');
+			return;
+		}
+		if (!m.partial && !this.store.findMapByDiscord(m.id).length && Date.now() - m.createdTimestamp > EDIT_MAP_GRACE_MS) {
+			// mensagem antiga que nunca foi ponte: não há destino a apagar
+			this.log.debug({ messageId: m.id }, 'deleção sem mapeamento: mensagem não ponte');
+			return;
+		}
 		const job: DeleteJob = { kind: 'delete', side: 'discord', linkId: link.id, sourceMessageId: m.id };
 		this.outbox.enqueue({
 			linkId: link.id,
@@ -818,10 +878,45 @@ export class Bridge {
 		return buildReactionFooter(map.footer_base ?? '', mergeReactionCounts(sides), maxChars);
 	}
 
+	/**
+	 * Avatar do autor do Papo como anexo da mensagem. Sem media server público o
+	 * Discord não tem URL absoluta para `author.icon_url`, e `attachment://` é a
+	 * forma de entregar o avatar sem hospedar nada fora do bot (o anexo referenciado
+	 * pelo embed não aparece como arquivo separado).
+	 */
+	private avatarAttachment(
+		sha: string | undefined,
+		existingIconUrl?: string
+	): { name: string; buffer: Buffer } | undefined {
+		if (!sha || existingIconUrl) return undefined;
+		const buffer = this.media.readFor(sha);
+		if (!buffer) return undefined;
+		return { name: avatarAttachmentName(sha, this.media.extFor(sha)), buffer };
+	}
+
+	/** Arquivos que os embeds salvos referenciam por `attachment://`: um edit precisa reenviá-los. */
+	private filesForEmbedRefs(embeds: DiscordEmbedPayload[]): { name: string; buffer: Buffer }[] {
+		const out: { name: string; buffer: Buffer }[] = [];
+		const seen = new Set<string>();
+		for (const e of embeds) {
+			for (const url of [e.author?.icon_url, e.footer?.icon_url, e.thumbnail?.url, e.image?.url]) {
+				const sha = shaFromAttachmentRef(url);
+				if (!sha || seen.has(sha)) continue;
+				const buffer = this.media.readFor(sha);
+				if (!buffer) continue;
+				seen.add(sha);
+				out.push({ name: `avatar-${sha}.${this.media.extFor(sha)}`, buffer });
+			}
+		}
+		return out;
+	}
+
 	private async sendToDiscord(job: ToDiscordMessageJob, embed?: DiscordEmbedPayload): Promise<void> {
+		const avatar = this.avatarAttachment(job.authorIconSha, embed?.author?.icon_url);
 		const plan = await prepareAttachments(this.sourcesToAttachments(job.sources), {
 			maxFileBytes: this.cfg.discord.maxFileBytes,
-			maxFilesPerMessage: 10
+			// o avatar anexado ocupa um dos dez anexos da mensagem
+			maxFilesPerMessage: avatar ? DISCORD_LIMITS.attachmentsPerMessage - 1 : DISCORD_LIMITS.attachmentsPerMessage
 		});
 
 		const notes = [...job.notes, ...plan.notes];
@@ -843,12 +938,20 @@ export class Bridge {
 		built.footer = {
 			text: this.footerWithReactions(footerBase, job.linkId, 'papo', job.papoMessageId, DISCORD_LIMITS.embedFooterMax)
 		};
+		if (avatar && !built.author?.icon_url) {
+			built.author = {
+				name: built.author?.name ?? job.authorName,
+				...(built.author?.url ? { url: built.author.url } : {}),
+				icon_url: attachmentRef(avatar.name)
+			};
+		}
 
 		const groups = plan.groups.length ? plan.groups : [[]];
 		let lastDiscordId: string | undefined;
 
 		for (let g = 0; g < groups.length; g++) {
 			const files = groups[g]!.map((f) => ({ name: f.name, buffer: f.data }));
+			if (avatar && g === 0 && built.author?.icon_url === attachmentRef(avatar.name)) files.unshift(avatar);
 			const extra = g > 0;
 			const sent = await this.discord.send(job.discordChannelId, {
 				embeds: extra
@@ -887,12 +990,14 @@ export class Bridge {
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
 		});
 
+		// O texto vai todo no `description` do embed: a mensagem do Papo sai sem `content`
+		// (o card é a mensagem). Notas de mídia entram no mesmo bloco.
 		const notes = [...job.notes, ...plan.notes];
-		const content = clampText(
+		const text = clampText(
 			notes.length
 				? `${job.content}${job.content ? '\n\n' : ''}${notes.map((n) => `> ${n}`).join('\n')}`.trim()
 				: job.content,
-			PAPO_LIMITS.contentMax
+			PAPO_LIMITS.embedDescriptionMax
 		);
 
 		const groups = plan.groups.length ? plan.groups : [[]];
@@ -901,7 +1006,6 @@ export class Bridge {
 		for (let g = 0; g < groups.length; g++) {
 			const attachments = groups[g]!.map((f) => ({ name: f.name, data: f.data, mime: f.mime }));
 			const extra = g > 0;
-			if (!content && !attachments.length) return;
 
 			const embeds = extra
 				? [
@@ -916,6 +1020,7 @@ export class Bridge {
 
 			const mainEmbed = extra ? undefined : embeds[0];
 			if (mainEmbed) {
+				mainEmbed.description = text;
 				mainEmbed.footer = {
 					text: this.footerWithReactions(
 						job.footerBase,
@@ -926,10 +1031,11 @@ export class Bridge {
 					)
 				};
 			}
+			if (!text && !attachments.length && !embeds.length) return;
 
 			const created = await this.sendToPapoSafe({
 				channelId: job.papoChannelId,
-				content: extra ? undefined : content,
+				content: undefined,
 				replyTo: extra ? job.replyToPapoId ?? lastPapoId : job.replyToPapoId,
 				attachments,
 				embeds: embeds.length ? (embeds as ToPapoMessageJob['linkEmbeds']) : undefined
@@ -942,7 +1048,7 @@ export class Bridge {
 				discord_message_id: job.discordMessageId,
 				chunk_index: extra ? EXTRA_CHUNK_BASE + g : job.chunkIndex,
 				chunk_total: job.chunkTotal,
-				rendered: extra ? null : content,
+				rendered: extra ? null : text,
 				bridge_embed: extra ? null : mainEmbed ?? null,
 				footer_base: extra ? null : job.footerBase
 			});
@@ -975,10 +1081,18 @@ export class Bridge {
 		if (!map) throw new RetryableError('mensagem de destino ainda não mapeada');
 
 		if (job.side === 'papo') {
+			// direction discord_to_papo: a mensagem do Papo é cópia nossa e a do Discord é de
+			// outro autor — o Discord recusa a edição (50005).
+			if (map.direction !== 'papo_to_discord') {
+				this.log.debug({ papoMessageId: job.sourceMessageId }, 'edição ignorada: cópia do bot no Papo');
+				return;
+			}
 			if (!map.discord_message_id) throw new RetryableError('sem mensagem do Discord mapeada');
 			if (env.embedsOnly) {
+				const embeds = (env.embeds ?? []) as APIEmbed[];
 				await this.discord.edit(job.targetChannelId, map.discord_message_id, {
-					embeds: (env.embeds ?? []) as APIEmbed[]
+					embeds,
+					files: this.filesForEmbedRefs(embeds)
 				});
 				return;
 			}
@@ -999,10 +1113,34 @@ export class Bridge {
 		}
 
 		if (!map.papo_message_id) throw new RetryableError('sem mensagem do Papo mapeada');
-		await this.api.editMessage(map.papo_message_id, job.text);
+		// bridge papo→discord: a mensagem do Papo é a original, de outro autor. O
+		// backend recusa edição de terceiros (403), e o lado Papo já é a fonte.
+		if (map.direction !== 'discord_to_papo') {
+			this.log.debug({ papoMessageId: map.papo_message_id }, 'edição ignorada: mensagem do Papo não é do bot');
+			return;
+		}
+		await this.api.editMessage(map.papo_message_id, '', [this.papoCopyEmbed(map, job.text)]);
 	}
 
-	/** Reescreve o rodapé do embed salvo em `message_map` com o resumo atual de reações. */
+	/**
+	 * Embed da cópia Papo: snapshot salvo em `message_map` com o texto novo no
+	 * `description` (a mensagem bridgeada não usa `content` no Papo).
+	 */
+	private papoCopyEmbed(map: MessageMapRow, text: string): PapoEmbedInput {
+		const embed: PapoEmbedInput = map.bridge_embed
+			? (JSON.parse(map.bridge_embed) as PapoEmbedInput)
+			: { author: { name: 'Discord' } };
+		embed.description = clampText(text, PAPO_LIMITS.embedDescriptionMax);
+		if (!embed.site_name) embed.site_name = 'Discord';
+		return embed;
+	}
+
+	/**
+	 * Reescreve o rodapé do embed salvo em `message_map` com o resumo atual de reações.
+	 * O destino é a cópia que o bot criou (definida por `map.direction`): a mensagem original
+	 * do outro lado é de outro autor — Discord recusa edição (50005) e o backend do Papo também
+	 * (403), além de já mostrar as próprias reações.
+	 */
 	private async refreshFooter(job: EditJob): Promise<void> {
 		const maps =
 			job.side === 'papo' ? this.store.findMapByPapo(job.sourceMessageId) : this.store.findMapByDiscord(job.sourceMessageId);
@@ -1015,17 +1153,24 @@ export class Bridge {
 		const link = this.store.getChannelLinkById(job.linkId);
 		if (!link) throw new PermanentError('link removido');
 
-		const maxFooter = job.side === 'papo' ? DISCORD_LIMITS.embedFooterMax : PAPO_LIMITS.embedFooterMax;
 		for (const map of targets) {
-			const embed = JSON.parse(map.bridge_embed!) as DiscordEmbedPayload & PapoEmbedInput;
-			embed.footer = { text: this.footerForMap(map, maxFooter) };
-			if (job.side === 'papo') {
+			if (map.direction === 'papo_to_discord') {
+				// a cópia editável está no Discord
 				if (!map.discord_message_id) continue;
-				await this.discord.edit(link.discord_channel_id, map.discord_message_id, { embeds: [embed as APIEmbed] });
+				const embed = JSON.parse(map.bridge_embed!) as DiscordEmbedPayload;
+				embed.footer = { text: this.footerForMap(map, DISCORD_LIMITS.embedFooterMax) };
+				await this.discord.edit(link.discord_channel_id, map.discord_message_id, {
+					embeds: [embed as APIEmbed],
+					files: this.filesForEmbedRefs([embed])
+				});
 				continue;
 			}
+			// a cópia editável está no Papo: o texto mora no embed, `content` fica limpo
 			if (!map.papo_message_id) continue;
-			await this.api.editMessage(map.papo_message_id, map.rendered ?? '', [embed as PapoEmbedInput]);
+			const embed = JSON.parse(map.bridge_embed!) as PapoEmbedInput;
+			embed.footer = { text: this.footerForMap(map, PAPO_LIMITS.embedFooterMax) };
+			if (!embed.description) embed.description = clampText(map.rendered ?? '', PAPO_LIMITS.embedDescriptionMax);
+			await this.api.editMessage(map.papo_message_id, '', [embed]);
 		}
 	}
 
@@ -1039,8 +1184,13 @@ export class Bridge {
 		for (const map of maps) {
 			try {
 				if (job.side === 'papo' && map.discord_message_id) {
+					// bridge discord→papo: a mensagem do Discord é a original, de outro autor.
+					if (map.direction !== 'papo_to_discord') continue;
 					await this.discord.delete(link.discord_channel_id, map.discord_message_id);
 				} else if (job.side === 'discord' && map.papo_message_id) {
+					// bridge papo→discord: a mensagem do Papo é a original, de outro autor
+					// (o backend recusa: 403). A cópia do Discord já sumiu por si só.
+					if (map.direction !== 'discord_to_papo') continue;
 					await this.api.deleteMessage(map.papo_message_id);
 				}
 			} catch (err) {
@@ -1095,8 +1245,30 @@ export class Bridge {
 			}
 		}
 
-		if (job.add) await this.discord.react(link.discord_channel_id, map.discord_message_id, native);
-		else await this.discord.unreact(link.discord_channel_id, map.discord_message_id, native);
+		try {
+			await this.reactOnDiscord(job, link.discord_channel_id, map.discord_message_id, native);
+		} catch (err) {
+			if (!isUnknownEmoji(err)) throw err;
+			// o cache do gateway ainda traz o emoji, mas o Discord o recusa (apagado ou
+			// `available: false`): re-carrega a lista de indisponíveis e tenta o equivalente.
+			await this.discord.loadUnavailableEmojis();
+			const retry = name
+				? this.emojis.tokenForDiscord(name, { findByName: (n) => this.discord.findGuildEmoji(n) })
+				: undefined;
+			if (!retry?.startsWith('<') || retry === native) {
+				this.log.warn(
+					{ emoji: display, messageId: job.sourceMessageId },
+					'reação com emoji indisponível no guild: só o resumo do rodapé'
+				);
+				return;
+			}
+			await this.reactOnDiscord(job, link.discord_channel_id, map.discord_message_id, retry);
+		}
+	}
+
+	private async reactOnDiscord(job: ReactionJob, channelId: string, messageId: string, emoji: string): Promise<void> {
+		if (job.add) await this.discord.react(channelId, messageId, emoji);
+		else await this.discord.unreact(channelId, messageId, emoji);
 	}
 
 	/** Reação nascida no Discord: registra a contagem e reflete no Papo (importando o emoji se preciso). */

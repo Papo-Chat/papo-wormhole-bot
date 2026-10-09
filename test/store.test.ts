@@ -54,6 +54,33 @@ describe('channel links', () => {
 	});
 });
 
+describe('cursor Papo por link (fila começa no link)', () => {
+	it('semeia o cursor no instante em que o link é criado', () => {
+		const { store } = fixture();
+		const hourAgo = new Date(Date.now() - 3600_000).toISOString();
+		const link = store.upsertChannelLink({ papo_channel_id: 'p1', discord_channel_id: '111' });
+		const cursor = store.getPapoCursor(link.id);
+		expect(cursor).toBeDefined();
+		expect((cursor ?? '') >= hourAgo).toBe(true);
+	});
+
+	it('relinkar o mesmo canal não move o cursor', () => {
+		const { store } = fixture();
+		const link = store.upsertChannelLink({ papo_channel_id: 'p1', discord_channel_id: '111' });
+		store.setPapoCursor(link.id, '2026-01-01T00:00:00.000Z');
+		const updated = store.upsertChannelLink({ papo_channel_id: 'p1', discord_channel_id: '222' });
+		expect(updated.id).toBe(link.id);
+		expect(store.getPapoCursor(link.id)).toBe('2026-01-01T00:00:00.000Z');
+	});
+
+	it('unlink limpa o cursor', () => {
+		const { store } = fixture();
+		const link = store.upsertChannelLink({ papo_channel_id: 'p1', discord_channel_id: '111' });
+		store.removeChannelLink('111');
+		expect(store.getPapoCursor(link.id)).toBeUndefined();
+	});
+});
+
 describe('message map', () => {
 	it('mapeia nos dois sentidos e consulta por cada lado', () => {
 		const { store } = fixture();

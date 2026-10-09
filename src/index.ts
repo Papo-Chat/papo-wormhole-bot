@@ -27,6 +27,7 @@ async function main(): Promise<void> {
 		baseUrl: cfg.papo.baseUrl,
 		username: cfg.papo.username,
 		password: cfg.papo.password,
+		serverPassword: cfg.papo.serverPassword,
 		rateLimitRps: cfg.papo.rateLimitRps,
 		rateBurst: cfg.papo.rateBurst
 	});
@@ -56,6 +57,13 @@ async function main(): Promise<void> {
 					await registerCommands(discord.client, guild);
 				} catch (err) {
 					log.error({ err }, 'falha ao registrar slash commands');
+				}
+				try {
+					// emojis apagados/indisponíveis ficam no cache do gateway e estouram 10014 na reação
+					const blocked = await discord.loadUnavailableEmojis();
+					if (blocked) log.info({ blocked }, 'emojis indisponíveis no guild: excluídos das reações');
+				} catch (err) {
+					log.debug({ err }, 'lista de emojis do guild não carregada');
 				}
 			}
 		}

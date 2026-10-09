@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
-import { createReadStream, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Store } from '../db/store.js';
 
@@ -66,6 +66,21 @@ export class MediaStore {
 		const row = this.store.getMedia(sha256);
 		const ext = row?.path ? row.path.split('.').pop() ?? 'bin' : 'bin';
 		return `${publicBaseUrl}/media/${sha256}.${ext}`;
+	}
+
+	/** Bytes do arquivo (para envio direto como anexo, quando não há URL pública). */
+	readFor(sha256: string): Buffer | undefined {
+		const path = this.pathFor(sha256);
+		if (!path) return undefined;
+		try {
+			return readFileSync(path);
+		} catch {
+			return undefined;
+		}
+	}
+
+	extFor(sha256: string): string {
+		return this.pathFor(sha256)?.split('.').pop() ?? 'bin';
 	}
 }
 

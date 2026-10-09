@@ -20,6 +20,13 @@ const EnvSchema = z.object({
 	PAPO_WS_URL: z.string().optional(),
 	PAPO_USERNAME: z.string().min(1),
 	PAPO_PASSWORD: z.string().min(1),
+	/**
+	 * Senha de acesso ao servidor (servidores privados). Vazia/comentada = servidor público.
+	 */
+	PAPO_SERVER_PASSWORD: z
+		.string()
+		.optional()
+		.transform((v) => (v && v.trim() ? v.trim() : undefined)),
 	PAPO_REFRESH_HOURS: z.coerce.number().int().min(1).max(23).default(12),
 	PAPO_BACKFILL_ON_START: Bool.default(true),
 	/** Teto de requisições ao Papo (o backend limita por IP: 10/s, rajada 20). */
@@ -55,6 +62,8 @@ export interface Config {
 		wsUrl: string;
 		username: string;
 		password: string;
+		/** Senha do servidor (obrigatória quando `GET /server` → `public: false`). */
+		serverPassword?: string;
 		refreshHours: number;
 		backfillOnStart: boolean;
 		rateLimitRps: number;
@@ -102,6 +111,7 @@ export function loadConfig(): Config {
 			wsUrl: e.PAPO_WS_URL ?? toWsUrl(e.PAPO_BASE_URL),
 			username: e.PAPO_USERNAME,
 			password: e.PAPO_PASSWORD,
+			serverPassword: e.PAPO_SERVER_PASSWORD,
 			refreshHours: e.PAPO_REFRESH_HOURS,
 			backfillOnStart: e.PAPO_BACKFILL_ON_START,
 			rateLimitRps: e.PAPO_RATE_LIMIT_RPS,

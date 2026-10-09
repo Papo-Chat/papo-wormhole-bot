@@ -21,6 +21,19 @@ export interface DiscordEmbedPayload {
 
 export const intToHex = (color: number): string => `#${color.toString(16).padStart(6, '0')}`;
 
+/** Referência a um arquivo enviado junto da mensagem (o Discord resolve localmente). */
+export const attachmentRef = (name: string): string => `attachment://${name}`;
+
+/** Nome canônico do anexo de avatar (o sha vai inteiro para o edit reanexar). */
+export const avatarAttachmentName = (sha: string, ext: string): string => `avatar-${sha}.${ext}`;
+
+/** Extrai o sha256 de uma referência `attachment://avatar-<sha>.<ext>`. */
+export function shaFromAttachmentRef(url?: string): string | undefined {
+	if (!url) return undefined;
+	const m = /^attachment:\/\/avatar-([0-9a-f]{64})\.[a-z0-9]+$/.exec(url);
+	return m?.[1];
+}
+
 export const hexToInt = (color?: string | null): number | undefined => {
 	if (!color) return undefined;
 	const m = /^#?([0-9a-fA-F]{6})$/.exec(color.trim());
@@ -84,6 +97,8 @@ export function discordEmbedsToPapo(embeds: DiscordEmbedPayload[]): PapoEmbedInp
 		if (e.author?.name) {
 			input.author = { name: clampText(e.author.name, PAPO_LIMITS.embedAuthorMax) };
 			if (e.author.url) input.author.url = clampText(e.author.url, PAPO_LIMITS.embedUrlMax);
+			// avatar do autor: o backend do Papo baixa e re-serva (author_media)
+			if (e.author.icon_url) input.author.icon_url = clampText(e.author.icon_url, PAPO_LIMITS.embedUrlMax);
 		}
 		if (e.footer?.text) input.footer = { text: clampText(e.footer.text, PAPO_LIMITS.embedFooterMax) };
 		const host = hostOf(e.url);
@@ -154,6 +169,8 @@ export interface BridgeEmbedInput {
 	url?: string;
 	imageUrl?: string;
 	thumbnailUrl?: string;
+	/** Selo de origem (linha de topo do card do Papo). Padrão: `Discord`. */
+	siteName?: string;
 	fields?: { name: string; value: string; inline?: boolean }[];
 }
 
@@ -185,22 +202,28 @@ export function buildDiscordBridgeEmbed(i: BridgeEmbedInput): DiscordEmbedPayloa
 	return payload;
 }
 
-/** Embed "mensagem bridgeada" no Papo (autor do Discord + avatar + data). */
+/** Embed "mensagem bridgeada" no Papo (autor do Discord + data + selo de origem). */
 export function buildPapoBridgeEmbed(i: BridgeEmbedInput): PapoEmbedInput {
 	const payload: PapoEmbedInput = {
+		// O card do Papo desenha `site_name` na linha de topo e o ícone do autor
+		// (`author_media`) no selo dessa linha: nome no topo, avatar no ícone.
+		// A linha de autor do card é omitida pelo frontend quando repete o nome do topo.
 		author: {
 			name: clampText(i.authorName, PAPO_LIMITS.embedAuthorMax),
-			...(i.authorUrl ? { url: i.authorUrl } : {})
+			...(i.authorUrl ? { url: i.authorUrl } : {}),
+			...(i.authorIconUrl ? { icon_url: clampText(i.authorIconUrl, PAPO_LIMITS.embedUrlMax) } : {})
 		},
 		description: clampText(i.description, PAPO_LIMITS.embedDescriptionMax),
-		footer: { text: clampText(i.footerText, PAPO_LIMITS.embedFooterMax) }
+		footer: { text: clampText(i.footerText, PAPO_LIMITS.embedFooterMax) },
+		site_name: clampText(i.authorName ?? 'Discord', 128)
 	};
 	if (i.title) payload.title = clampText(i.title, PAPO_LIMITS.embedTitleMax);
 	if (i.url) payload.url = clampText(i.url, PAPO_LIMITS.embedUrlMax);
 	if (i.colorHex && /^#[0-9a-fA-F]{6}$/.test(i.colorHex)) payload.color = i.colorHex;
-	// O Papo não tem ícone de author: o avatar vai na thumbnail.
-	const thumb = i.authorIconUrl ?? i.thumbnailUrl;
-	if (thumb) payload.thumbnail = { url: clampText(thumb, PAPO_LIMITS.embedUrlMax) };
+	// O card do Papo não tem ícone de author e desenha a thumbnail como imagem grande
+	// do card (largura total): avatar na thumbnail viraria banner. Só imagem de
+	// conteúdo vai na thumbnail.
+	if (i.thumbnailUrl) payload.thumbnail = { url: clampText(i.thumbnailUrl, PAPO_LIMITS.embedUrlMax) };
 	if (i.imageUrl) payload.image = { url: clampText(i.imageUrl, PAPO_LIMITS.embedUrlMax) };
 	if (i.fields?.length) {
 		payload.fields = i.fields.slice(0, PAPO_LIMITS.embedFieldsMax).map((f) => ({

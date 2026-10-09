@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Logger } from 'pino';
 import type {
 	PapoChannel,
+	PapoServer,
 	PapoEmbed,
 	PapoEmoji,
 	PapoEmbedInput,
@@ -18,6 +19,13 @@ export interface PapoApiOptions {
 	baseUrl: string;
 	username: string;
 	password: string;
+	/**
+	 * Senha de acesso ao servidor (`POST /auth/login_server`). Obrigatória quando o
+	 * servidor é privado (`GET /server` → `public: false`): o backend recusa
+	 * `POST /auth/login` com 401 `server-access-required` enquanto o cookie `Auth`
+	 * não carregar o token temporário (30 min) emitido por aquela rota.
+	 */
+	serverPassword?: string;
 	logger?: Logger;
 	/** Timeout de cada requisição (ms). */
 	timeoutMs?: number;
@@ -81,6 +89,14 @@ class Throttle {
 }
 
 /**
+ * `type` do problem emitido pelo gate de servidor privado. O backend escreve a URL
+ * completa (`https://host/errors/server-access-required`), então comparo o último segmento.
+ */
+function isServerAccessRequired(problem?: PapoProblem): boolean {
+	return (problem?.type ?? '').split('/').pop() === 'server-access-required';
+}
+
+/**
  * Cliente REST do Papo.
  * Autenticação: cookie HttpOnly `Auth` (gerenciado manualmente, pois fetch não tem cookie jar).
  * Convenções do backend: X-Request-ID por chamada, erros RFC 7807, 401 → refresh + 1 retry.
@@ -101,11 +117,53 @@ export class PapoApi {
 
 	// ── auth ───────────────────────────────────────────────
 
-	async login(): Promise<void> {
-		const res = await this.raw('/auth/login', {
+	/**
+	 * Servidor privado: troca a senha do servidor pelo token temporário (30 min)
+	 * que o gate de `/auth/login` exige no cookie `Auth`. Resposta 204: a
+	 * autorização chega só pelo cookie.
+	 */
+	async loginServer(): Promise<void> {
+		if (!this.opts.serverPassword) {
+			throw new PapoApiError('senha do servidor não configurada (PAPO_SERVER_PASSWORD)', 401);
+		}
+		const res = await this.raw('/auth/login_server', {
 			method: 'POST',
-			body: JSON.stringify({ username: this.opts.username, password: this.opts.password })
+			body: JSON.stringify({ server_password: this.opts.serverPassword })
 		});
+		if (res.status >= 400) await this.problem(res, '/auth/login_server');
+		this.storeCookie(res);
+		if (!this.cookie) {
+			throw new PapoApiError('login_server sem cookie Auth na resposta', 500);
+		}
+	}
+
+	async login(): Promise<void> {
+		// servidor privado: o gate de /auth/login lê o cookie Auth e exige o token
+		// temporário de /auth/login_server (um token de sessão não vale como tal).
+		if (this.opts.serverPassword) await this.loginServer();
+
+		const body = JSON.stringify({ username: this.opts.username, password: this.opts.password });
+		let res = await this.raw('/auth/login', { method: 'POST', body });
+		let problem = res.status >= 400 ? await this.readProblem(res) : undefined;
+
+		if (res.status === 401 && isServerAccessRequired(problem) && this.opts.serverPassword) {
+			// o token temporário expirou (ou nem chegou): renova e tenta uma vez.
+			await this.loginServer();
+			res = await this.raw('/auth/login', { method: 'POST', body });
+			problem = res.status >= 400 ? await this.readProblem(res) : undefined;
+		}
+
+		if (res.status >= 400) {
+			if (res.status === 401 && isServerAccessRequired(problem)) {
+				throw new PapoApiError(
+					'servidor privado: informe PAPO_SERVER_PASSWORD (POST /auth/login_server antes de /auth/login)',
+					401,
+					problem
+				);
+			}
+			await this.problem(res, '/auth/login', problem);
+		}
+
 		this.storeCookie(res);
 		if (!this.cookie) {
 			throw new PapoApiError('login sem cookie Auth na resposta', 500);
@@ -149,6 +207,11 @@ export class PapoApi {
 		return this.request<PapoWhoami>('/auth/whoami');
 	}
 
+	/** Metadados públicos do servidor; `public: false` exige `/auth/login_server` antes do login. */
+	async getServer(): Promise<PapoServer> {
+		return this.request<PapoServer>('/server');
+	}
+
 	/** Cookie atual (usado no handshake do WebSocket). */
 	get authCookie(): string | undefined {
 		return this.cookie;
@@ -167,6 +230,27 @@ export class PapoApi {
 		if (q.lastId) params.set('last_id', q.lastId);
 		params.set('order', q.order ?? 'asc');
 		return this.request<PapoMessageList>(`/channels/${channelId}/messages?${params.toString()}`);
+	}
+
+	/** Todos os usuários do servidor (páginas de 100), com teto de segurança. */
+	async listAllUsers(maxPages = 20): Promise<PapoUserSummary[]> {
+		const out: PapoUserSummary[] = [];
+		let since: string | undefined;
+		let lastId: string | undefined;
+		for (let page = 0; page < maxPages; page++) {
+			const params = new URLSearchParams({ order: 'asc' });
+			if (since) params.set('since', since);
+			if (lastId) params.set('last_id', lastId);
+			const res = await this.request<{ users?: PapoUserSummary[]; has_more?: boolean }>(`/users?${params.toString()}`);
+			const users = res.users ?? [];
+			out.push(...users);
+			if (!res.has_more || users.length === 0) break;
+			const last = users[users.length - 1]!;
+			since = last.created_at;
+			lastId = last.id;
+			if (!since) break;
+		}
+		return out;
 	}
 
 	/** Todas as páginas de um canal (ordem asc), com teto de segurança. */
@@ -380,13 +464,17 @@ export class PapoApi {
 		return res;
 	}
 
-	private async problem(res: Response, path: string): Promise<never> {
-		let problem: PapoProblem | undefined;
+	private async readProblem(res: Response): Promise<PapoProblem | undefined> {
 		try {
-			if ((res.headers.get('content-type') ?? '').includes('json')) problem = (await res.json()) as PapoProblem;
+			if ((res.headers.get('content-type') ?? '').includes('json')) return (await res.json()) as PapoProblem;
 		} catch {
-			problem = undefined;
+			return undefined;
 		}
+		return undefined;
+	}
+
+	private async problem(res: Response, path: string, preread?: PapoProblem): Promise<never> {
+		const problem = preread ?? (await this.readProblem(res));
 		const detail = problem?.detail ?? problem?.title ?? res.statusText;
 		throw new PapoApiError(`${res.status} em ${path}: ${detail}`, res.status, problem, res.headers.get('x-request-id') ?? undefined);
 	}

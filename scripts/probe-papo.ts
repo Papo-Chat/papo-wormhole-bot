@@ -39,7 +39,12 @@ if (!args.channel) {
 const channelId = String(args.channel);
 const burst = Number(args.burst ?? 0);
 const wsSeconds = Number(args.ws ?? 0);
-const api = new PapoApi({ baseUrl, username, password });
+const api = new PapoApi({
+	baseUrl,
+	username,
+	password,
+	serverPassword: process.env.PAPO_SERVER_PASSWORD?.trim() || undefined
+});
 
 const line = (label: string, value: string) => console.log(`${label.padEnd(42)} ${value}`);
 const section = (title: string) => console.log(`\n── ${title} ${'─'.repeat(Math.max(0, 52 - title.length))}`);

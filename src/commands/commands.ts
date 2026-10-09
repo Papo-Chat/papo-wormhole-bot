@@ -1,25 +1,29 @@
 import {
 	ChannelType,
+	MessageFlags,
 	PermissionsBitField,
 	SlashCommandBuilder,
+	type BaseMessageOptions,
 	type ChatInputCommandInteraction,
 	type Client,
 	type Guild
 } from 'discord.js';
 import type { Logger } from 'pino';
+import type { PapoUserSummary } from '../papo/types.js';
 import { scoped } from '../logger.js';
 import type { Store } from '../db/store.js';
 import type { PapoApi } from '../papo/api.js';
 import type { Bridge } from '../bridge/bridge.js';
 import type { Outbox } from '../db/outbox.js';
 import type { OutboxState } from '../db/outbox.js';
+import { isUuid, matchChannel, matchServer, matchUser, type Resolved } from './resolve.js';
 
 export const commands = [
 	new SlashCommandBuilder().setName('online').setDescription('Quem está online na plataforma inversa'),
 	new SlashCommandBuilder()
 		.setName('link-channel')
 		.setDescription('Linka um canal do Papo a um canal do Discord')
-		.addStringOption((o) => o.setName('papo_channel').setDescription('id (uuid) do canal do Papo').setRequired(true))
+		.addStringOption((o) => o.setName('papo_channel').setDescription('nome do canal do Papo (ex.: geral) ou id (uuid)').setRequired(true))
 		.addChannelOption((o) =>
 			o.setName('discord_channel').setDescription('Canal do Discord').addChannelTypes(ChannelType.GuildText).setRequired(true)
 		)
@@ -34,12 +38,12 @@ export const commands = [
 	new SlashCommandBuilder()
 		.setName('link-server')
 		.setDescription('Associa o servidor Papo ao servidor Discord')
-		.addStringOption((o) => o.setName('papo_server').setDescription('id (uuid) do servidor Papo').setRequired(true))
+		.addStringOption((o) => o.setName('papo_server').setDescription('nome do servidor Papo (ex.: Cyber Asilo) ou id (uuid)').setRequired(true))
 		.setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
 	new SlashCommandBuilder()
 		.setName('link-user')
 		.setDescription('Mapeia um usuário do Papo a um usuário do Discord')
-		.addStringOption((o) => o.setName('papo_user').setDescription('id (uuid) do usuário Papo').setRequired(true))
+		.addStringOption((o) => o.setName('papo_user').setDescription('usuário do Papo (ex.: jonas ou apelido) ou id (uuid)').setRequired(true))
 		.addUserOption((o) => o.setName('discord_user').setDescription('Usuário do Discord').setRequired(true))
 		.setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
 	new SlashCommandBuilder()
@@ -118,9 +122,28 @@ const flagColumns = {
 	mentions: 'propagate_mentions'
 } as const;
 
+/**
+ * O Discord exige a primeira resposta da interação em 3 s; depois disso o token expira
+ * e o callback vira `10062 Unknown interaction`. Comandos que consultam o Papo chamam
+ * `deferReply()` antes de qualquer chamada e entregam o resultado por `editReply`.
+ */
+async function respond(i: ChatInputCommandInteraction, payload: BaseMessageOptions, ephemeral = false): Promise<void> {
+	const flags = ephemeral ? MessageFlags.Ephemeral : undefined;
+	if (i.deferred) {
+		await i.editReply(payload);
+		return;
+	}
+	if (i.replied) {
+		await i.followUp({ ...payload, flags });
+		return;
+	}
+	await i.reply({ ...payload, flags });
+}
+
 export async function handleCommand(i: ChatInputCommandInteraction, deps: CommandDeps): Promise<void> {
 	const log = deps.logger ?? scoped('commands');
 	const { store, api, bridge, outbox } = deps;
+	const reply = (payload: BaseMessageOptions, ephemeral = false): Promise<void> => respond(i, payload, ephemeral);
 
 	try {
 		switch (i.commandName) {
@@ -129,7 +152,7 @@ export async function handleCommand(i: ChatInputCommandInteraction, deps: Comman
 				const discord = bridge.discordOnline();
 				const fmt = (rows: { name: string; status: string }[]) =>
 					rows.length ? rows.slice(0, 40).map((r) => `${r.status === 'online' ? '🟢' : '🌙'} ${r.name}`).join('\n') : '_ninguém_';
-				await i.reply({
+				await reply({
 					embeds: [
 						{ title: 'Online no Papo', description: fmt(papo) },
 						{ title: 'Online no Discord', description: fmt(discord) }
@@ -139,17 +162,19 @@ export async function handleCommand(i: ChatInputCommandInteraction, deps: Comman
 			}
 
 			case 'link-channel': {
-				const papoChannelId = i.options.getString('papo_channel', true);
+				const input = i.options.getString('papo_channel', true);
 				const discordChannel = i.options.getChannel('discord_channel', true);
-				const channels = await api.listChannels();
-				const found = channels.find((c) => c.id === papoChannelId);
-				if (!found) {
-					await i.reply({ content: '❌ canal do Papo não encontrado (confira o uuid).', ephemeral: true });
+				await i.deferReply();
+				const resolved = matchChannel(await api.listChannels(), input);
+				if (!resolved.ok) {
+					await reply({ content: `❌ canal do Papo não resolvido: ${resolved.message}` });
 					return;
 				}
-				const link = store.upsertChannelLink({ papo_channel_id: found.id, discord_channel_id: discordChannel.id });
-				await i.reply({
-					content: `✅ linkado: Papo #${found.name} ↔ Discord <#${discordChannel.id}> (mode=${link.mode})`
+				const link = store.upsertChannelLink({ papo_channel_id: resolved.value.id, discord_channel_id: discordChannel.id });
+				await reply({
+					content:
+						`✅ linkado: Papo #${resolved.value.name} ↔ Discord <#${discordChannel.id}> (mode=${link.mode})` +
+						`\n\`${resolved.value.id}\``
 				});
 				void bridge.drain();
 				return;
@@ -158,55 +183,76 @@ export async function handleCommand(i: ChatInputCommandInteraction, deps: Comman
 			case 'unlink-channel': {
 				const discordChannel = i.options.getChannel('discord_channel', true);
 				const removed = store.removeChannelLink(discordChannel.id);
-				await i.reply({ content: removed ? '🔗 link removido.' : 'nenhum link para esse canal', ephemeral: !removed });
+				await reply({ content: removed ? '🔗 link removido.' : 'nenhum link para esse canal' }, !removed);
 				return;
 			}
 
 			case 'link-server': {
-				const papoServerId = i.options.getString('papo_server', true);
+				const input = i.options.getString('papo_server', true);
 				if (!i.guild) {
-					await i.reply({ content: 'use em um servidor Discord', ephemeral: true });
+					await reply({ content: 'use em um servidor Discord' }, true);
 					return;
 				}
-				store.upsertServerLink(papoServerId, i.guild.id);
-				await i.reply({ content: `✅ servidor Papo ${papoServerId} ↔ Discord ${i.guild.name}` });
+				await i.deferReply();
+				const resolved = matchServer(await api.getServer(), input);
+				if (!resolved.ok) {
+					await reply({ content: `❌ servidor Papo não resolvido: ${resolved.message}` });
+					return;
+				}
+				store.upsertServerLink(resolved.value.id, i.guild.id);
+				await reply({
+					content: `✅ servidor Papo ${resolved.value.name} ↔ Discord ${i.guild.name}\n\`${resolved.value.id}\``
+				});
 				return;
 			}
 
 			case 'link-user': {
-				const papoUser = i.options.getString('papo_user', true);
+				const input = i.options.getString('papo_user', true);
 				const discordUser = i.options.getUser('discord_user', true);
-				const profiles = await api.profilesBatch([papoUser]);
-				if (!profiles.length) {
-					await i.reply({ content: '❌ usuário do Papo não encontrado.', ephemeral: true });
+				await i.deferReply();
+				let resolved: Resolved<PapoUserSummary>;
+				if (isUuid(input)) {
+					const [profile] = await api.profilesBatch([input.trim()]);
+					resolved = profile
+						? { ok: true, value: profile, by: 'uuid' }
+						: { ok: false, message: `nenhum usuário do Papo com o uuid ${input.trim()}.` };
+				} else {
+					resolved = matchUser(await api.listAllUsers(), input);
+				}
+				if (!resolved.ok) {
+					await reply({ content: `❌ usuário do Papo não resolvido: ${resolved.message}` });
 					return;
 				}
-				store.upsertPapoUser({ id: profiles[0]!.id, username: profiles[0]!.username, nickname: profiles[0]!.nickname ?? null });
+				const papo = resolved.value;
+				store.upsertPapoUser({ id: papo.id, username: papo.username, nickname: papo.nickname ?? null });
 				store.upsertDiscordUser({ id: discordUser.id, username: discordUser.username, display_name: discordUser.displayName });
-				store.linkUser(papoUser, discordUser.id);
-				await i.reply({ content: `✅ ${profiles[0]!.username} ↔ ${discordUser}` });
+				store.linkUser(papo.id, discordUser.id);
+				await reply({ content: `✅ ${papo.nickname ?? papo.username} (@${papo.username}) ↔ ${discordUser}` });
 				return;
 			}
 
 			case 'unlink-user': {
 				const discordUser = i.options.getUser('discord_user', true);
 				const n = store.unlinkUser(discordUser.id);
-				await i.reply({ content: n ? '🔗 mapeamento removido.' : 'nenhum mapeamento', ephemeral: !n });
+				await reply({ content: n ? '🔗 mapeamento removido.' : 'nenhum mapeamento' }, !n);
 				return;
 			}
 
 			case 'bridges': {
 				const links = store.listChannelLinks();
 				if (!links.length) {
-					await i.reply({ content: 'nenhum canal linkado ainda. Use `/link-channel`.', ephemeral: true });
+					await reply({ content: 'nenhum canal linkado ainda. Use `/link-channel`.' }, true);
 					return;
 				}
+				await i.deferReply();
+				// nome em vez de uuid só para leitura; se o Papo estiver inacessível, mostra o id
+				const names = new Map((await api.listChannels().catch(() => [])).map((c) => [c.id, c.name]));
 				const lines = links.map(
 					(l) =>
-						`• <#${l.discord_channel_id}> ↔ Papo \`${l.papo_channel_id}\` — ${l.mode}` +
+						`• <#${l.discord_channel_id}> ↔ Papo #${names.get(l.papo_channel_id) ?? l.papo_channel_id} — ${l.mode}` +
 						`${l.paused ? ' (pausado)' : ''} · anexos:${l.bridge_attachments ? '✅' : '⛔'} embeds:${l.bridge_embeds ? '✅' : '⛔'} reações:${l.bridge_reactions ? '✅' : '⛔'}`
 				);
-				await i.reply({ embeds: [{ title: 'Canais linkados', description: lines.join('\n') }] });
+				await reply({ embeds: [{ title: 'Canais linkados', description: lines.join('\n') }] });
 				return;
 			}
 
@@ -214,7 +260,7 @@ export async function handleCommand(i: ChatInputCommandInteraction, deps: Comman
 				const discordChannel = i.options.getChannel('discord_channel', true);
 				const link = store.getChannelLinkByDiscord(discordChannel.id);
 				if (!link) {
-					await i.reply({ content: 'esse canal não está linkado.', ephemeral: true });
+					await reply({ content: 'esse canal não está linkado.' }, true);
 					return;
 				}
 				const mode = i.options.getString('mode');
@@ -223,7 +269,7 @@ export async function handleCommand(i: ChatInputCommandInteraction, deps: Comman
 					const value = i.options.getBoolean(option);
 					if (value !== null) store.setChannelLinkFlag(link.id, column, value ? 1 : 0);
 				}
-				await i.reply({ content: '✅ configuração atualizada.' });
+				await reply({ content: '✅ configuração atualizada.' });
 				return;
 			}
 
@@ -248,14 +294,14 @@ export async function handleCommand(i: ChatInputCommandInteraction, deps: Comman
 						description: audit.length ? audit.map((a) => `${a.ts} [${a.level}] ${a.event}`).join('\n') : '_vazio_'
 					}
 				];
-				await i.reply({ embeds });
+				await reply({ embeds });
 				return;
 			}
 
 			case 'retry': {
 				const states: OutboxState[] = i.options.getBoolean('dead') ? ['failed', 'dead'] : ['failed'];
 				const n = outbox.requeueAll(states);
-				await i.reply({ content: `♻️ ${n} job(s) re-enfileirado(s).` });
+				await reply({ content: `♻️ ${n} job(s) re-enfileirado(s).` });
 				void bridge.drain();
 				return;
 			}
@@ -265,24 +311,28 @@ export async function handleCommand(i: ChatInputCommandInteraction, deps: Comman
 				const discordChannel = i.options.getChannel('discord_channel', true);
 				const link = store.getChannelLinkByDiscord(discordChannel.id);
 				if (!link) {
-					await i.reply({ content: 'esse canal não está linkado.', ephemeral: true });
+					await reply({ content: 'esse canal não está linkado.' }, true);
 					return;
 				}
 				store.setChannelLinkFlag(link.id, 'paused', i.commandName === 'pause' ? 1 : 0);
-				await i.reply({ content: i.commandName === 'pause' ? '⏸️ bridge pausado.' : '▶️ bridge retomado.' });
+				await reply({ content: i.commandName === 'pause' ? '⏸️ bridge pausado.' : '▶️ bridge retomado.' });
 				if (i.commandName === 'resume') void bridge.drain();
 				return;
 			}
 
 			case 'help': {
-				await i.reply({
+				await reply({
 					embeds: [
 						{
 							title: 'Papo Wormhole',
 							description: [
-								'**1.** `/link-channel papo_channel:<uuid> discord_channel:#canal`',
-								'**2.** opcional: `/link-user`, `/bridge-config`, `/pause`',
-								'**3.** `/bridges` e `/status` para acompanhar a fila',
+								'**1.** `/link-server papo_server:<nome do servidor>`',
+								'**2.** `/link-channel papo_channel:<nome do canal> discord_channel:#canal`',
+								'**3.** opcional: `/link-user papo_user:<usuário> discord_user:@alguém`, `/bridge-config`, `/pause`',
+								'**4.** `/bridges` e `/status` para acompanhar a fila',
+								'',
+								'Em `papo_server`, `papo_channel` e `papo_user` serve o nome (`Cyber Asilo`, `#geral`, `@jonas`) ou o uuid.',
+								'Nome ambíguo: o bot lista as opções e aí o uuid resolve.',
 								'',
 								'Mensagens, anexos, previews de link, edições, deleções e reações viajam nos dois sentidos.'
 							].join('\n')
@@ -293,10 +343,10 @@ export async function handleCommand(i: ChatInputCommandInteraction, deps: Comman
 			}
 
 			default:
-				await i.reply({ content: 'comando desconhecido', ephemeral: true });
+				await reply({ content: 'comando desconhecido' }, true);
 		}
 	} catch (err) {
 		log.error({ err, command: i.commandName }, 'comando falhou');
-		if (!i.deferred && !i.replied) await i.reply({ content: '⚠️ erro interno; veja os logs.', ephemeral: true });
+		await respond(i, { content: '⚠️ erro interno; veja os logs.' }, true).catch(() => undefined);
 	}
 }

@@ -43,6 +43,12 @@ export const DISCORD_LIMITS = {
 /** Orçamento de texto por chunk de embed (deixa folga para footer/fields). */
 export const EMBED_CHUNK_CHARS = 3600;
 
+/**
+ * Orçamento de texto por chunk no lado Papo: a mensagem bridgeada vai inteira no
+ * `description` do embed (o `content` fica vazio), então o teto é o do embed.
+ */
+export const PAPO_EMBED_CHUNK_CHARS = PAPO_LIMITS.embedDescriptionMax - 256;
+
 /** Tamanho-alvo das partes ao particionar um arquivo que não cabe no destino. */
 export const PART_TARGET_BYTES = 19 * 1024 * 1024;
 

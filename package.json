@@ -14,7 +14,8 @@
     "typecheck": "tsc -p tsconfig.check.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "probe": "tsx scripts/probe-papo.ts"
+    "probe": "tsx scripts/probe-papo.ts",
+    "check-auth": "tsx scripts/check-auth.ts"
   },
   "dependencies": {
     "discord.js": "^14.25.1",

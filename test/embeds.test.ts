@@ -141,15 +141,30 @@ describe('embeds de bridge', () => {
 		expect(e.color).toBe(0x5865f2);
 	});
 
-	it('coloca o avatar do Discord na thumbnail do embed do Papo', () => {
+	it('usa o avatar do Discord como ícone do autor no embed do Papo', () => {
 		const e = buildPapoBridgeEmbed({
 			authorName: 'Jonas',
 			authorIconUrl: 'https://cdn.discordapp.com/avatars/1/a.png',
 			description: 'olá',
 			footerText: '🕒 · Discord'
 		});
-		expect(e.thumbnail?.url).toBe('https://cdn.discordapp.com/avatars/1/a.png');
+		// nada de avatar na thumbnail: o card do Papo desenha a thumbnail em largura total
+		expect(e.thumbnail).toBeUndefined();
 		expect(e.author?.name).toBe('Jonas');
+		expect(e.author?.icon_url).toBe('https://cdn.discordapp.com/avatars/1/a.png');
+		expect(e.site_name).toBe('Jonas');
+	});
+
+	it('mantém imagem de conteúdo na thumbnail do embed do Papo', () => {
+		const e = buildPapoBridgeEmbed({
+			authorName: 'Jonas',
+			authorIconUrl: 'https://cdn.discordapp.com/avatars/1/a.png',
+			description: 'olá',
+			footerText: '🕒 · Discord',
+			thumbnailUrl: 'https://cdn.example.com/foto.png'
+		});
+		expect(e.thumbnail?.url).toBe('https://cdn.example.com/foto.png');
+		expect(e.site_name).toBe('Jonas');
 	});
 
 	it('ignora cor inválida no embed do Papo', () => {
