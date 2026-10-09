@@ -221,9 +221,10 @@ export class Bridge {
 		return link;
 	}
 
-	private resolvers(): TranslateResolvers {
+	private resolvers(link?: ChannelLink): TranslateResolvers {
 		return {
-			propagateMentions: this.cfg.bridge.propagateMentions,
+			// O env é o interruptor global; o flag do link liga a propagação naquele canal.
+			propagateMentions: this.cfg.bridge.propagateMentions || (link?.propagate_mentions ?? 0) === 1,
 			timezone: this.cfg.bridge.timezone,
 			papoUserLabel: (id) => {
 				const u = this.store.getPapoUser(id);
@@ -254,6 +255,20 @@ export class Bridge {
 		}));
 	}
 
+	/**
+	 * Cópia bridgeada da mensagem que está sendo respondida. Sem cópia (mensagem anterior
+	 * ao link, ou apagada) o reply simplesmente não é propagado: não existe id de destino.
+	 */
+	private copyForPapoMessage(papoMessageId?: string | null): string | undefined {
+		if (!papoMessageId) return undefined;
+		return this.store.findMapByPapo(papoMessageId).find((r) => !r.deleted && r.discord_message_id)?.discord_message_id ?? undefined;
+	}
+
+	private copyForDiscordMessage(discordMessageId?: string | null): string | undefined {
+		if (!discordMessageId) return undefined;
+		return this.store.findMapByDiscord(discordMessageId).find((r) => !r.deleted && r.papo_message_id)?.papo_message_id ?? undefined;
+	}
+
 	private async onPapoMessage(msg: PapoWsMessageEvent | PapoMessage): Promise<void> {
 		const link = this.linkForPapoChannel(msg.channel_id);
 		if (!link) return;
@@ -261,7 +276,7 @@ export class Bridge {
 		if (this.store.findMapByPapo(msg.id).length) return; // idempotência
 
 		const author = await this.identity.author(msg.author_id);
-		const translated = papoToDiscordContent(msg.content ?? '', this.resolvers());
+		const translated = papoToDiscordContent(msg.content ?? '', this.resolvers(link));
 		const chunks = chunkText(translated, EMBED_CHUNK_CHARS);
 		const sources = link.bridge_attachments ? this.sourceRefs(msg) : [];
 		if (!chunks.length && !sources.length) return;
@@ -283,7 +298,8 @@ export class Bridge {
 				colorHex: link.color ?? undefined,
 				timestamp: msg.created_at,
 				notes: [],
-				sources: i === 0 ? sources : []
+				sources: i === 0 ? sources : [],
+				replyRefPapoId: i === 0 ? (msg.reply_to ?? undefined) : undefined
 			};
 			const embed = buildDiscordBridgeEmbed({
 				authorName: author.name,
@@ -314,7 +330,7 @@ export class Bridge {
 			this.log.debug({ messageId: e.id }, 'edição de cópia do bot no Papo: eco ignorado');
 			return;
 		}
-		const chunks = chunkText(papoToDiscordContent(e.content ?? '', this.resolvers()), EMBED_CHUNK_CHARS);
+		const chunks = chunkText(papoToDiscordContent(e.content ?? '', this.resolvers(link)), EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
 			? maps
@@ -610,7 +626,7 @@ export class Bridge {
 			avatar_hash: m.author.avatar
 		});
 
-		const content = discordToPapoContent(m.content ?? '', this.resolvers());
+		const content = discordToPapoContent(m.content ?? '', this.resolvers(link));
 		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
 		const linkEmbeds = link.bridge_embeds ? discordEmbedsToPapo(m.embeds as APIEmbed[]) : [];
 		const sources: SourceRef[] = link.bridge_attachments
@@ -645,7 +661,8 @@ export class Bridge {
 				footerBase: `🕒 ${formatDate(m.createdAt.toISOString(), this.cfg.bridge.timezone)} · Discord${chunkLabel(i, total)}`,
 				notes: [],
 				sources: i === 0 ? sources : [],
-				linkEmbeds
+				linkEmbeds,
+				replyRefDiscordId: i === 0 ? (m.reference?.messageId ?? undefined) : undefined
 			};
 			const bridgeEmbed = buildPapoBridgeEmbed({
 				authorName: displayName,
@@ -686,7 +703,7 @@ export class Bridge {
 			this.log.debug({ messageId: fresh.id }, 'edição sem mapeamento: mensagem não ponte');
 			return;
 		}
-		const chunks = chunkText(discordToPapoContent(fresh.content ?? '', this.resolvers()), PAPO_EMBED_CHUNK_CHARS);
+		const chunks = chunkText(discordToPapoContent(fresh.content ?? '', this.resolvers(link)), PAPO_EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
 			? maps
@@ -965,7 +982,7 @@ export class Bridge {
 						]
 					: [built as APIEmbed, ...((job.linkEmbeds ?? []) as APIEmbed[])],
 				files,
-				replyTo: extra ? lastDiscordId : undefined
+				replyTo: extra ? lastDiscordId : this.copyForPapoMessage(job.replyRefPapoId)
 			});
 			lastDiscordId = sent.id;
 			this.store.mapMessage({
@@ -1036,7 +1053,7 @@ export class Bridge {
 			const created = await this.sendToPapoSafe({
 				channelId: job.papoChannelId,
 				content: undefined,
-				replyTo: extra ? job.replyToPapoId ?? lastPapoId : job.replyToPapoId,
+				replyTo: extra ? lastPapoId : this.copyForDiscordMessage(job.replyRefDiscordId),
 				attachments,
 				embeds: embeds.length ? (embeds as ToPapoMessageJob['linkEmbeds']) : undefined
 			});
@@ -1290,14 +1307,18 @@ export class Bridge {
 		if (!map.papo_message_id) throw new RetryableError('sem mensagem do Papo mapeada');
 		const papoEmoji = custom ? await this.emojis.papoByName(display.replace(/:/g, '')) : undefined;
 		const args = papoEmoji ? { emojiId: papoEmoji.id } : { unicode: display };
-		if (job.add) await this.api.addReaction(link.papo_channel_id, map.papo_message_id, args);
-		else await this.api.removeReaction(link.papo_channel_id, map.papo_message_id, args);
-		// marca como nossa: o `react_update` que isso dispara não deve voltar ao Discord
-		this.store.markSelfReaction({
-			linkId: link.id,
-			destinationMessageId: map.papo_message_id,
-			emoji: papoEmoji ? `e:${papoEmoji.id}` : `u:${display}`
-		});
+		const selfKey = papoEmoji ? `e:${papoEmoji.id}` : `u:${display}`;
+		// Marca ANTES de aplicar: o Papo transmite o `react_update` antes de devolver o
+		// HTTP, então o eco chega enquanto a chamada ainda está em voo. Marcando depois,
+		// o eco não era reconhecido e a reação voltava ao Discord como duplicada.
+		this.store.markSelfReaction({ linkId: link.id, destinationMessageId: map.papo_message_id, emoji: selfKey });
+		try {
+			if (job.add) await this.api.addReaction(link.papo_channel_id, map.papo_message_id, args);
+			else await this.api.removeReaction(link.papo_channel_id, map.papo_message_id, args);
+		} catch (err) {
+			this.store.clearSelfReaction({ linkId: link.id, destinationMessageId: map.papo_message_id, emoji: selfKey });
+			throw err;
+		}
 	}
 
 	private async applyPin(job: PinJob): Promise<void> {

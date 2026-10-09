@@ -4,9 +4,6 @@ Ponte bidirecional entre canais do Papo e canais do Discord:
 mensagens, anexos, previews de link, edições, deleções, reações e emojis viajam nos dois
 sentidos, preservando autoria (nome + avatar + data) e ordem de conversa.
 
-> Estado: implementação da v1 concluída (M0–M6 do `BOT.md`); falta validar contra uma
-> instância real do Papo (`npm run probe`).
-
 ## O que faz
 
 | Recurso | Papo → Discord | Discord → Papo |
@@ -194,7 +191,18 @@ trabalho (commite ou `git stash` antes).
   (`🕒 09/10/2026 14:22 · Papo 1/2 · 👍 3 · ❤️ 1`). Quem reagiu não é transportado: a reação fica
   atribuída à conta do bridge nos dois lados.
 - Emoji custom do Papo sem homônimo no guild do Discord não gera reação nativa (seria 400); aparece
-  apenas como `:nome: 2` no resumo do rodapé.
+  apenas como `:nome: 2` no resumo do rodapé. Emoji do guild marcado `available: false` no Discord
+  (69 no guild atual) também só aparece no rodapé: o Discord recusa a reação com 10014.
+- Menção só vira menção real quando o canal-link tem `mentions` ligado (`/bridge-config …`).
+  Propagada, ela renderiza como chip clicável no card dos dois lados, mas não notifica: embed não
+  gera ping no Discord e o trigger de notificação do Papo lê apenas `content`.
+- Reply é propagado por referência mapeada (`message.reference` ↔ `reply_to`): se a mensagem
+  respondida não tem cópia do outro lado (anterior ao link, apagada), o reply simplesmente não vai.
+- Attachment do Papo em análise de moderação (`pending`/`processing`) é reenviado normalmente — o
+  Papo também mostra e serve o arquivo nesse estado. Se o veredito for `blocked`, o Papo apaga a
+  mensagem e o bridge apaga a cópia junto.
+- O card do Papo renderiza a descrição do embed com o renderizador de mensagem: `:emoji:`,
+  markdown e menção aparecem formatados.
 - A imagem de um preview do Papo não tem URL pública: o bridge baixa `GET /embeds/{id}`
   (`image_data`) e re-hospeda no media server para o embed do Discord ter thumbnail.
   Requer `WORMHOLE_MEDIA_BASE_URL` configurada.

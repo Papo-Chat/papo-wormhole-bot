@@ -72,10 +72,9 @@ export async function prepareAttachments(
 			notes.push(`⛔ anexo "${a.name}" bloqueado pela moderação do Papo (não reenviado).`);
 			continue;
 		}
-		if (a.moderationStatus === 'pending' || a.moderationStatus === 'processing') {
-			notes.push(`⏳ anexo "${a.name}" ainda em análise de moderação; reenvio adiado.`);
-			continue;
-		}
+		// `pending`/`processing`: o Papo mostra e serve o arquivo enquanto a inferência
+		// não termina. Reenviar mantém os dois lados iguais; se o veredito for `blocked`
+		// o Papo apaga a mensagem e o bridge apaga a cópia junto.
 		if (a.moderationStatus === 'sensitive') {
 			notes.push(`⚠️ anexo "${a.name}" marcado como conteúdo sensível.`);
 		}

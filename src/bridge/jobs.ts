@@ -40,7 +40,8 @@ export interface ToDiscordMessageJob {
 	notes: string[];
 	sources: SourceRef[];
 	linkEmbeds?: DiscordEmbedPayload[];
-	replyToDiscordId?: string;
+	/** Mensagem Papo respondida (origem); a cópia Discord é resolvida na execução do job. */
+	replyRefPapoId?: string;
 }
 
 export interface ToPapoMessageJob {
@@ -58,7 +59,8 @@ export interface ToPapoMessageJob {
 	linkEmbeds?: PapoEmbedInput[];
 	notes: string[];
 	sources: SourceRef[];
-	replyToPapoId?: string;
+	/** Mensagem Discord respondida (origem); a cópia Papo é resolvida na execução do job. */
+	replyRefDiscordId?: string;
 }
 
 export interface EditJob {

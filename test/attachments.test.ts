@@ -101,9 +101,10 @@ describe('prepareAttachments', () => {
 			{ maxFileBytes: 1024, maxFilesPerMessage: 10 }
 		);
 		expect(plan.blocked).toBe(true);
-		expect(plan.groups.flat().map((f) => f.name)).toEqual(['ok.png']);
+		// `pending` é reenviado: o Papo também mostra e serve o arquivo durante a análise.
+		expect(plan.groups.flat().map((f) => f.name)).toEqual(['duvidoso.png', 'ok.png']);
 		expect(plan.notes.join(' ')).toContain('bloqueado pela moderação');
-		expect(plan.notes.join(' ')).toContain('análise de moderação');
+		expect(plan.notes.join(' ')).not.toContain('análise de moderação');
 	});
 
 	it('agrupa em blocos de até maxFilesPerMessage arquivos', async () => {

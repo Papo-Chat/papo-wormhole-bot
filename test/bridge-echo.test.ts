@@ -89,7 +89,7 @@ const fixture = (discord: FakeDiscord, opts: { papoEmojis?: { id: string; name: 
 			await new Promise((r) => setTimeout(r, 25));
 		}
 	};
-	return { store, outbox, bridge, link, edits, deletes, settle };
+	return { store, outbox, bridge, link, api, edits, deletes, settle };
 };
 
 const discordMessage = (id: string, authorId: string, content = 'editado') => ({
@@ -253,6 +253,23 @@ describe('rodapé de reação só toca a cópia criada pelo bot', () => {
 
 		expect(edits).toEqual([]);
 		expect(discord.edits.map((e) => e.messageId)).toEqual(['9999']);
+	});
+
+	it('eco que chega antes da resposta HTTP não duplica a reação no Discord', async () => {
+		const discord = fakeDiscord();
+		const { store, bridge, link, api, settle } = fixture(discord, { papoEmojis: [{ id: 'e1', name: 'pepega_cy' }] });
+		map(store, link.id, 'discord_to_papo', 'pm2', '8888');
+
+		// O Papo transmite o `react_update` antes de devolver o POST: o eco chega com a
+		// nossa chamada ainda em voo. A marca precisa existir antes da chamada.
+		api.addReaction = async () => {
+			bridge.onPapoEvent({ type: 'react_update', message_id: 'pm2', emoji_id: 'e1', unicode: null, count: 1 } as never);
+		};
+
+		await bridge.onDiscordReaction('8888', '111', 'pepega_cy', '777', false, true, 1);
+		await settle();
+
+		expect(discord.reacts).toEqual([]);
 	});
 
 	it('emoji que o Discord recusa (10014) não derruba o job de reação', async () => {

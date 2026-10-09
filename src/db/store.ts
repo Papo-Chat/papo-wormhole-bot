@@ -368,6 +368,13 @@ export class Store {
 			.run(r.linkId, r.destinationMessageId, r.emoji);
 	}
 
+	/** Desmarca (falha na chamada: a reação nunca chegou ao Papo, o eco não vai existir). */
+	clearSelfReaction(r: { linkId: number; destinationMessageId: string; emoji: string }): void {
+		this.db
+			.prepare('DELETE FROM self_reactions WHERE link_id = ? AND destination_message_id = ? AND emoji = ?')
+			.run(r.linkId, r.destinationMessageId, r.emoji);
+	}
+
 	/** true se a reação vista no Papo foi aplicada por nós há menos de `withinSeconds`. */
 	isSelfReaction(r: {
 		linkId: number;
