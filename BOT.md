@@ -81,21 +81,25 @@ Componentes:
 - **Outbox worker**: um worker serializado **por canal-link** (garante ordem), concorrência entre
   links diferentes.
 - **Media server (opcional)**: expõe `GET /media/{sha256}.{ext}` para dar URL pública a avatar
-  Papo (Discord exige `author.icon_url` como URL).
+  Papo (Discord exige `author.icon_url` como URL). Sem `WORMHOLE_MEDIA_BASE_URL` o avatar vai
+  como **anexo da mensagem** e o embed referencia `attachment://avatar-<sha256>.<ext>` — o Discord
+  aceita referência local em `author.icon_url` e não mostra o arquivo separado.
 
 ---
 
 ## 4. Identidade e mapeamento de autores
 
 - **Modo A (padrão)** — bot comum no Discord, autoria via embed:
-  `author.name = nickname ?? username` (Papo), `author.icon_url = <media server>/media/<sha>.png`,
-  `author.url` opcional.
+  `author.name = nickname ?? username` (Papo), `author.icon_url = <media server>/media/<sha>.png`
+  (ou `attachment://avatar-<sha>.<ext>` quando não há media server público), `author.url` opcional.
 - **Modo B (opcional, por canal-link)** — webhook por canal: `username`/`avatar_url` do webhook
   por mensagem → autoria visual perfeita, custo: permissão `Manage Webhooks`, limite de webhooks
   por canal e rate limit próprio.
 - **Papo (ambos os modos)**: embed custom (`EmbedInput`) com
-  `author.name = nickname ?? username` do usuário Discord, `thumbnail.url = https://cdn.discordapp.com/avatars/<id>/<hash>.png`
-  (Papo aceita `thumbnail`/`image` por URL HTTPS e baixa/re-serva no backend).
+  `author.name = nickname ?? username` do usuário Discord e `author.icon_url = <avatar Discord>`
+  (HTTPS). O backend do Papo baixa e re-serva o avatar em `embeds.author_media`; o card desenha
+  esse ícone no selo da linha de topo e `site_name` (aqui, o nome do autor) ao lado. Avatar na
+  `thumbnail` **não**: o `EmbedCard` desenha a thumbnail como imagem grande do card (largura total).
 - `/link-user` é **opcional**: sem link, usa modo espelho (nome/avatar no embed). Com link,
   habilita: menções traduzidas, `/online` cruzado, reações atribuídas, e futura sincronia de papéis.
 
@@ -110,7 +114,7 @@ Regra geral: **CommonMark é pass-through**; só reescrever sintaxe específica 
 | negrito/itálico/riscado/código/bloco/citação/listas | markdown | markdown | pass-through |
 | spoiler `||x||` | suporta | confirmar | pass-through; se Papo não renderiza, converter para `**spoiler:**` |
 | link `[t](u)` | suporta | suporta | pass-through |
-| menção de usuário | `<@id>` | `@mention(<@uuid>)` | **por padrão não propagar menção real**: renderizar `@nickname` em texto (evita ping em cascata e loops). Habilitável por canal-link |
+| menção de usuário | `<@id>` | `@mention(<@uuid>)` | **por padrão não propagar menção real**: renderizar `@nickname` em texto (evita ping em cascata e loops). Habilitável por canal-link (`/bridge-config … mentions:true`, que é lido pelo translator junto com `WORMHOLE_PROPAGATE_MENTIONS`). Propagada, a menção vira chip clicável no card dos dois lados — embed não gera notificação nem no Discord nem no Papo (o trigger de notificação do Papo lê só `content`) |
 | menção de canal | `<#id>` | sem sintaxe | substituir por `#nome` |
 | menção de role | `<@&id>` | sem sintaxe | substituir por nome da role |
 | `@everyone` / `@here` | ping real | exige `everyone_message` | neutralizado para `@\u200beveryone` (zero-width): a conta do bridge pode ter `everyone_message` e o texto atravessaria como ping em massa |
@@ -128,6 +132,18 @@ reação pelo `user` do evento; no Papo o `react_update` traz apenas `count`, se
 isso toda reação que aplicamos no Papo é registrada em `self_reactions`, e um `react_update` que
 casa com uma linha recente (120 s) é tratado como eco: a contagem é atualizada, mas a reação não
 volta ao Discord (o que inflaria a contagem visível com a reação do bot).
+**A marca é escrita antes da chamada**: o backend do Papo transmite o `react_update` antes de
+devolver o `POST` da reação, então o eco chega com a nossa chamada ainda em voo — marcar depois de
+`addReaction` fazia o eco escapar e a reação voltava ao Discord duplicada. Se a chamada falha, a
+marca é removida (`clearSelfReaction`) para não esconder uma reação legítima seguinte.
+
+**Mutação só escreve na cópia do bot** (`message_map.direction`): edição, deleção e refresh de
+rodapé só podem tocar a mensagem que o próprio bridge criou. `papo_to_discord` → a cópia editável
+está no Discord; `discord_to_papo` → a cópia editável está no Papo. Os eventos que chegam do outro
+lado de uma cópia nossa são eco do que nós mesmos fizemos e são descartados na entrada
+(`allCopiesHere`), sem job. Reação é a exceção: reagir em mensagem de terceiros é permitido, então
+a reação nativa vai para a mensagem original — só o rodapé dela fica intocado (Discord 50005 e
+Papo 403 recusam edição de terceiros, e cada lado já mostra suas próprias reações).
 
 **Anti-ping**: no Discord enviar sempre `allowed_mentions: { parse: [] }`.
 
@@ -176,13 +192,18 @@ mostra no máximo 8 emojis.
   fica em `reaction_counts (link_id, source, source_message_id, emoji)`. `count = 0` remove o emoji do resumo.
 - Emoji custom sem equivalente no destino: **sem reação nativa** (no Discord, `react(":nome:")` é 400);
   o registro vira só o resumo, exibido como texto `:nome: 2` — footer de embed não renderiza emoji custom.
+- Emoji do guild que o Discord recusa (10014 `Unknown Emoji` — apagado por moderação ou marcado
+  `available: false`, flag que o discord.js não expõe no cache do gateway): a lista de indisponíveis é
+  lida de `GET /guilds/{id}/emojis` na conexão e re-carregada quando um 10014 aparece; sem equivalente
+  utilizável o job **não falha**, a reação fica só no resumo do rodapé.
 - A conversão do emoji acontece na **execução** do job (§10.1): guild ainda sem emojis no cache faz o
   job voltar para a fila, em vez de decidir "não existe equivalente" com o cache frio.
 - Remoção é propagada nos dois sentidos: `count = 0` no Papo → `MessageReaction#remove()` no Discord
   (remove a reação da conta do bot); `messageReactionRemove` → `DELETE .../reactions`.
 - Refresh do rodapé é agendado como job `edit` com `footerOnly` e dedupe por bucket de 3 s, para
   rajadas de reação não virarem dezenas de edições. O embed re-renderizado vem do snapshot guardado
-  em `message_map.rendered / bridge_embed / footer_base`.
+  em `message_map.rendered / bridge_embed / footer_base`, e o destino é a **cópia criada pelo bot**
+  (definido por `map.direction`) — nunca a mensagem original do outro lado.
 
 ---
 
@@ -205,7 +226,7 @@ Nitro 500 MB; boost L2 50 MB / L3 100 MB — usar o valor configurado, nunca ass
 | > 10 arquivos na mensagem | agrupar em blocos de 10 (limite Discord), mesma `chunk_total` |
 | `moderation_status = blocked` | **não** bridgear; registrar no audit log |
 | `moderation_status = sensitive` | bridgear com aviso explícito no embed (`⚠️ conteúdo sensível`) |
-| `pending/processing` | adiar o bridge do attachment (reavaliar no próximo tick) ou enviar sem attachment e atualizar depois |
+| `pending` / `processing` | bridgear normalmente: o Papo também mostra e serve o arquivo durante a inferência (`GET /attachments/{id}` só recusa `blocked`, com 410). Se o veredito for `blocked`, o Papo apaga a mensagem inteira e o `message_delete` apaga a cópia do outro lado |
 
 Cache de mídia em disco (`media_cache(sha256, path, mime, size_bytes, source)`) para:
 reuso de avatar, retries sem novo download, e URLs estáveis no media server.
@@ -222,8 +243,8 @@ Mapeamento Discord Embed → Papo `EmbedInput`:
 | `description` (4096) | `description` (4192) | truncar no mínimo comum |
 | `url` | `url` | manter a URL original |
 | `color` (int) | `color` (`#RRGGBB`) | conversão |
-| `author.name` / `author.url` | `author.name` / `author.url` | avatar não existe em `EmbedInput` |
-| `author.icon_url` | — | mover para `thumbnail` do embed |
+| `author.name` / `author.url` | `author.name` / `author.url` | idêntico |
+| `author.icon_url` | `author.icon_url` | backend do Papo baixa e re-serva (`embeds.author_media`); o card usa esse ícone no selo da linha de topo |
 | `thumbnail.url` / `image.url` | `thumbnail.url` / `image.url` | Papo baixa e re-serva (HTTPS + allowlist de MIME) |
 | `video` | `video` | Discord raramente expõe vídeo direto; se houver, `mime_type` obrigatório |
 | `footer.text` | `footer.text` | usado também para data/origem |
@@ -239,6 +260,8 @@ Formato do embed "mensagem bridgeada" (padrão nos dois lados):
 ```
 Discord embed:
   author:  { name: "<nickname|username>", icon_url: <avatar Papo>, url?: <link> }
+           (sem media server público: icon_url = attachment://avatar-<sha256>.<ext>,
+            com o avatar enviado como anexo da própria mensagem)
   title:   (opcional, quando o conteúdo tem link)
   description: <conteúdo traduzido>
   fields:  (opcional)
@@ -247,16 +270,24 @@ Discord embed:
   color:   cor fixa configurável por canal-link
 
 Papo embed (EmbedInput):
-  author:  { name: "<displayName>", url: <link opcional> }
-  description: <conteúdo traduzido>
-  thumbnail: { url: https://cdn.discordapp.com/avatars/<id>/<hash>.png }
+  author:  { name: "<displayName>", icon_url: https://cdn.discordapp.com/avatars/<id>/<hash>.png }
+  site_name: "<displayName>"        (linha de topo; o avatar ocupa o selo dessa linha)
+  description: <conteúdo traduzido>  (a mensagem do Papo sai sem `content`)
+  thumbnail: (somente imagem de conteúdo; nunca avatar)
   image:   { url: https://cdn.discordapp.com/attachments/... }
   footer:  { text: "🕒 09/10/2026 14:03 · Discord #geral · msg 1/2" }
   color:   "#5865F2"
 ```
 
-`content` do Papo fica com o texto original (sem o embed duplicado) para permanecer pesquisável
-e copiável; o embed carrega autoria + mídia.
+No Papo a mensagem bridgeada sai **sem `content`**: o texto vai no `description` do embed, então
+o card é a mensagem (sem bolha de texto duplicada na frente do card). Consequência aceita: a
+mensagem ponte não é pesquisável no Papo — a pesquisa do lado Discord acontece no Discord.
+
+O card do Papo renderiza `description` com o **mesmo renderizador do corpo de mensagem**
+(`renderMessageMarkdown`): markdown, `:emoji:` custom e `@mention(<@uuid>)` aparecem formatados.
+Sem isso o texto da ponte chegava como texto cru — `:sadge:` literal, negrito visível, menção crua.
+Notificação de menção continua exigindo `content` (o trigger do Papo lê só `content`), e no Discord
+menção em embed renderiza como chip sem notificar: é limite das duas plataformas, não do bridge.
 
 ---
 
@@ -499,6 +530,7 @@ WS event {type:"message", id, channel_id, author_id, content, reply_to, attachme
   → resolver autor: GET /users/profile_batch (≤50) → nickname/username + avatar (cache por sha)
   → chunk (§9)
   → attachments: baixar (Range), filtrar por moderação, comprimir/particionar (§7)
+  → reply_to da origem → cópia Discord em message_map → reply do Discord (sem cópia: sem reply)
   → INSERT outbox(to_discord) → worker → channel.messages.create({embeds, files, allowed_mentions:{parse:[]}})
   → INSERT message_map(papo_message_id, discord_message_id, chunk)
   (embeds de link chegam depois via message_embeds_update → atualizar o embed Discord correspondente)
@@ -510,6 +542,7 @@ MESSAGE_CREATE
   → ignorar bot/webhook próprio
   → canal-link?
   → traduzir conteúdo + embeds (rich/link preview) + attachments
+  → m.reference da origem → cópia Papo em message_map → reply_to do Papo (sem cópia: sem reply)
   → montar EmbedInput (author, thumbnail=avatar Discord, image=anexo, footer=data/origem)
   → multipart POST /messages {channel_id, content, embeds(JSON string), attachments[](binary), reply_to?}
   → message_map
@@ -546,6 +579,24 @@ MESSAGE_CREATE
 | `Presence#status` | ✅ | vocabulário `online/idle/dnd/invisible` → normalizado para `online/away/busy/offline` |
 | `channelPinsUpdate` | ❌ não usado | o evento não diz **qual** mensagem foi pinada; exige `fetchPinned()` + diff. Pino Discord → Papo continua fora da v1 |
 
+### 12.5 Reply
+
+O reply é propagado por referência mapeada, não por texto copiado:
+
+| Origem | Referência lida | Destino |
+| --- | --- | --- |
+| Discord | `message.reference.messageId` → `message_map.discord_message_id` → `papo_message_id` | `POST /messages { reply_to }` |
+| Papo | `message.reply_to` → `message_map.papo_message_id` → `discord_message_id` | `send({ reply: { messageReference, failIfNotExists: false } })` |
+
+- Só o **primeiro chunk** carrega a referência; os chunks seguintes respondem ao chunk anterior
+  (thread da própria mensagem particionada).
+- Sem cópia mapeada não há reply: a mensagem respondida é anterior ao link, já foi apagada, ou o
+  link está em modo unilateral. O job resolve a cópia na **execução**, não no enqueue — assim a
+  mensagem respondida, que está na mesma fila FIFO, já tem `message_map` quando o reply é enviado.
+- `reply_to` apontando para mensagem apagada dá 404 no Papo: o bot reenvia sem referência.
+- Não copiamos o texto respondido no corpo do embed: os dois lados já renderizam o preview nativo
+  (Discord mostra a mensagem referenciada, o Papo mostra o reply do próprio Papo).
+
 ---
 
 ## 13. Comandos
@@ -556,10 +607,10 @@ Slash commands no Discord (registro global ou por guild), com controle de acesso
 | Comando | Efeito |
 | --- | --- |
 | `/online` | Lista quem está online na plataforma inversa (usa `presence_cache` dos dois lados) |
-| `/link-channel papo_channel:<id> discord_channel:<canal>` | Cria/atualiza link 1:1 |
+| `/link-channel papo_channel:<nome\|uuid> discord_channel:<canal>` | Cria/atualiza link 1:1 (o nome é resolvido em `GET /channels`) |
 | `/unlink-channel discord_channel:<canal>` | Remove o link (mantém histórico) |
-| `/link-server papo_server:<id> discord_guild:<guild>` | Associa servidores (metadados/validação) |
-| `/link-user papo_user:<id> discord_user:<usuário>` | Mapeia identidade |
+| `/link-server papo_server:<nome\|uuid> discord_guild:<guild>` | Associa servidores (validado contra `GET /server`) |
+| `/link-user papo_user:<nome\|uuid> discord_user:<usuário>` | Mapeia identidade (username/apelido resolvido em `GET /users`) |
 | `/unlink-user discord_user:<usuário>` | Remove mapeamento |
 | `/bridges` | Lista canal-links com estado, contadores e flags |
 | `/bridge-config discord_channel:<canal> mode/identity/attachments/reactions/edits/deletes/mentions/color` | Ajusta flags do canal-link |
@@ -568,6 +619,15 @@ Slash commands no Discord (registro global ou por guild), com controle de acesso
 | `/sync-emojis discord_channel:<canal>` | Pré-importa emojis Discord usados → Papo e vice-versa |
 | `/pause <canal>` / `/resume <canal>` | Pausa o bridge de um canal sem deslinkar |
 | `/help` | Ajuda |
+
+**Alias dos comandos de configuração**: `papo_server`, `papo_channel` e `papo_user` aceitam nome ou
+uuid. O nome é normalizado (sem `#`/`@`, sem caixa) e casado contra `GET /server`, `GET /channels` e
+`GET /users` (username e apelido); substring que casa com um único item é aceita, empate é recusado
+com a lista de candidatos. Os ids resolvidos são os que vão para o SQLite.
+
+**Resposta das interações**: o Discord exige a primeira resposta em 3 s; comandos que consultam o
+Papo (`/link-channel`, `/link-server`, `/link-user`, `/bridges`) chamam `deferReply()` antes da
+chamada e entregam o resultado por `editReply` — sem isso o callback vira `10062 Unknown interaction`.
 
 Comandos Papo: o Papo não tem slash commands → espelho por **prefixo** na primeira linha da
 mensagem do canal-link (ex.: `!status`, `!online`) respondido no próprio canal, ou apenas via
@@ -816,7 +876,7 @@ Também confirmado nos probes:
 
 | Uso | Endpoint |
 | --- | --- |
-| Login / sessão | `POST /auth/login`, `POST /auth/refresh`, `GET /auth/whoami` |
+| Login / sessão | `POST /auth/login`, `POST /auth/login_server` (servidor privado), `POST /auth/refresh`, `GET /auth/whoami` |
 | Listar canais | `GET /channels` |
 | Histórico / backfill | `GET /channels/{channel_id}/messages?since&last_id&order` |
 | Enviar mensagem | `POST /messages` (multipart: `channel_id`, `content`, `reply_to`, `attachments[]`, `embeds` = JSON string) |
