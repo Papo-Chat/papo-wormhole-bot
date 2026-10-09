@@ -1,0 +1,32 @@
+{
+  "name": "papo-wormhole",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bridge bidirecional Papo <-> Discord (mensagens, attachments, embeds, emojis, reacoes).",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json && node -e \"const fs=require('node:fs');fs.mkdirSync('dist/db',{recursive:true});fs.copyFileSync('src/db/schema.sql','dist/db/schema.sql')\"",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "probe": "tsx scripts/probe-papo.ts"
+  },
+  "dependencies": {
+    "discord.js": "^14.25.1",
+    "pino": "^10.1.0",
+    "ws": "^8.18.3",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.15"
+  }
+}

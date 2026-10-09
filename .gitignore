@@ -147,3 +147,9 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# dados locais do bridge (sqlite + cache de mídia)
+data/
+
+# config local do agente
+opencode.json
