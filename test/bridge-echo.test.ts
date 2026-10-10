@@ -3,6 +3,7 @@ import { openDb } from '../src/db/index.js';
 import { Store } from '../src/db/store.js';
 import { Outbox } from '../src/db/outbox.js';
 import { Bridge } from '../src/bridge/bridge.js';
+import { settleQueue } from './helpers/settle.js';
 import type { Config } from '../src/config.js';
 
 const cfg: Config = {
@@ -83,11 +84,7 @@ const fixture = (discord: FakeDiscord, opts: { papoEmojis?: { id: string; name: 
 	const bridge = new Bridge(cfg, store, outbox, api as never, {} as never, discord as never, {} as never);
 	const link = store.upsertChannelLink({ papo_channel_id: 'chan-1', discord_channel_id: '111' });
 	const settle = async (): Promise<void> => {
-		const until = Date.now() + 1200;
-		while (Date.now() < until) {
-			if (outbox.counts().in_flight === 0 && outbox.counts().pending === 0) return;
-			await new Promise((r) => setTimeout(r, 25));
-		}
+		await settleQueue(outbox);
 	};
 	return { store, outbox, bridge, link, api, edits, deletes, settle };
 };

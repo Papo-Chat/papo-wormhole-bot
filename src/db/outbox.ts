@@ -12,6 +12,8 @@ export interface OutboxRow {
 	kind: OutboxKind;
 	payload: string;
 	dedupe_key: string;
+	revision: string | null;
+	remote_attempts: number;
 	state: OutboxState;
 	attempts: number;
 	last_error: string | null;
@@ -25,6 +27,17 @@ export interface EnqueueInput {
 	kind: OutboxKind;
 	dedupeKey: string;
 	payload: unknown;
+	/**
+	 * Chave de **estado** (reação, pino, edição): em vez de descartar a chegada seguinte, o
+	 * job vivo da mesma chave recebe o payload mais recente. Estados repetíveis não são
+	 * eventos únicos — `1→0→1` precisa chegar ao destino.
+	 * Padrão: `true` para `reaction`/`pin`/`edit`, `false` para `message`/`delete`.
+	 */
+	coalesce?: boolean;
+	/** Revisão monotônica do estado (timestamp ISO da origem). Ao coalescer, a maior vence. */
+	revision?: string;
+	/** O job só sai da fila a partir deste instante (debounce do resumo de reações). */
+	notBefore?: Date;
 }
 
 export interface BackoffPolicy {
@@ -32,6 +45,18 @@ export interface BackoffPolicy {
 	baseMs: number;
 	maxMs: number;
 }
+
+/** Kinds cuja chave identifica um estado observável, não um evento único. */
+const COALESCABLE_KINDS: ReadonlySet<OutboxKind> = new Set<OutboxKind>(['reaction', 'pin', 'edit']);
+
+/** Jobs que ainda podem ter o payload trocado por um estado mais novo. */
+const LIVE_STATES = "'pending','in_flight','failed'";
+
+/**
+ * Gerações de coalescência: com o job `in_flight` o payload em execução não pode ser
+ * trocado por baixo do worker — o estado novo entra como job da geração seguinte.
+ */
+const MAX_COALESCE_GENERATIONS = 8;
 
 /** Backoff exponencial com jitter: base * 2^(attempt-1), limitado e com ruído ±20%. */
 export function backoffDelayMs(attempt: number, policy: BackoffPolicy, rand = Math.random): number {
@@ -47,15 +72,60 @@ export class Outbox {
 		private policy: BackoffPolicy
 	) {}
 
-	/** Enfileira um job. Retorna o id, ou null quando o dedupe_key já existia. */
+	/** Sequência de chaves de transbordamento da coalescência. */
+	private overflow = 0;
+
+	/**
+	 * Enfileira um job. Retorna o id, ou `null` quando a chave já está ocupada por job
+	 * equivalente. Para chaves de estado, o job vivo é atualizado com o payload mais recente.
+	 */
 	enqueue(job: EnqueueInput): number | null {
+		const payload = JSON.stringify(job.payload);
+		const due = (job.notBefore ?? new Date()).toISOString();
+		const coalesce = job.coalesce ?? COALESCABLE_KINDS.has(job.kind);
+		if (!coalesce) return this.insert(job, job.dedupeKey, payload, due);
+
+		for (let gen = 0; gen <= MAX_COALESCE_GENERATIONS; gen++) {
+			const key = gen === 0 ? job.dedupeKey : `${job.dedupeKey}#${gen}`;
+			const live = rows<{ id: number; state: OutboxState; revision: string | null }>(
+				this.db
+					.prepare(
+						`SELECT id, state, revision FROM outbox WHERE dedupe_key = ? AND state IN (${LIVE_STATES}) ORDER BY id DESC LIMIT 1`
+					)
+					.all(key)
+			)[0];
+			if (!live) {
+				const id = this.insert(job, key, payload, due);
+				// chave presa por job concluído (schema antigo, UNIQUE permanente): próxima geração
+				if (id !== null) return id;
+				continue;
+			}
+			if (live.state === 'in_flight') continue;
+			return this.replace(live.id, payload, job.revision, live.revision, due);
+		}
+		return this.insertOverflow(job, payload, due);
+	}
+
+	/**
+	 * Gerações esgotadas: o estado entra com chave própria em vez de ser descartado. O
+	 * contador evita que duas transições no mesmo milissegundo colidam na chave.
+	 */
+	private insertOverflow(job: EnqueueInput, payload: string, due: string): number | null {
+		for (let n = 0; n < 16; n++) {
+			const id = this.insert(job, `${job.dedupeKey}#x${(this.overflow++).toString(36)}`, payload, due);
+			if (id !== null) return id;
+		}
+		return null;
+	}
+
+	private insert(job: EnqueueInput, key: string, payload: string, due: string): number | null {
 		try {
 			const res = this.db
 				.prepare(
-					`INSERT INTO outbox (link_id, direction, kind, payload, dedupe_key)
-					 VALUES (?, ?, ?, ?, ?)`
+					`INSERT INTO outbox (link_id, direction, kind, payload, dedupe_key, revision, next_retry_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?)`
 				)
-				.run(job.linkId, job.direction, job.kind, JSON.stringify(job.payload), job.dedupeKey);
+				.run(job.linkId, job.direction, job.kind, payload, key, job.revision ?? null, due);
 			return Number(res.lastInsertRowid);
 		} catch (err) {
 			if ((err as Error).message.includes('UNIQUE')) return null;
@@ -63,26 +133,55 @@ export class Outbox {
 		}
 	}
 
+	/** Troca o estado pendente pelo mais recente — a transição não pode ser descartada. */
+	private replace(id: number, payload: string, revision: string | undefined, current: string | null, due: string): number {
+		if (revision !== undefined && current !== null && revision < current) return id;
+		this.db
+			.prepare(
+				`UPDATE outbox SET payload = ?, revision = ?, state = 'pending', attempts = 0, claimed_at = NULL, next_retry_at = ?
+				 WHERE id = ?`
+			)
+			.run(payload, revision ?? null, due, id);
+		return id;
+	}
+
 	/**
 	 * Reivindica o próximo job pendente de um canal-link (FIFO por id).
 	 * Um só worker por link garante ordem de conversa; links avançam em paralelo.
+	 * Reivindicação em uma única statement atômica: duas instâncias não conseguem tomar
+	 * o mesmo job.
 	 */
 	claimNext(linkId: number, now = new Date()): OutboxRow | undefined {
-		const due = rows<OutboxRow>(
+		const claimed = rows<OutboxRow>(
 			this.db
 				.prepare(
-					`SELECT * FROM outbox
-					 WHERE link_id = ? AND state IN ('pending','failed') AND next_retry_at <= ?
-					 ORDER BY id LIMIT 1`
+					`UPDATE outbox SET state = 'in_flight', claimed_at = ?
+					 WHERE id = (
+					   SELECT id FROM outbox
+					   WHERE link_id = ? AND state IN ('pending','failed') AND next_retry_at <= ?
+					   ORDER BY id LIMIT 1
+					 )
+					 RETURNING *`
 				)
-				.all(linkId, now.toISOString())
+				.all(now.toISOString(), linkId, now.toISOString())
 		);
-		const job = due[0];
+		const job = claimed[0];
 		if (!job) return undefined;
-		this.db
-			.prepare(`UPDATE outbox SET state = 'in_flight', claimed_at = ? WHERE id = ?`)
-			.run(now.toISOString(), job.id);
 		return { ...job, state: 'in_flight' };
+	}
+
+	/**
+	 * Registra o envio remoto antes de chamá-lo. Separa "nunca saiu" de "saiu e o resultado
+	 * é incerto" — o caso em que repetir o envio duplicaria a mensagem no destino.
+	 */
+	markRemoteAttempt(id: number): void {
+		this.db.prepare('UPDATE outbox SET remote_attempts = remote_attempts + 1 WHERE id = ?').run(id);
+	}
+
+	/** Quantos envios remotos já foram tentados para este job. */
+	remoteAttempts(id: number): number {
+		const r = rows<{ remote_attempts: number }>(this.db.prepare('SELECT remote_attempts FROM outbox WHERE id = ?').all(id))[0];
+		return r?.remote_attempts ?? 0;
 	}
 
 	complete(id: number, now = new Date()): void {

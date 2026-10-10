@@ -272,8 +272,12 @@ export class PapoApiError extends Error {
 		this.name = 'PapoApiError';
 	}
 
-	/** Erro transitório: vale retry. 4xx de payload/permissão não. */
+	/**
+	 * Erro transitório: vale retry. 4xx de payload/permissão não.
+	 * 401 é recuperável (a sessão é rotacionada/refeita) — matar o job por falha de
+	 * autenticação descartaria uma mensagem que só precisava de uma sessão nova.
+	 */
 	get transient(): boolean {
-		return this.status >= 500 || this.status === 429 || this.status === 0;
+		return this.status >= 500 || this.status === 429 || this.status === 401 || this.status === 0;
 	}
 }

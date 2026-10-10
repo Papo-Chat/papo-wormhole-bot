@@ -185,6 +185,25 @@ export class DiscordBridge {
 		return channel.messages.fetch(messageId).catch(() => undefined);
 	}
 
+	/**
+	 * Mensagens recentes de um autor no canal, com os rodapés dos embeds. É a base da
+	 * reconciliação de envios cujo resultado é incerto: o bridge reconhece a cópia que já
+	 * criou pelo rodapé determinístico que escreve nela.
+	 */
+	async recentByAuthor(
+		channelId: string,
+		authorId: string,
+		limit = 50
+	): Promise<{ id: string; createdAt: number; footers: string[] }[]> {
+		const channel = await this.textChannel(channelId);
+		if (!channel) return [];
+		const messages = await channel.messages.fetch({ limit: Math.min(100, Math.max(1, limit)) }).catch(() => null);
+		if (!messages) return [];
+		return messages
+			.filter((m) => m.author.id === authorId)
+			.map((m) => ({ id: m.id, createdAt: m.createdTimestamp, footers: m.embeds.map((e) => e.footer?.text ?? '') }));
+	}
+
 	async edit(
 		channelId: string,
 		messageId: string,

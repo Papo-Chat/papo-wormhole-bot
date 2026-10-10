@@ -105,10 +105,20 @@ export class PapoApi {
 	private cookie?: string;
 	private readonly timeoutMs: number;
 	private readonly throttle: Throttle;
+	/** Refresh em voo: chamadas concorrentes compartilham o mesmo resultado. */
+	private refreshing?: Promise<boolean>;
+	/** Recuperação de sessão em voo (401 de várias requisições ao mesmo tempo). */
+	private recovering?: Promise<boolean>;
+	/** Login em voo. */
+	private loggingIn?: Promise<void>;
 
 	constructor(private opts: PapoApiOptions) {
 		this.timeoutMs = opts.timeoutMs ?? 30_000;
 		this.throttle = new Throttle(opts.rateLimitRps ?? 8, opts.rateBurst ?? 12);
+	}
+
+	private get log(): Logger | undefined {
+		return this.opts.logger;
 	}
 
 	get authenticated(): boolean {
@@ -137,7 +147,17 @@ export class PapoApi {
 		}
 	}
 
+	/** Login serializado: várias requisições caindo ao mesmo tempo não disparam N logins. */
 	async login(): Promise<void> {
+		if (this.loggingIn) return this.loggingIn;
+		const run = this.doLogin().finally(() => {
+			this.loggingIn = undefined;
+		});
+		this.loggingIn = run;
+		return run;
+	}
+
+	private async doLogin(): Promise<void> {
 		// servidor privado: o gate de /auth/login lê o cookie Auth e exige o token
 		// temporário de /auth/login_server (um token de sessão não vale como tal).
 		if (this.opts.serverPassword) await this.loginServer();
@@ -170,13 +190,28 @@ export class PapoApi {
 		}
 	}
 
-	/** Rotaciona a sessão (JWT expira em 24h; refresh válido até 30 dias). */
+	/**
+	 * Rotaciona a sessão (JWT expira em 24h; refresh válido até 30 dias).
+	 *
+	 * Só é sucesso quando o backend aceitou: `raw()` não lança para status de erro, então
+	 * validar o status aqui é o que impede um 401/429/500 de ser reportado como sessão
+	 * renovada. Refreshes concorrentes são serializados — chamadas simultâneas disputando
+	 * a rotação invalidariam umas às outras.
+	 */
 	async refresh(): Promise<boolean> {
 		if (!this.cookie) return false;
+		if (this.refreshing) return this.refreshing;
+		const run = this.doRefresh().finally(() => {
+			this.refreshing = undefined;
+		});
+		this.refreshing = run;
+		return run;
+	}
+
+	private async doRefresh(): Promise<boolean> {
+		let res: Response;
 		try {
-			const res = await this.raw('/auth/refresh', { method: 'POST' });
-			this.storeCookie(res);
-			return true;
+			res = await this.raw('/auth/refresh', { method: 'POST' });
 		} catch (err) {
 			if (err instanceof PapoApiError && err.status === 401) {
 				this.cookie = undefined;
@@ -184,6 +219,42 @@ export class PapoApi {
 			}
 			throw err;
 		}
+		if (res.status === 401) {
+			// refresh vencido: a sessão não vale mais, é preciso fazer login de novo
+			this.cookie = undefined;
+			return false;
+		}
+		if (res.status >= 400) {
+			// 429/5xx: a sessão pode até continuar válida, mas o refresh não aconteceu —
+			// transitório, não sucesso
+			await this.problem(res, '/auth/refresh');
+		}
+		this.storeCookie(res);
+		if (!this.cookie) throw new PapoApiError('refresh sem cookie Auth na resposta', 500);
+		return true;
+	}
+
+	/**
+	 * Recupera a sessão depois de um 401: tenta o refresh e, se ele não resolver, refaz o
+	 * login. Serializado: várias requisições 401 ao mesmo tempo fazem uma única recuperação.
+	 */
+	private async recoverSession(): Promise<boolean> {
+		if (this.recovering) return this.recovering;
+		const run = (async () => {
+			try {
+				if (await this.refresh()) return true;
+				this.cookie = undefined;
+				await this.login();
+				return true;
+			} catch (err) {
+				this.log?.error({ err }, 'recuperação de sessão falhou');
+				return false;
+			}
+		})().finally(() => {
+			this.recovering = undefined;
+		});
+		this.recovering = run;
+		return run;
 	}
 
 	async ensureSession(): Promise<void> {
@@ -479,11 +550,11 @@ export class PapoApi {
 		throw new PapoApiError(`${res.status} em ${path}: ${detail}`, res.status, problem, res.headers.get('x-request-id') ?? undefined);
 	}
 
-	private async request<T>(path: string, init: RequestInit = {}, allowRefresh = true): Promise<T> {
+	private async request<T>(path: string, init: RequestInit = {}, allowRecovery = true): Promise<T> {
 		const res = await this.raw(path, init);
-		if (res.status === 401 && allowRefresh) {
-			const refreshed = await this.refresh().catch(() => false);
-			if (refreshed) return this.request<T>(path, init, false);
+		if (res.status === 401 && allowRecovery) {
+			// uma única recuperação por onda de 401; o retry é feito com a sessão renovada
+			if (await this.recoverSession()) return this.request<T>(path, init, false);
 		}
 		if (res.status >= 400) await this.problem(res, path);
 		if (res.status === 204) return undefined as T;

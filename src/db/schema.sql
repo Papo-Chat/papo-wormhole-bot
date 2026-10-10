@@ -70,6 +70,9 @@ CREATE TABLE IF NOT EXISTS message_map (
   rendered           TEXT,
   bridge_embed       TEXT,
   footer_base        TEXT,
+  -- revisão (timestamp ISO da origem) da última edição aplicada à cópia: impede que uma
+  -- edição mais antiga, enfileirada depois, sobrescreva a mais recente
+  edit_revision      TEXT,
   deleted            INTEGER NOT NULL DEFAULT 0,
   created_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -104,15 +107,40 @@ CREATE TABLE IF NOT EXISTS deferred_events (
 );
 CREATE INDEX IF NOT EXISTS ix_deferred_msg ON deferred_events (source, source_message_id);
 
--- Reações que o próprio bridge aplicou no Papo. Serve para reconhecer o eco do
+-- Reações que o próprio bridge aplicou no Papo. Servem para reconhecer o eco do
 -- `react_update` que a nossa reação dispara (o evento do Papo não traz quem reagiu).
 -- `emoji` é a identidade no Papo: `e:<emoji_id>` (custom) ou `u:<unicode>`.
+-- `pending_echoes` é o número de ecos ainda esperados: cada eco consumido libera o
+-- marcador, para que uma reação legítima igual não fique suprimida até a janela expirar.
 CREATE TABLE IF NOT EXISTS self_reactions (
   link_id                INTEGER NOT NULL REFERENCES channel_links(id) ON DELETE CASCADE,
   destination_message_id TEXT    NOT NULL,
   emoji                  TEXT    NOT NULL,
   applied_at             TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  pending_echoes         INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (link_id, destination_message_id, emoji)
+);
+
+-- Espelhos que o bridge mantém vivos no destino (`side` = lado da cópia). Serve para
+-- descontar a reação do próprio bot quando a contagem observada na origem a inclui —
+-- sem isso, `count > 0` leria a reação do bridge como se fosse de um usuário.
+CREATE TABLE IF NOT EXISTS mirror_reactions (
+  link_id                INTEGER NOT NULL REFERENCES channel_links(id) ON DELETE CASCADE,
+  side                   TEXT    NOT NULL CHECK (side IN ('papo','discord')),
+  destination_message_id TEXT    NOT NULL,
+  emoji                  TEXT    NOT NULL,
+  applied_at             TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (link_id, side, destination_message_id, emoji)
+);
+
+-- Mensagens de origem já apagadas, por lado. É o tombstone que reconcilia um `delete`
+-- chegado antes do `message_map`: o job de criação é suprimido em vez de criar uma
+-- cópia órfã, e o delete não é tratado como falha permanente.
+CREATE TABLE IF NOT EXISTS message_tombstones (
+  side              TEXT    NOT NULL CHECK (side IN ('papo','discord')),
+  source_message_id TEXT    NOT NULL,
+  deleted_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (side, source_message_id)
 );
 
 CREATE TABLE IF NOT EXISTS emoji_map (
@@ -145,22 +173,33 @@ CREATE TABLE IF NOT EXISTS presence_cache (
 );
 
 CREATE TABLE IF NOT EXISTS outbox (
-  id            INTEGER PRIMARY KEY,
-  link_id       INTEGER NOT NULL REFERENCES channel_links(id) ON DELETE CASCADE,
-  direction     TEXT NOT NULL CHECK (direction IN ('to_discord','to_papo')),
-  kind          TEXT NOT NULL CHECK (kind IN ('message','edit','delete','reaction','pin')),
-  payload       TEXT NOT NULL,
-  dedupe_key    TEXT NOT NULL UNIQUE,
-  state         TEXT NOT NULL DEFAULT 'pending'
-                CHECK (state IN ('pending','in_flight','done','failed','dead')),
-  attempts      INTEGER NOT NULL DEFAULT 0,
-  last_error    TEXT,
-  next_retry_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  claimed_at    TEXT,
-  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  done_at       TEXT
+  id              INTEGER PRIMARY KEY,
+  link_id         INTEGER NOT NULL REFERENCES channel_links(id) ON DELETE CASCADE,
+  direction       TEXT NOT NULL CHECK (direction IN ('to_discord','to_papo')),
+  kind            TEXT NOT NULL CHECK (kind IN ('message','edit','delete','reaction','pin')),
+  payload         TEXT NOT NULL,
+  dedupe_key      TEXT NOT NULL,
+  -- revisão monotônica do estado (timestamp ISO da origem). Ao coalescer jobs vivos da
+  -- mesma chave, a maior revisão vence: uma edição antiga não substitui a mais nova.
+  revision        TEXT,
+  -- quantas vezes o envio remoto foi tentado: separa "nunca saiu" de "saiu e o resultado
+  -- é incerto", que é o caso em que criar de novo duplicaria a mensagem no destino.
+  remote_attempts INTEGER NOT NULL DEFAULT 0,
+  state           TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (state IN ('pending','in_flight','done','failed','dead')),
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT,
+  next_retry_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  claimed_at      TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  done_at         TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_outbox_due ON outbox (link_id, state, next_retry_at, id);
+-- A chave idempotente vale enquanto o job está vivo. Jobs concluídos não podem continuar
+-- ocupando a chave: estados repetíveis (reação 1→0→1, pin true→false→true) precisam poder
+-- ser reaplicados depois que o job anterior terminou.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_outbox_dedupe_active
+  ON outbox (dedupe_key) WHERE state IN ('pending','in_flight','failed');
 
 CREATE TABLE IF NOT EXISTS audit_log (
   id      INTEGER PRIMARY KEY,

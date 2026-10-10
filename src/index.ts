@@ -100,8 +100,9 @@ async function main(): Promise<void> {
 	// keep-alive da sessão Papo (JWT expira em 24h)
 	const refreshTimer = setInterval(async () => {
 		try {
-			await api.refresh();
-			log.debug('sessão Papo rotacionada');
+			// refresh que falha por 429/5xx não é sucesso: `ensureSession` refaz o login
+			await api.ensureSession();
+			log.debug('sessão Papo verificada/rotacionada');
 		} catch (err) {
 			log.error({ err }, 'refresh de sessão falhou');
 		}
@@ -110,11 +111,16 @@ async function main(): Promise<void> {
 	// tick de retry da fila
 	const drainTimer = setInterval(() => void bridge.drain().catch((err) => log.error({ err }, 'drain falhou')), 15_000);
 
+	let closing = false;
 	const shutdown = async (signal: string) => {
+		if (closing) return;
+		closing = true;
 		log.info({ signal }, 'encerrando');
 		clearInterval(refreshTimer);
 		clearInterval(drainTimer);
-		await bridge.stop().catch((err) => log.error({ err }, 'encerramento do Discord falhou'));
+		// para a ingestão e aguarda os workers antes de fechar o banco: fechar o SQLite no
+		// meio de um envio deixaria job em voo e mapa não gravado
+		await bridge.stop().catch((err) => log.error({ err }, 'encerramento do bridge falhou'));
 		db.close();
 		process.exit(0);
 	};

@@ -3,6 +3,7 @@ import { openDb } from '../src/db/index.js';
 import { Store } from '../src/db/store.js';
 import { Outbox } from '../src/db/outbox.js';
 import { Bridge } from '../src/bridge/bridge.js';
+import { settleQueue } from './helpers/settle.js';
 import type { Config } from '../src/config.js';
 
 const cfg: Config = {
@@ -95,11 +96,7 @@ const fixture = (discord: FakeDiscord) => {
 			footer_base: '🕒 18:09 · Papo'
 		});
 	const settle = async (): Promise<void> => {
-		await new Promise((r) => setTimeout(r, 40));
-		const until = Date.now() + 1200;
-		while (Date.now() < until && (outbox.counts().in_flight > 0 || outbox.counts().pending > 0)) {
-			await new Promise((r) => setTimeout(r, 25));
-		}
+		await settleQueue(outbox);
 	};
 	return { store, outbox, bridge, link, map, papoEdits, settle };
 };

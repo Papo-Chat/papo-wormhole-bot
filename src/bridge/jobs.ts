@@ -72,6 +72,12 @@ export interface EditJob {
 	chunkIndex: number;
 	chunkTotal: number;
 	text: string;
+	/**
+	 * Revisão monotônica da edição na origem (timestamp ISO). Na execução, uma edição mais
+	 * antiga que a última aplicada é descartada: a fila serializa a execução, não a ordem
+	 * cronológica dos eventos de origem.
+	 */
+	revision?: string;
 }
 
 export interface DeleteJob {

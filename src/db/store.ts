@@ -56,6 +56,7 @@ export interface MessageMapRow {
 	rendered: string | null;
 	bridge_embed: string | null;
 	footer_base: string | null;
+	edit_revision: string | null;
 	deleted: number;
 }
 
@@ -84,6 +85,27 @@ export const bool = (v: boolean | number | undefined): number => (v ? 1 : 0);
 
 export class Store {
 	constructor(private db: Db) {}
+
+	/**
+	 * Executa `fn` numa única transação SQLite. É o que torna atômica a transferência de
+	 * eventos adiados para a outbox: se o processo cair no meio, nada foi apagado.
+	 */
+	withTransaction<T>(fn: () => T): T {
+		if (this.db.isTransaction) return fn();
+		this.db.exec('BEGIN IMMEDIATE');
+		try {
+			const out = fn();
+			this.db.exec('COMMIT');
+			return out;
+		} catch (err) {
+			try {
+				this.db.exec('ROLLBACK');
+			} catch {
+				// transação já desfeita pelo próprio SQLite
+			}
+			throw err;
+		}
+	}
 
 	// ── meta ───────────────────────────────────────────────
 	getMeta(key: string): string | undefined {
@@ -293,7 +315,7 @@ export class Store {
 	 */
 	updateMapSnapshot(
 		id: number,
-		snapshot: { rendered?: string | null; bridge_embed?: unknown; footer_base?: string | null }
+		snapshot: { rendered?: string | null; bridge_embed?: unknown; footer_base?: string | null; edit_revision?: string | null }
 	): void {
 		const sets: string[] = [];
 		const args: (string | number | null)[] = [];
@@ -308,6 +330,10 @@ export class Store {
 		if (snapshot.footer_base !== undefined) {
 			sets.push('footer_base = ?');
 			args.push(snapshot.footer_base);
+		}
+		if (snapshot.edit_revision !== undefined) {
+			sets.push('edit_revision = ?');
+			args.push(snapshot.edit_revision);
 		}
 		if (!sets.length) return;
 		args.push(id);
@@ -384,14 +410,18 @@ export class Store {
 		);
 	}
 
-	/** Registra que fomos nós que aplicamos esta reação no Papo (para reconhecer o eco do `react_update`). */
+	/**
+	 * Registra que fomos nós que aplicamos esta reação no Papo (para reconhecer o eco do
+	 * `react_update`). Cada aplicação soma um eco esperado: o marcador é de uso único.
+	 */
 	markSelfReaction(r: { linkId: number; destinationMessageId: string; emoji: string }): void {
 		this.db
 			.prepare(
-				`INSERT INTO self_reactions (link_id, destination_message_id, emoji)
-				 VALUES (?, ?, ?)
+				`INSERT INTO self_reactions (link_id, destination_message_id, emoji, pending_echoes)
+				 VALUES (?, ?, ?, 1)
 				 ON CONFLICT(link_id, destination_message_id, emoji)
-				 DO UPDATE SET applied_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+				 DO UPDATE SET applied_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+				   pending_echoes = self_reactions.pending_echoes + 1`
 			)
 			.run(r.linkId, r.destinationMessageId, r.emoji);
 	}
@@ -401,6 +431,28 @@ export class Store {
 		this.db
 			.prepare('DELETE FROM self_reactions WHERE link_id = ? AND destination_message_id = ? AND emoji = ?')
 			.run(r.linkId, r.destinationMessageId, r.emoji);
+	}
+
+	/**
+	 * Reconhece **um** eco esperado e o consome. Sem consumo, uma reação legítima igual à
+	 * nossa ficava suprimida até a janela expirar.
+	 */
+	consumeSelfReaction(r: {
+		linkId: number;
+		destinationMessageId: string;
+		emoji: string;
+		withinSeconds: number;
+	}): boolean {
+		const seconds = `-${Math.max(1, Math.floor(r.withinSeconds))} seconds`;
+		const res = this.db
+			.prepare(
+				`UPDATE self_reactions SET pending_echoes = pending_echoes - 1
+				 WHERE link_id = ? AND destination_message_id = ? AND emoji = ?
+				   AND pending_echoes > 0
+				   AND applied_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)`
+			)
+			.run(r.linkId, r.destinationMessageId, r.emoji, seconds);
+		return Number(res.changes ?? 0) > 0;
 	}
 
 	/** true se a reação vista no Papo foi aplicada por nós há menos de `withinSeconds`. */
@@ -416,6 +468,7 @@ export class Store {
 				.prepare(
 					`SELECT 1 FROM self_reactions
 					 WHERE link_id = ? AND destination_message_id = ? AND emoji = ?
+					   AND pending_echoes > 0
 					   AND applied_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)`
 				)
 				.get(r.linkId, r.destinationMessageId, r.emoji, seconds) !== undefined
@@ -430,6 +483,63 @@ export class Store {
 		return Number(res.changes ?? 0);
 	}
 
+	// ── espelhos aplicados no destino ───────────────────────
+	/**
+	 * Marca o emoji que o bridge mantém na cópia. Serve para descontar a reação do bot
+	 * quando a contagem observada na origem a inclui.
+	 */
+	markMirrorReaction(r: { linkId: number; side: 'papo' | 'discord'; destinationMessageId: string; emoji: string }): void {
+		this.db
+			.prepare(
+				`INSERT INTO mirror_reactions (link_id, side, destination_message_id, emoji)
+				 VALUES (?, ?, ?, ?)
+				 ON CONFLICT(link_id, side, destination_message_id, emoji)
+				 DO UPDATE SET applied_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+			)
+			.run(r.linkId, r.side, r.destinationMessageId, r.emoji);
+	}
+
+	clearMirrorReaction(r: { linkId: number; side: 'papo' | 'discord'; destinationMessageId: string; emoji: string }): void {
+		this.db
+			.prepare('DELETE FROM mirror_reactions WHERE link_id = ? AND side = ? AND destination_message_id = ? AND emoji = ?')
+			.run(r.linkId, r.side, r.destinationMessageId, r.emoji);
+	}
+
+	hasMirrorReaction(r: { linkId: number; side: 'papo' | 'discord'; destinationMessageId: string; emoji: string }): boolean {
+		return (
+			this.db
+				.prepare('SELECT 1 FROM mirror_reactions WHERE link_id = ? AND side = ? AND destination_message_id = ? AND emoji = ?')
+				.get(r.linkId, r.side, r.destinationMessageId, r.emoji) !== undefined
+		);
+	}
+
+	// ── tombstone de exclusão ───────────────────────────────
+	/**
+	 * A origem foi apagada. Persiste mesmo sem `message_map`: é o que permite reconciliar
+	 * o delete com o job de criação que ainda não rodou.
+	 */
+	tombstoneMessage(side: 'papo' | 'discord', sourceMessageId: string): void {
+		this.db
+			.prepare(
+				`INSERT INTO message_tombstones (side, source_message_id) VALUES (?, ?)
+				 ON CONFLICT(side, source_message_id) DO UPDATE SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+			)
+			.run(side, sourceMessageId);
+	}
+
+	isTombstoned(side: 'papo' | 'discord', sourceMessageId: string): boolean {
+		return this.db.prepare('SELECT 1 FROM message_tombstones WHERE side = ? AND source_message_id = ?').get(side, sourceMessageId) !== undefined;
+	}
+
+	pruneTombstones(olderThanSeconds: number): number {
+		const seconds = `-${Math.max(1, Math.floor(olderThanSeconds))} seconds`;
+		return Number(
+			this.db
+				.prepare(`DELETE FROM message_tombstones WHERE deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)`)
+				.run(seconds).changes
+		);
+	}
+
 	// ── eventos fora de ordem (mensagem ainda não bridgeada) ────
 	deferEvent(e: {
 		source: 'papo' | 'discord';
@@ -440,6 +550,15 @@ export class Store {
 		this.db
 			.prepare('INSERT INTO deferred_events (source, source_message_id, kind, payload) VALUES (?, ?, ?, ?)')
 			.run(e.source, e.sourceMessageId, e.kind, JSON.stringify(e.payload));
+	}
+
+	/** Consulta sem remover: permite medir o que ainda espera um bridge. */
+	peekDeferredEvents(source: 'papo' | 'discord', sourceMessageId: string): DeferredEventRow[] {
+		return rows<DeferredEventRow>(
+			this.db
+				.prepare('SELECT id, source, source_message_id, kind, payload, created_at FROM deferred_events WHERE source = ? AND source_message_id = ? ORDER BY id')
+				.all(source, sourceMessageId)
+		);
 	}
 
 	/** Remove e devolve os eventos adiados de uma mensagem de origem. */

@@ -1,4 +1,5 @@
 import { setTimeout as sleep } from 'node:timers/promises';
+import { createHash } from 'node:crypto';
 import type { Logger } from 'pino';
 import type { APIEmbed, Message as DiscordMessage, PartialMessage as PartialDiscordMessage } from 'discord.js';
 import type { Config } from '../config.js';
@@ -59,11 +60,24 @@ class PermanentError extends Error {}
 /** Erro transitório explícito: o job volta para a fila com backoff. */
 class RetryableError extends Error {}
 
-/** Janela em que uma reação vista no Papo é tratada como eco da nossa própria aplicação. */
-const SELF_REACTION_TTL_SECONDS = 120;
+/**
+ * Janela em que um eco esperado do Papo ainda vale. É curta de propósito: o eco chega
+ * enquanto a nossa chamada ainda está em voo. Marcador de uso único + janela curta é o
+ * que evita suprimir uma reação legítima igual à nossa.
+ */
+const SELF_REACTION_TTL_SECONDS = 20;
 
 /** Janela em que uma edição do Discord ainda pode estar esperando o mapeamento da ponte. */
 const EDIT_MAP_GRACE_MS = 5 * 60_000;
+
+/** Janela em que um delete ainda espera o mapeamento da mensagem de origem aparecer. */
+const DELETE_MAP_GRACE_MS = 10 * 60_000;
+
+/** Resumo de reações: agrupa mudanças da mesma mensagem numa única re-escrita do embed. */
+const FOOTER_DEBOUNCE_MS = 300;
+
+/** Teto de espera pelos workers do bridge no encerramento. */
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 10_000;
 
 /** Selo de edição no rodapé do embed re-renderido (o texto novo vai no `description`). */
 const EDIT_MARK = '✏️ editado · ';
@@ -77,6 +91,23 @@ const MENTION_LOOKUP_LIMIT = 10;
 /** Identidade de uma reação do Papo, estável entre o evento WS e a execução do job. */
 const papoReactionKey = (e: { emoji_id: string | null; unicode: string | null }): string =>
 	e.emoji_id ? `e:${e.emoji_id}` : `u:${e.unicode ?? ''}`;
+
+/**
+ * Assunto do conteúdo (hash), para chave idempotente de estado: duas atualizações com a
+ * mesma forma mas conteúdo diferente não podem ser confundidas.
+ */
+const contentSha = (value: unknown): string =>
+	createHash('sha256').update(JSON.stringify(value ?? null)).digest('hex').slice(0, 16);
+
+/** Chave canônica de um emoji no destino: id (custom) ou nome/unicode. */
+const mirrorEmojiKey = (emojiId: string | null | undefined, nameOrUnicode: string | null | undefined): string =>
+	emojiId ? `i:${emojiId}` : `u:${nameOrUnicode ?? ''}`;
+
+/** Chave canônica a partir do token renderizável do Discord (`<:nome:id>`, `<a:nome:id>` ou unicode). */
+const discordMirrorKey = (token: string): string => {
+	const custom = /^<a?:[A-Za-z0-9_]{1,32}:(\d+)>$/.exec(token);
+	return custom ? `i:${custom[1]}` : `u:${token}`;
+};
 
 /** Vocabulário de presença do Discord → vocabulário do Papo (`/online` cruza os dois). */
 const DISCORD_STATUS_TO_PAPO: Record<string, string> = {
@@ -120,6 +151,16 @@ export class Bridge {
 	private readonly emojis: EmojiBridge;
 	/** Um worker serializado por canal-link (preserva a ordem da conversa). */
 	private readonly running = new Map<number, Promise<void>>();
+	/** Encerramento: para a ingestão e deixa só os jobs em voo terminarem. */
+	private stopping = false;
+	/** Refresh de resumo de reações, agrupado por mensagem de origem. */
+	private readonly footerTimers = new Map<
+		string,
+		{
+			args: { linkId: number; source: 'papo' | 'discord'; sourceMessageId: string; targetChannelId: string };
+			timer: ReturnType<typeof setTimeout>;
+		}
+	>();
 
 	constructor(
 		private cfg: Config,
@@ -150,9 +191,19 @@ export class Bridge {
 		await this.drain();
 	}
 
-	stop(): Promise<void> {
+	/**
+	 * Encerra em camadas: para a ingestão, fecha as conexões e aguarda os workers em voo.
+	 * Quem chama pode então fechar o banco sem cortar um envio pela metade.
+	 */
+	async stop(): Promise<void> {
+		this.stopping = true;
+		this.flushFooterTimers();
 		this.ws.close();
-		return this.discord.destroy();
+		await this.discord.destroy();
+		const inFlight = [...this.running.values()];
+		if (!inFlight.length) return;
+		this.log.info({ workers: inFlight.length }, 'aguardando workers do bridge');
+		await Promise.race([Promise.allSettled(inFlight), sleep(SHUTDOWN_DRAIN_TIMEOUT_MS)]);
 	}
 
 	/** Retoma jobs deixados em `in_flight` por um crash. */
@@ -163,6 +214,8 @@ export class Bridge {
 		if (pruned) this.log.debug({ pruned }, 'registro de reações próprias expirado');
 		const stale = this.store.pruneDeferredEvents(6 * 3600);
 		if (stale) this.log.warn({ stale }, 'eventos adiados sem bridge descartados');
+		const tombstones = this.store.pruneTombstones(24 * 3600);
+		if (tombstones) this.log.debug({ tombstones }, 'tombstones de exclusão expirados');
 		for (const link of this.store.listChannelLinks()) this.scheduleLink(link.id);
 	}
 
@@ -188,6 +241,7 @@ export class Bridge {
 	// ── eventos Papo ───────────────────────────────────────
 
 	onPapoEvent(event: PapoWsEvent): void {
+		if (this.stopping) return; // encerrando: nada novo entra
 		void this.handlePapoEvent(event).catch((err) => this.log.error({ err, type: event.type }, 'evento Papo falhou'));
 	}
 
@@ -363,6 +417,7 @@ export class Bridge {
 					.filter((m) => m.discord_message_id && m.direction === 'papo_to_discord')
 					.map((m) => ({ chunkIndex: m.chunk_index, chunkTotal: Math.max(chunks.length, m.chunk_total) }))
 			: chunks.map((_, i) => ({ chunkIndex: i, chunkTotal: chunks.length }));
+		const revision = e.edited_at ?? new Date().toISOString();
 		for (const target of targets) {
 			const job: EditJob = {
 				kind: 'edit',
@@ -372,13 +427,17 @@ export class Bridge {
 				targetChannelId: link.discord_channel_id,
 				chunkIndex: target.chunkIndex,
 				chunkTotal: target.chunkTotal,
-				text: chunks[target.chunkIndex] ?? ''
+				text: chunks[target.chunkIndex] ?? '',
+				revision
 			};
+			// chave por mensagem/chunk, sem timestamp: a edição mais nova substitui a que
+			// ainda não saiu, em vez de virar um segundo job na fila
 			this.outbox.enqueue({
 				linkId: link.id,
 				direction: 'to_discord',
 				kind: 'edit',
-				dedupeKey: `papo-edit:${e.id}:${target.chunkIndex}:${e.edited_at}`,
+				dedupeKey: `papo-edit:${e.id}:${target.chunkIndex}`,
+				revision,
 				payload: { job } satisfies Envelope
 			});
 		}
@@ -388,6 +447,9 @@ export class Bridge {
 	private async onPapoDelete(e: PapoWsDeleteEvent): Promise<void> {
 		const link = this.store.getChannelLinkByPapo(e.channel_id);
 		if (!link || !link.bridge_deletes) return;
+		// tombstone primeiro: é o que reconcilia um delete chegado antes do mapeamento —
+		// o job de criação é suprimido em vez de criar uma cópia órfã
+		this.store.tombstoneMessage('papo', e.id);
 		const maps = this.store.findMapByPapo(e.id);
 		if (this.allCopiesHere(maps, 'papo')) {
 			// A cópia do bot no Papo sumiu (eco de deleção nascida no Discord, ou moderação):
@@ -395,6 +457,13 @@ export class Bridge {
 			// não pode ser apagada por reflexo.
 			this.store.markMapDeleted(e.id);
 			this.log.debug({ messageId: e.id }, 'deleção de cópia do bot no Papo: original do Discord preservado');
+			return;
+		}
+		this.store.markMapDeleted(e.id);
+		if (!maps.length) {
+			// a mensagem ainda está na fila de bridge: o tombstone já cancela a criação e o
+			// job de delete só entra quando houver cópia a apagar
+			this.log.debug({ messageId: e.id }, 'delete sem mapeamento: criação da cópia suprimida');
 			return;
 		}
 		const job: DeleteJob = { kind: 'delete', side: 'papo', linkId: link.id, sourceMessageId: e.id };
@@ -405,7 +474,6 @@ export class Bridge {
 			dedupeKey: `papo-delete:${e.id}`,
 			payload: { job } satisfies Envelope
 		});
-		this.store.markMapDeleted(e.id);
 		this.scheduleLink(link.id);
 	}
 
@@ -428,6 +496,8 @@ export class Bridge {
 		const embeds = papoEmbedsToDiscord(e.embeds ?? [], {
 			thumbnailUrlFor: (embed) => (embed.id ? mediaUrls.get(embed.id) : undefined)
 		});
+		// hash do conteúdo: a quantidade de embeds sozinha confunde duas atualizações diferentes
+		const sha = contentSha(embeds);
 		for (const map of maps) {
 			if (!map.discord_message_id || map.direction !== 'papo_to_discord') continue;
 			const job: EditJob = {
@@ -444,7 +514,7 @@ export class Bridge {
 				linkId: link.id,
 				direction: 'to_discord',
 				kind: 'edit',
-				dedupeKey: `papo-embeds:${e.message_id}:${map.chunk_index}:${embeds.length}`,
+				dedupeKey: `papo-embeds:${e.message_id}:${map.chunk_index}:${sha}`,
 				payload: { job, embedsOnly: true, embeds } satisfies Envelope
 			});
 		}
@@ -498,18 +568,28 @@ export class Bridge {
 	 * execução do job, quando o guild está acessível — não aqui.
 	 */
 	private enqueuePapoReaction(link: ChannelLink, e: PapoWsReactEvent): void {
-		// eco da reação que nós mesmos aplicamos no Papo: a contagem do Discord já foi registrada
+		const key = papoReactionKey(e);
+		// eco da reação que nós mesmos aplicamos no Papo: o marcador é consumido aqui, para
+		// que uma reação legítima igual à nossa não fique suprimida até a janela expirar
 		if (
-			this.store.isSelfReaction({
+			this.store.consumeSelfReaction({
 				linkId: link.id,
 				destinationMessageId: e.message_id,
-				emoji: papoReactionKey(e),
+				emoji: key,
 				withinSeconds: SELF_REACTION_TTL_SECONDS
 			})
 		) {
 			this.log.debug({ messageId: e.message_id }, 'eco de reação própria: não propagada');
 			return;
 		}
+
+		const map = this.store.findMapByPapo(e.message_id)[0];
+		// o espelho do bridge vive na cópia: se a contagem observada é a da própria cópia,
+		// ela inclui a nossa reação e precisa ser descontada antes de decidir o estado desejado
+		const mirrored =
+			map?.direction === 'discord_to_papo' &&
+			this.store.hasMirrorReaction({ linkId: link.id, side: 'papo', destinationMessageId: e.message_id, emoji: key });
+		const count = Math.max(0, e.count - (mirrored ? 1 : 0));
 
 		const job: ReactionJob = {
 			kind: 'reaction',
@@ -519,27 +599,44 @@ export class Bridge {
 			targetChannelId: link.discord_channel_id,
 			emojiId: e.emoji_id ?? undefined,
 			unicode: e.unicode ?? undefined,
-			count: e.count,
-			add: e.count > 0
+			count,
+			add: count > 0
 		};
+		// chave sem a contagem: `1 → 0 → 1` é a mesma chave, e o estado mais recente
+		// substitui o job pendente em vez de ser descartado
 		this.outbox.enqueue({
 			linkId: link.id,
 			direction: 'to_discord',
 			kind: 'reaction',
-			dedupeKey: `papo-react:${e.message_id}:${e.emoji_id ?? e.unicode}:${e.count}`,
+			dedupeKey: `papo-react:${e.message_id}:${e.emoji_id ?? e.unicode}`,
 			payload: { job } satisfies Envelope
 		});
 		this.queueFooterRefresh(link.id, 'papo', e.message_id, link.discord_channel_id);
 	}
 
-	/** Re-rendera o embed da cópia com o resumo atual de reações (máx. 1 a cada 3s). */
+	/**
+	 * Re-rendera o embed da cópia com o resumo atual de reações. As mudanças da mesma
+	 * mensagem são agrupadas num único refresh, agendado depois da última mudança — não
+	 * dentro de uma janela fixa em que a última alteração se perde.
+	 */
 	private queueFooterRefresh(
 		linkId: number,
 		source: 'papo' | 'discord',
 		sourceMessageId: string,
 		targetChannelId: string
 	): void {
-		const bucket = Math.floor(Date.now() / 3000);
+		const key = `${source}:${sourceMessageId}`;
+		const pending = this.footerTimers.get(key);
+		if (pending) clearTimeout(pending.timer);
+		const args = { linkId, source, sourceMessageId, targetChannelId };
+		this.footerTimers.set(key, { args, timer: setTimeout(() => this.fireFooterRefresh(key), FOOTER_DEBOUNCE_MS) });
+	}
+
+	private fireFooterRefresh(key: string): void {
+		const entry = this.footerTimers.get(key);
+		if (!entry) return;
+		this.footerTimers.delete(key);
+		const { linkId, source, sourceMessageId, targetChannelId } = entry.args;
 		const job: EditJob = {
 			kind: 'edit',
 			side: source,
@@ -554,9 +651,15 @@ export class Bridge {
 			linkId,
 			direction: source === 'papo' ? 'to_discord' : 'to_papo',
 			kind: 'edit',
-			dedupeKey: `footer:${source}:${sourceMessageId}:${bucket}`,
+			dedupeKey: `footer:${source}:${sourceMessageId}`,
 			payload: { job, footerOnly: true } satisfies Envelope
 		});
+		this.scheduleLink(linkId);
+	}
+
+	/** Encerramento: o que estava sendo agrupado entra na fila em vez de se perder. */
+	private flushFooterTimers(): void {
+		for (const key of [...this.footerTimers.keys()]) this.fireFooterRefresh(key);
 	}
 
 	private async onPapoModeration(e: PapoWsModerationEvent): Promise<void> {
@@ -603,7 +706,7 @@ export class Bridge {
 			linkId: link.id,
 			direction: 'to_discord',
 			kind: 'pin',
-			dedupeKey: `papo-pin:${e.message_id}:${e.is_pinned}`,
+			dedupeKey: `papo-pin:${e.message_id}`,
 			payload: { job } satisfies Envelope
 		});
 	}
@@ -617,18 +720,22 @@ export class Bridge {
 		const link = this.store.getChannelLinkById(linkId);
 		if (!link) return;
 		let flushed = 0;
-		for (const row of this.store.takeDeferredEvents(source, sourceMessageId)) {
-			const payload = JSON.parse(row.payload) as PapoWsReactEvent | PapoWsPinEvent;
-			if (row.kind === 'reaction' && link.bridge_reactions) {
-				this.enqueuePapoReaction(link, payload as PapoWsReactEvent);
-				flushed += 1;
-			} else if (row.kind === 'pin' && link.bridge_pins) {
-				this.enqueuePapoPin(link, payload as PapoWsPinEvent);
-				flushed += 1;
-			} else {
-				this.log.debug({ kind: row.kind, sourceMessageId }, 'evento adiado descartado: desligado no link');
+		// apagar os eventos adiados e criar os jobs na mesma transação: se o processo cair
+		// no meio, nada foi removido e os eventos voltam no próximo flush
+		this.store.withTransaction(() => {
+			for (const row of this.store.takeDeferredEvents(source, sourceMessageId)) {
+				const payload = JSON.parse(row.payload) as PapoWsReactEvent | PapoWsPinEvent;
+				if (row.kind === 'reaction' && link.bridge_reactions) {
+					this.enqueuePapoReaction(link, payload as PapoWsReactEvent);
+					flushed += 1;
+				} else if (row.kind === 'pin' && link.bridge_pins) {
+					this.enqueuePapoPin(link, payload as PapoWsPinEvent);
+					flushed += 1;
+				} else {
+					this.log.debug({ kind: row.kind, sourceMessageId }, 'evento adiado descartado: desligado no link');
+				}
 			}
-		}
+		});
 		if (flushed) {
 			this.log.debug({ sourceMessageId, flushed }, 'eventos adiados enfileirados');
 			this.scheduleLink(linkId);
@@ -678,6 +785,7 @@ export class Bridge {
 	}
 
 	async onDiscordMessage(m: DiscordMessage): Promise<void> {
+		if (this.stopping) return;
 		if (this.discord.isSelf(m.author.id)) return; // anti-loop
 		if (m.channel.isThread()) return; // v1: threads fora do escopo
 		const link = this.linkForDiscordChannel(m.channelId);
@@ -751,6 +859,7 @@ export class Bridge {
 
 	async onDiscordEdit(before: DiscordMessage | PartialDiscordMessage, after: DiscordMessage | PartialDiscordMessage): Promise<void> {
 		void before;
+		if (this.stopping) return;
 		const link = this.linkForDiscordChannel(after.channelId);
 		if (!link || !link.bridge_edits) return;
 		// mensagem parcial (não estava no cache): só temos id e canal, o conteúdo precisa ser buscado
@@ -778,6 +887,7 @@ export class Bridge {
 					.filter((m) => m.papo_message_id)
 					.map((m) => ({ chunkIndex: m.chunk_index, chunkTotal: Math.max(chunks.length, m.chunk_total) }))
 			: chunks.map((_, i) => ({ chunkIndex: i, chunkTotal: chunks.length }));
+		const revision = fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : new Date().toISOString();
 		for (const target of targets) {
 			const job: EditJob = {
 				kind: 'edit',
@@ -787,13 +897,15 @@ export class Bridge {
 				targetChannelId: link.papo_channel_id,
 				chunkIndex: target.chunkIndex,
 				chunkTotal: target.chunkTotal,
-				text: chunks[target.chunkIndex] ?? ''
+				text: chunks[target.chunkIndex] ?? '',
+				revision
 			};
 			this.outbox.enqueue({
 				linkId: link.id,
 				direction: 'to_papo',
 				kind: 'edit',
-				dedupeKey: `discord-edit:${fresh.id}:${target.chunkIndex}:${fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : Date.now()}`,
+				dedupeKey: `discord-edit:${fresh.id}:${target.chunkIndex}`,
+				revision,
 				payload: { job } satisfies Envelope
 			});
 		}
@@ -801,6 +913,7 @@ export class Bridge {
 	}
 
 	async onDiscordDelete(m: DiscordMessage | PartialDiscordMessage): Promise<void> {
+		if (this.stopping) return;
 		const link = this.store.getChannelLinkByDiscord(m.channelId);
 		if (!link || !link.bridge_deletes) return;
 		if (!m.partial && this.discord.isSelf(m.author.id)) {
@@ -808,9 +921,17 @@ export class Bridge {
 			this.log.debug({ messageId: m.id }, 'deleção de embed ponte: eco ignorado');
 			return;
 		}
-		if (!m.partial && !this.store.findMapByDiscord(m.id).length && Date.now() - m.createdTimestamp > EDIT_MAP_GRACE_MS) {
+		const maps = this.store.findMapByDiscord(m.id);
+		// tombstone: reconcilia o delete com o job de criação que ainda não rodou
+		this.store.tombstoneMessage('discord', m.id);
+		if (!m.partial && !maps.length && Date.now() - m.createdTimestamp > EDIT_MAP_GRACE_MS) {
 			// mensagem antiga que nunca foi ponte: não há destino a apagar
 			this.log.debug({ messageId: m.id }, 'deleção sem mapeamento: mensagem não ponte');
+			return;
+		}
+		this.store.markMapDeleted(undefined, m.id);
+		if (!maps.length) {
+			this.log.debug({ messageId: m.id }, 'delete sem mapeamento: criação da cópia suprimida');
 			return;
 		}
 		const job: DeleteJob = { kind: 'delete', side: 'discord', linkId: link.id, sourceMessageId: m.id };
@@ -821,7 +942,6 @@ export class Bridge {
 			dedupeKey: `discord-delete:${m.id}`,
 			payload: { job } satisfies Envelope
 		});
-		this.store.markMapDeleted(undefined, m.id);
 		this.scheduleLink(link.id);
 	}
 
@@ -834,10 +954,23 @@ export class Bridge {
 		add = true,
 		count = 0
 	): Promise<void> {
+		if (this.stopping) return;
 		const link = this.store.getChannelLinkByDiscord(channelId);
 		if (!link || !link.bridge_reactions) return;
 
 		const custom = Boolean(emojiId);
+		const key = mirrorEmojiKey(emojiId, emojiName);
+		const map = this.store.findMapByDiscord(messageId)[0];
+		// a cópia Discord é mensagem do bot: quando a contagem observada é a dela, ela inclui
+		// o espelho que o bridge aplicou lá — descontar evita ler a reação do bot como humana
+		const mirrored =
+			map?.direction === 'papo_to_discord' &&
+			this.store.hasMirrorReaction({ linkId: link.id, side: 'discord', destinationMessageId: messageId, emoji: key });
+		const human = Math.max(0, count - (mirrored ? 1 : 0));
+		// estado desejado reconciliado pela contagem absoluta, não pela ação individual:
+		// uma pessoa removendo a reação não derruba o espelho enquanto outras ainda reagiram
+		const present = human > 0 || (add && count === 0);
+
 		const job: ReactionJob = {
 			kind: 'reaction',
 			side: 'discord',
@@ -848,15 +981,15 @@ export class Bridge {
 			emojiName: custom ? emojiName : undefined,
 			animated,
 			unicode: custom ? undefined : emojiName,
-			count,
-			add
+			count: human,
+			add: present
 		};
 		// sem mapeamento ainda, o job re-tenta: a mensagem pode estar na fila de bridge
 		this.outbox.enqueue({
 			linkId: link.id,
 			direction: 'to_papo',
 			kind: 'reaction',
-			dedupeKey: `discord-react:${messageId}:${emojiName}:${add ? 'add' : 'remove'}:${count}`,
+			dedupeKey: `discord-react:${messageId}:${emojiName}`,
 			payload: { job } satisfies Envelope
 		});
 		this.queueFooterRefresh(link.id, 'discord', messageId, link.papo_channel_id);
@@ -870,7 +1003,7 @@ export class Bridge {
 	// ── execução dos jobs ──────────────────────────────────
 
 	private scheduleLink(linkId: number): void {
-		if (this.running.has(linkId)) return;
+		if (this.stopping || this.running.has(linkId)) return;
 		const run = this.runLink(linkId).finally(() => this.running.delete(linkId));
 		this.running.set(linkId, run);
 	}
@@ -878,6 +1011,8 @@ export class Bridge {
 	private async runLink(linkId: number): Promise<void> {
 		let sent = 0;
 		for (;;) {
+			// encerramento: o job em voo termina, mas nenhum outro é reivindicado
+			if (this.stopping) return;
 			const row = this.outbox.claimNext(linkId);
 			if (!row) return;
 			try {
@@ -892,6 +1027,7 @@ export class Bridge {
 				const ctx = { err, jobId: row.id, kind: row.kind, linkId, permanent };
 				if (transient) this.log.warn(ctx, 'job adiado para nova tentativa');
 				else this.log.error(ctx, 'job falhou');
+				if (row.kind === 'reaction') this.requeueFooter(row);
 				if (!transient) continue;
 				await sleep(500);
 			}
@@ -900,13 +1036,33 @@ export class Bridge {
 		}
 	}
 
+	/**
+	 * Reação que falhou deixa o resumo do embed defasado: reagenda o refresh para depois da
+	 * nova tentativa, senão o embed fica com a contagem anterior até o próximo evento.
+	 */
+	private requeueFooter(row: OutboxRow): void {
+		let job: ReactionJob | undefined;
+		try {
+			const env = JSON.parse(row.payload) as Envelope;
+			if (env.job.kind === 'reaction') job = env.job as ReactionJob;
+		} catch {
+			return;
+		}
+		if (!job) return;
+		this.queueFooterRefresh(job.linkId, job.side, job.sourceMessageId, job.targetChannelId);
+	}
+
 	private async execute(row: OutboxRow): Promise<void> {
 		const env = JSON.parse(row.payload) as Envelope;
 		switch (env.job.kind) {
 			case 'message': {
 				const job = env.job as ToDiscordMessageJob | ToPapoMessageJob;
-				if ('description' in job) return this.sendToDiscord(job as ToDiscordMessageJob, env.embed);
-				return this.sendToPapo(job as ToPapoMessageJob, env.embed);
+				// registrar antes de chamar: é o que distingue "nunca saiu" de "saiu e o
+				// resultado é incerto" quando o processo cai depois de o destino aceitar
+				this.outbox.markRemoteAttempt(row.id);
+				const uncertain = this.outbox.remoteAttempts(row.id) > 1;
+				if ('description' in job) return this.sendToDiscord(job as ToDiscordMessageJob, env.embed, uncertain);
+				return this.sendToPapo(job as ToPapoMessageJob, env.embed, uncertain);
 			}
 			case 'edit':
 				return this.applyEdit(env);
@@ -1021,7 +1177,13 @@ export class Bridge {
 		return out;
 	}
 
-	private async sendToDiscord(job: ToDiscordMessageJob, embed?: DiscordEmbedPayload): Promise<void> {
+	private async sendToDiscord(job: ToDiscordMessageJob, embed?: DiscordEmbedPayload, uncertain = false): Promise<void> {
+		// a origem já foi apagada: criar a cópia agora deixaria uma mensagem órfã no Discord
+		if (this.store.isTombstoned('papo', job.papoMessageId)) {
+			this.log.debug({ papoMessageId: job.papoMessageId }, 'criação suprimida: mensagem de origem já excluída');
+			return;
+		}
+
 		const avatar = this.avatarAttachment(job.authorIconSha, embed?.author?.icon_url);
 		const plan = await prepareAttachments(this.sourcesToAttachments(job.sources), {
 			maxFileBytes: this.cfg.discord.maxFileBytes,
@@ -1059,19 +1221,38 @@ export class Bridge {
 		}
 
 		const groups = plan.groups.length ? plan.groups : [[]];
+		// rodapé determinístico por grupo: é a assinatura que permite reconhecer a cópia já
+		// criada quando o resultado de um envio anterior é incerto
+		const footers = groups.map((_, g) =>
+			g === 0 ? footerBase : `🕒 ${formatDate(job.timestamp, this.cfg.bridge.timezone)} · Papo · 📎 ${g + 1}/${groups.length}`
+		);
+		const existing = uncertain ? await this.findDiscordCopies(job.discordChannelId, footers, job.timestamp) : new Map<string, string>();
+		if (existing.size) {
+			this.log.warn(
+				{ papoMessageId: job.papoMessageId, found: existing.size },
+				'cópia já criada no Discord: envio não repetido'
+			);
+		}
+
 		let lastDiscordId: string | undefined;
 
 		for (let g = 0; g < groups.length; g++) {
+			const extra = g > 0;
+			const already = existing.get(footers[g]!);
+			if (already) {
+				lastDiscordId = already;
+				this.mapDiscordCopy(job, already, g, extra, description, built, footerBase);
+				continue;
+			}
 			const files = groups[g]!.map((f) => ({ name: f.name, buffer: f.data }));
 			if (avatar && g === 0 && built.author?.icon_url === attachmentRef(avatar.name)) files.unshift(avatar);
-			const extra = g > 0;
 			const sent = await this.discord.send(job.discordChannelId, {
 				embeds: extra
 					? [
 							buildDiscordBridgeEmbed({
 								authorName: job.authorName,
 								description: `📎 continuação de anexos (${g + 1}/${groups.length})`,
-								footerText: `🕒 ${formatDate(job.timestamp, this.cfg.bridge.timezone)} · Papo`,
+								footerText: footers[g]!,
 								colorHex: job.colorHex
 							}) as APIEmbed
 						]
@@ -1080,23 +1261,63 @@ export class Bridge {
 				replyTo: extra ? lastDiscordId : this.copyForPapoMessage(job.replyRefPapoId)
 			});
 			lastDiscordId = sent.id;
-			this.store.mapMessage({
-				link_id: job.linkId,
-				direction: 'papo_to_discord',
-				papo_message_id: job.papoMessageId,
-				discord_message_id: sent.id,
-				// grupos extras de arquivos recebem índice fora do intervalo dos chunks de texto
-				chunk_index: extra ? EXTRA_CHUNK_BASE + g : job.chunkIndex,
-				chunk_total: job.chunkTotal,
-				rendered: extra ? null : description,
-				bridge_embed: extra ? null : built,
-				footer_base: extra ? null : footerBase
-			});
+			this.mapDiscordCopy(job, sent.id, g, extra, description, built, footerBase);
 		}
 		this.flushDeferred('papo', job.papoMessageId, job.linkId);
+		// o delete chegou enquanto o envio estava em voo: a cópia recém-criada não sobrevive
+		if (this.store.isTombstoned('papo', job.papoMessageId)) {
+			await this.applyDelete({ kind: 'delete', side: 'papo', linkId: job.linkId, sourceMessageId: job.papoMessageId });
+		}
 	}
 
-	private async sendToPapo(job: ToPapoMessageJob, embed?: DiscordEmbedPayload): Promise<void> {
+	private mapDiscordCopy(
+		job: ToDiscordMessageJob,
+		discordMessageId: string,
+		group: number,
+		extra: boolean,
+		description: string,
+		built: DiscordEmbedPayload,
+		footerBase: string
+	): void {
+		this.store.mapMessage({
+			link_id: job.linkId,
+			direction: 'papo_to_discord',
+			papo_message_id: job.papoMessageId,
+			discord_message_id: discordMessageId,
+			// grupos extras de arquivos recebem índice fora do intervalo dos chunks de texto
+			chunk_index: extra ? EXTRA_CHUNK_BASE + group : job.chunkIndex,
+			chunk_total: job.chunkTotal,
+			rendered: extra ? null : description,
+			bridge_embed: extra ? null : built,
+			footer_base: extra ? null : footerBase
+		});
+	}
+
+	/**
+	 * Reconcilia um envio de resultado incerto: procura no destino a cópia que o bridge já
+	 * criou, reconhecida pelo rodapé determinístico e por ser posterior à mensagem de origem.
+	 */
+	private async findDiscordCopies(channelId: string, footers: string[], sourceTimestamp: string): Promise<Map<string, string>> {
+		const out = new Map<string, string>();
+		const selfId = this.discord.selfId;
+		if (!selfId || !footers.length) return out;
+		const recent = await this.discord.recentByAuthor(channelId, selfId, 50).catch(() => undefined);
+		if (!recent) return out;
+		const after = Date.parse(sourceTimestamp) || 0;
+		for (const footer of footers) {
+			const hit = recent.find((m) => m.footers.includes(footer) && m.createdAt >= after);
+			if (hit) out.set(footer, hit.id);
+		}
+		return out;
+	}
+
+	private async sendToPapo(job: ToPapoMessageJob, embed?: DiscordEmbedPayload, uncertain = false): Promise<void> {
+		// a origem já foi apagada: criar a cópia agora deixaria uma mensagem órfã no Papo
+		if (this.store.isTombstoned('discord', job.discordMessageId)) {
+			this.log.debug({ discordMessageId: job.discordMessageId }, 'criação suprimida: mensagem de origem já excluída');
+			return;
+		}
+
 		const plan = await prepareAttachments(this.sourcesToAttachments(job.sources), {
 			maxFileBytes: PAPO_LIMITS.attachmentMaxBytes,
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
@@ -1113,6 +1334,16 @@ export class Bridge {
 		);
 
 		const groups = plan.groups.length ? plan.groups : [[]];
+		const footers = groups.map((_, g) =>
+			clampText(
+				g === 0 ? job.footerBase : `${job.footerBase} · 📎 ${g + 1}/${groups.length}`,
+				PAPO_LIMITS.embedFooterMax
+			)
+		);
+		const existing = uncertain ? await this.findPapoCopies(job.papoChannelId, footers) : new Map<string, string>();
+		if (existing.size) {
+			this.log.warn({ discordMessageId: job.discordMessageId, found: existing.size }, 'cópia já criada no Papo: envio não repetido');
+		}
 		let lastPapoId: string | undefined;
 
 		for (let g = 0; g < groups.length; g++) {
@@ -1124,7 +1355,7 @@ export class Bridge {
 						buildPapoBridgeEmbed({
 							authorName: job.authorName,
 							description: `📎 continuação de anexos (${g + 1}/${groups.length})`,
-							footerText: job.footerBase,
+							footerText: footers[g]!,
 							colorHex: '#5865F2'
 						})
 					]
@@ -1137,9 +1368,16 @@ export class Bridge {
 					this.reactionSummaryFor('papo', this.store.listReactions(job.linkId, 'discord', job.discordMessageId)),
 					PAPO_LIMITS.embedDescriptionMax
 				);
-				mainEmbed.footer = { text: clampText(job.footerBase, PAPO_LIMITS.embedFooterMax) };
+				mainEmbed.footer = { text: footers[g]! };
 			}
 			if (!text && !attachments.length && !embeds.length) return;
+
+			const already = existing.get(footers[g]!);
+			if (already) {
+				lastPapoId = already;
+				this.mapPapoCopy(job, already, g, extra, text, mainEmbed);
+				continue;
+			}
 
 			const created = await this.sendToPapoSafe({
 				channelId: job.papoChannelId,
@@ -1149,18 +1387,47 @@ export class Bridge {
 				embeds: embeds.length ? (embeds as ToPapoMessageJob['linkEmbeds']) : undefined
 			});
 			lastPapoId = created.id;
-			this.store.mapMessage({
-				link_id: job.linkId,
-				direction: 'discord_to_papo',
-				papo_message_id: created.id,
-				discord_message_id: job.discordMessageId,
-				chunk_index: extra ? EXTRA_CHUNK_BASE + g : job.chunkIndex,
-				chunk_total: job.chunkTotal,
-				rendered: extra ? null : text,
-				bridge_embed: extra ? null : mainEmbed ?? null,
-				footer_base: extra ? null : job.footerBase
-			});
+			this.mapPapoCopy(job, created.id, g, extra, text, mainEmbed);
 		}
+		// o delete chegou enquanto o envio estava em voo: a cópia recém-criada não sobrevive
+		if (this.store.isTombstoned('discord', job.discordMessageId)) {
+			await this.applyDelete({ kind: 'delete', side: 'discord', linkId: job.linkId, sourceMessageId: job.discordMessageId });
+		}
+	}
+
+	private mapPapoCopy(
+		job: ToPapoMessageJob,
+		papoMessageId: string,
+		group: number,
+		extra: boolean,
+		text: string,
+		mainEmbed: unknown
+	): void {
+		this.store.mapMessage({
+			link_id: job.linkId,
+			direction: 'discord_to_papo',
+			papo_message_id: papoMessageId,
+			discord_message_id: job.discordMessageId,
+			chunk_index: extra ? EXTRA_CHUNK_BASE + group : job.chunkIndex,
+			chunk_total: job.chunkTotal,
+			rendered: extra ? null : text,
+			bridge_embed: extra ? null : mainEmbed ?? null,
+			footer_base: extra ? null : job.footerBase
+		});
+	}
+
+	/** Reconcilia envio incerto no Papo: a cópia é reconhecida pelo rodapé determinístico. */
+	private async findPapoCopies(channelId: string, footers: string[]): Promise<Map<string, string>> {
+		const out = new Map<string, string>();
+		if (!this.papoUserId || !footers.length) return out;
+		const since = new Date(Date.now() - 3600_000).toISOString();
+		const list = await this.api.listMessages(channelId, { since, order: 'desc' }).catch(() => undefined);
+		const mine = (list?.messages ?? []).filter((m) => m.author_id === this.papoUserId);
+		for (const footer of footers) {
+			const hit = mine.find((m) => (m.embeds ?? []).some((e) => e.footer?.text === footer));
+			if (hit) out.set(footer, hit.id);
+		}
+		return out;
 	}
 
 	/**
@@ -1187,6 +1454,15 @@ export class Bridge {
 			job.side === 'papo' ? this.store.findMapByPapo(job.sourceMessageId) : this.store.findMapByDiscord(job.sourceMessageId);
 		const map = maps.find((m) => m.chunk_index === job.chunkIndex) ?? maps[0];
 		if (!map) throw new RetryableError('mensagem de destino ainda não mapeada');
+		// a fila serializa a execução, não a cronologia da origem: uma edição mais antiga,
+		// enfileirada depois, não pode sobrescrever o estado mais recente já aplicado
+		if (job.revision && map.edit_revision && job.revision <= map.edit_revision) {
+			this.log.debug(
+				{ sourceMessageId: job.sourceMessageId, revision: job.revision },
+				'edição obsoleta ignorada: estado mais recente já aplicado'
+			);
+			return;
+		}
 
 		if (job.side === 'papo') {
 			// direction discord_to_papo: a mensagem do Papo é cópia nossa e a do Discord é de
@@ -1221,7 +1497,7 @@ export class Bridge {
 				embeds: [embed as APIEmbed],
 				files: this.filesForEmbedRefs([embed])
 			});
-			this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed });
+			this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed, edit_revision: job.revision ?? null });
 			return;
 		}
 
@@ -1234,7 +1510,7 @@ export class Bridge {
 		}
 		const embed = this.papoCopyEmbed(map, job.text);
 		await this.api.editMessage(map.papo_message_id, '', [embed]);
-		this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed });
+		this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed, edit_revision: job.revision ?? null });
 	}
 
 	/**
@@ -1328,7 +1604,15 @@ export class Bridge {
 	private async applyDelete(job: DeleteJob): Promise<void> {
 		const maps =
 			job.side === 'papo' ? this.store.findMapByPapo(job.sourceMessageId) : this.store.findMapByDiscord(job.sourceMessageId);
-		if (!maps.length) throw new PermanentError('sem mapeamento para deleção');
+		if (!maps.length) {
+			// o delete chegou antes do mapeamento: o tombstone já suprimiu a criação, então
+			// não há cópia a apagar — isto não é uma falha permanente do job
+			if (this.store.isTombstoned(job.side, job.sourceMessageId)) {
+				this.log.debug({ sourceMessageId: job.sourceMessageId }, 'delete sem cópia: origem já excluída');
+				return;
+			}
+			throw new PermanentError('sem mapeamento para deleção');
+		}
 		const link = this.store.getChannelLinkById(job.linkId);
 		if (!link) throw new PermanentError('link removido');
 
@@ -1351,8 +1635,8 @@ export class Bridge {
 			}
 		}
 		this.store.markMapDeleted(
-			job.side === 'discord' ? job.sourceMessageId : undefined,
-			job.side === 'papo' ? job.sourceMessageId : undefined
+			job.side === 'papo' ? job.sourceMessageId : undefined,
+			job.side === 'discord' ? job.sourceMessageId : undefined
 		);
 	}
 
@@ -1414,8 +1698,18 @@ export class Bridge {
 				);
 				return;
 			}
-			await this.reactOnDiscord(job, link.discord_channel_id, map.discord_message_id, retry);
+			native = retry;
+			await this.reactOnDiscord(job, link.discord_channel_id, map.discord_message_id, native);
 		}
+		// o espelho vive no Discord: registrar é o que permite descontar a reação do bot
+		// quando uma contagem observada naquela mensagem a incluir
+		this.trackMirrorReaction({
+			linkId: link.id,
+			side: 'discord',
+			destinationMessageId: map.discord_message_id,
+			emoji: discordMirrorKey(native),
+			present: job.add
+		});
 	}
 
 	private async reactOnDiscord(job: ReactionJob, channelId: string, messageId: string, emoji: string): Promise<void> {
@@ -1454,6 +1748,29 @@ export class Bridge {
 			this.store.clearSelfReaction({ linkId: link.id, destinationMessageId: map.papo_message_id, emoji: selfKey });
 			throw err;
 		}
+		this.trackMirrorReaction({
+			linkId: link.id,
+			side: 'papo',
+			destinationMessageId: map.papo_message_id,
+			emoji: selfKey,
+			present: job.add
+		});
+	}
+
+	/**
+	 * Registra (ou desregistra) o espelho que o bridge mantém no destino. É a contagem do
+	 * próprio bot: descontá-la é o que impede uma reação do bridge de parecer humana.
+	 */
+	private trackMirrorReaction(r: {
+		linkId: number;
+		side: 'papo' | 'discord';
+		destinationMessageId: string;
+		emoji: string;
+		present: boolean;
+	}): void {
+		const args = { linkId: r.linkId, side: r.side, destinationMessageId: r.destinationMessageId, emoji: r.emoji };
+		if (r.present) this.store.markMirrorReaction(args);
+		else this.store.clearMirrorReaction(args);
 	}
 
 	private async applyPin(job: PinJob): Promise<void> {
