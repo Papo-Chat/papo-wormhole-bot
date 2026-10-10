@@ -1,6 +1,12 @@
 import type { APIEmbed } from 'discord.js';
 import type { PapoEmbed, PapoEmbedInput } from '../papo/types.js';
-import { discordEmbedsToPapo, papoEmbedsToDiscord, type DiscordEmbedPayload } from './embeds.js';
+import {
+	discordEmbedMedia,
+	discordEmbedsToPapo,
+	papoEmbedsToDiscord,
+	type DiscordEmbedPayload,
+	type PreviewMedia
+} from './embeds.js';
 import { DISCORD_LIMITS, clampText } from './limits.js';
 import type { GiphyGif } from './giphy.js';
 
@@ -12,8 +18,13 @@ import type { GiphyGif } from './giphy.js';
  * compatível é aproveitado — mais que isso estoura o orçamento de embeds e repete a mesma URL.
  */
 
-/** Tipos de embed do Discord que funcionam como preview de link. */
-const DISCORD_PREVIEW_TYPES = new Set(['rich', 'link', 'image', 'video', 'gifv', 'article']);
+/**
+ * Tipos de embed do Discord que funcionam como preview de link. `gifv` é o tipo histórico do
+ * picker de GIF; desde 24/02/2026 o Discord indexa a mesma mídia como `gif`, e `components` é
+ * o preview novo de link de mídia (Instagram e afins) — nenhum dos três está nos tipos do
+ * discord-api-types instalado, mas todos aparecem nos payloads.
+ */
+const DISCORD_PREVIEW_TYPES = new Set(['rich', 'link', 'image', 'video', 'gifv', 'gif', 'article', 'components']);
 
 const urlOf = (e: { url?: string | null }): string | undefined => (e.url ? e.url : undefined);
 
@@ -33,6 +44,15 @@ const mediaKey = (url?: string | null): string | undefined => {
 };
 
 /**
+ * Embeds do Discord na forma crua da API. A classe `Embed` do discord.js reescreve a mídia em
+ * camelCase (`proxyURL`) e não expõe `components` — o conversor precisa dos campos da API:
+ * é o `proxy_url` que sobrevive à origem e são os componentes que carregam o preview novo.
+ */
+export function rawDiscordEmbeds(embeds: readonly APIEmbed[] | undefined): APIEmbed[] {
+	return (embeds ?? []).map((e) => (e as { data?: APIEmbed }).data ?? e);
+}
+
+/**
  * Primeiro preview do Discord convertível para o Papo.
  * `attachmentUrls`: mídia que já sai como anexo da mensagem bridgeada. Preview que representa
  * a mesma mídia (mesmo caminho, ainda que em outro host) é descartado: o GIF ou a imagem já
@@ -45,9 +65,13 @@ export function firstDiscordPreview(
 	const bridged = new Set(attachmentUrls.map(mediaKey).filter(Boolean));
 	for (const e of embeds ?? []) {
 		if (e.type && !DISCORD_PREVIEW_TYPES.has(e.type)) continue;
-		const media = [urlOf(e), e.image?.url, e.thumbnail?.url, e.video?.url].map(mediaKey);
-		if (media.some((key) => key && bridged.has(key))) continue;
-		const [converted] = discordEmbedsToPapo([e as unknown as DiscordEmbedPayload]);
+		const payload = e as unknown as DiscordEmbedPayload;
+		const media = discordEmbedMedia(payload);
+		const keys = [urlOf(e), ...media.images, ...media.videos]
+			.flatMap((m) => (typeof m === 'string' ? [m] : m ? [m.url, m.origin] : []))
+			.map(mediaKey);
+		if (keys.some((key) => key && bridged.has(key))) continue;
+		const [converted] = discordEmbedsToPapo([payload]);
 		if (converted && Object.keys(converted).length) return converted;
 	}
 	return undefined;
@@ -56,11 +80,16 @@ export function firstDiscordPreview(
 /**
  * Primeiro preview do Papo convertível para o Discord.
  * `thumbnailUrlFor`: o Papo não expõe a imagem do embed por URL; quem tem os bytes é
- * `GET /embeds/{id}` e o bridge re-hospeda no media server.
+ * `GET /embeds/{id}` e o bridge re-hospeda (media server ou anexo da mensagem).
+ * `mediaFor`: mídia já baixada pelo bridge — a thumbnail pode vir como `attachment://` e o
+ * vídeo entra como anexo, porque o Discord não grava `video` em embed criado por bot.
  */
 export function firstPapoPreview(
 	embeds: readonly PapoEmbed[] | null | undefined,
-	opts: { thumbnailUrlFor?: (embed: PapoEmbed) => string | undefined } = {}
+	opts: {
+		thumbnailUrlFor?: (embed: PapoEmbed) => string | undefined;
+		mediaFor?: (embed: PapoEmbed) => PreviewMedia | undefined;
+	} = {}
 ): DiscordEmbedPayload | undefined {
 	for (const e of embeds ?? []) {
 		const [converted] = papoEmbedsToDiscord([e], opts);

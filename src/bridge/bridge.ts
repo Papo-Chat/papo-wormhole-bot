@@ -36,21 +36,26 @@ import {
 } from './translator.js';
 import {
 	attachmentRef,
+	attachmentRefName,
 	avatarAttachmentName,
 	buildDiscordBridgeEmbed,
 	buildPapoBridgeEmbed,
+	discordApiEmbed,
 	fitEmbedBudget,
+	mediaAttachmentName,
+	mimeFromUrl,
 	shaFromAttachmentRef,
-	type DiscordEmbedPayload
+	type DiscordEmbedPayload,
+	type PreviewMedia
 } from './embeds.js';
-import { prepareAttachments, type SourceAttachment } from './attachments.js';
+import { prepareAttachments, sanitizeName, type SourceAttachment } from './attachments.js';
 import { mergeReactionCounts, reactionSummaryText, type ReactionDisplay } from './reactions.js';
-import { EMBED_CHUNK_CHARS, PAPO_LIMITS, PAPO_EMBED_CHUNK_CHARS, DISCORD_LIMITS, clampText } from './limits.js';
+import { EMBED_CHUNK_CHARS, PAPO_LIMITS, PAPO_EMBED_CHUNK_CHARS, DISCORD_LIMITS, PAPO_VIDEO_MIMES, clampText } from './limits.js';
 import { EmojiBridge } from './emoji.js';
 import type { MediaStore } from './media.js';
 import { PapoIdentity } from './identity.js';
 import { copySignatures, signedFooter } from './signature.js';
-import { firstDiscordPreview, firstPapoPreview, giphyEmbed } from './previews.js';
+import { firstDiscordPreview, firstPapoPreview, giphyEmbed, rawDiscordEmbeds } from './previews.js';
 import { GiphyResolver, giphyId } from './giphy.js';
 import { EXTRA_CHUNK_BASE, type BridgeJob, type DeleteJob, type EditJob, type PinJob, type ReactionJob, type SourceRef, type ToDiscordMessageJob, type ToPapoMessageJob } from './jobs.js';
 
@@ -123,8 +128,19 @@ interface Envelope {
 	 * atrasa a entrada na fila — e não é ela que decide a ordem das atualizações.
 	 */
 	papoEmbeds?: PapoEmbed[];
+	/**
+	 * Preview de link **já convertido para o Papo** (origem Discord). O Discord anexa o
+	 * preview de link depois de criar a mensagem, então ele chega por `MESSAGE_UPDATE` e é
+	 * aplicado à cópia do Papo como estado separado do texto.
+	 */
+	papoPreviews?: PapoEmbedInput[];
 	/** Re-rendera o embed da cópia com o resumo atual de reações (nome persistido no outbox). */
 	footerOnly?: boolean;
+}
+
+/** Preview de link do Discord adiado até a cópia do Papo existir. */
+interface DiscordPreviewDeferred {
+	embed: PapoEmbedInput;
 }
 
 const isDiscordTransient = (err: unknown): boolean => {
@@ -422,11 +438,11 @@ export class Bridge {
 		return { text: content };
 	}
 
-	/** Primeiro preview do Papo convertido para o Discord, com a imagem re-hospedada. */
+	/** Primeiro preview do Papo convertido para o Discord, com a mídia materializada. */
 	private async papoPreviewEmbed(embeds: PapoEmbed[] | null | undefined): Promise<DiscordEmbedPayload | undefined> {
 		if (!embeds?.length) return undefined;
-		const mediaUrls = await this.embedMediaUrls(embeds);
-		return firstPapoPreview(embeds, { thumbnailUrlFor: (embed) => (embed.id ? mediaUrls.get(embed.id) : undefined) });
+		const media = await this.previewMediaFor(embeds);
+		return firstPapoPreview(embeds, { mediaFor: (embed) => (embed.id ? media.get(embed.id) : undefined) });
 	}
 
 	/**
@@ -615,31 +631,89 @@ export class Bridge {
 	}
 
 	/**
-	 * O payload do Papo não traz URL para a imagem do embed — só mime/medidas.
-	 * Os bytes vêm de `GET /embeds/{id}` (`image_data`, base64): re-hospedamos no
-	 * media server para o Discord poder exibir a thumbnail do preview.
+	 * Mídia do preview de link, materializada no cache do bridge.
+	 *
+	 * Imagem: o payload do Papo não traz URL — só mime/medidas; os bytes vêm de
+	 * `GET /embeds/{id}` (`image_data`). Com media server público a thumbnail vira URL
+	 * absoluta; sem ele vira anexo da mensagem (`attachment://`), que o Discord resolve com o
+	 * arquivo reenviado em cada edit.
+	 * Vídeo: o Discord não grava `video` em embed criado por bot — o arquivo é baixado e
+	 * anexado à mensagem, e é o anexo que faz o preview do Twitter/Instagram virar player.
 	 */
-	private async embedMediaUrls(embeds: PapoEmbed[]): Promise<Map<string, string>> {
-		const out = new Map<string, string>();
-		const base = this.cfg.bridge.mediaBaseUrl;
-		if (!base) return out;
+	private async previewMediaFor(embeds: PapoEmbed[]): Promise<Map<string, PreviewMedia>> {
+		const out = new Map<string, PreviewMedia>();
 		for (const embed of embeds) {
-			if (!embed.id || embed.thumbnail?.url || embed.image?.url) continue;
-			if (!embed.thumbnail && !embed.image) continue;
-			try {
-				const full = await this.api.getEmbed(embed.id);
-				if (!full.image_data) continue;
-				const data = Buffer.from(full.image_data, 'base64');
-				if (!data.length) continue;
-				const mime = embed.thumbnail?.mime_type ?? embed.image?.mime_type ?? 'image/webp';
-				const { sha256 } = this.media.save(data, mime, `embed:${embed.id}`);
-				const url = this.media.urlFor(sha256, base);
-				if (url) out.set(embed.id, url);
-			} catch (err) {
-				this.log.debug({ err, embedId: embed.id }, 'imagem do embed não pôde ser re-hospedada');
+			if (!embed.id) continue;
+			const media: PreviewMedia = {};
+			const image = await this.embedImageMedia(embed);
+			if (image) {
+				const publicUrl = this.media.urlFor(image.sha, this.cfg.bridge.mediaBaseUrl);
+				if (publicUrl) media.thumbnailUrl = publicUrl;
+				else {
+					const name = mediaAttachmentName(image.sha, image.ext);
+					media.thumbnailUrl = attachmentRef(name);
+					(media.refs ??= []).push({ name, sha: image.sha });
+				}
 			}
+			const video = await this.embedVideoMedia(embed);
+			if (video) (media.refs ??= []).push({ name: mediaAttachmentName(video.sha, video.ext), sha: video.sha });
+			if (media.thumbnailUrl || media.refs?.length) out.set(embed.id, media);
 		}
 		return out;
+	}
+
+	/** Bytes da imagem do embed do Papo (`GET /embeds/{id}`), salvos no cache de mídia. */
+	private async embedImageMedia(embed: PapoEmbed): Promise<{ sha: string; ext: string } | undefined> {
+		if (!embed.id || embed.thumbnail?.url || embed.image?.url) return undefined;
+		if (!embed.thumbnail && !embed.image) return undefined;
+		try {
+			const full = await this.api.getEmbed(embed.id);
+			if (!full.image_data) return undefined;
+			const data = Buffer.from(full.image_data, 'base64');
+			if (!data.length) return undefined;
+			const mime = embed.thumbnail?.mime_type ?? embed.image?.mime_type ?? 'image/webp';
+			const saved = this.media.save(data, mime, `embed:${embed.id}`);
+			return { sha: saved.sha256, ext: saved.ext };
+		} catch (err) {
+			this.log.debug({ err, embedId: embed.id }, 'imagem do embed não pôde ser re-hospedada');
+			return undefined;
+		}
+	}
+
+	/**
+	 * Bytes do vídeo do preview: o `video.url` do embed do Papo é o arquivo direto
+	 * (CDN do Twitter, offload do Instagram). Página de player (o `/embed/` do YouTube) não é
+	 * arquivo e fica de fora. Não cabe no limite de upload do Discord? O preview segue só com
+	 * a thumbnail — baixar um vídeo que não pode ser reenviado não serve para nada.
+	 */
+	private async embedVideoMedia(embed: PapoEmbed): Promise<{ sha: string; ext: string } | undefined> {
+		const url = embed.video?.url;
+		if (!url) return undefined;
+		const mime = embed.video?.mime_type ?? mimeFromUrl(url);
+		if (!PAPO_VIDEO_MIMES.includes(mime)) return undefined;
+		const max = this.cfg.discord.maxFileBytes;
+		try {
+			const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+			if (!res.ok) {
+				this.log.debug({ embedId: embed.id, status: res.status }, 'vídeo do preview: origem recusou');
+				return undefined;
+			}
+			const declared = Number(res.headers.get('content-length') ?? 0);
+			if (declared > max) {
+				this.log.debug({ embedId: embed.id, bytes: declared }, 'vídeo do preview excede o limite do Discord');
+				return undefined;
+			}
+			const data = Buffer.from(await res.arrayBuffer());
+			if (!data.length || data.length > max) {
+				this.log.debug({ embedId: embed.id, bytes: data.length }, 'vídeo do preview excede o limite do Discord');
+				return undefined;
+			}
+			const saved = this.media.save(data, mime, `embed-video:${embed.id}`);
+			return { sha: saved.sha256, ext: saved.ext };
+		} catch (err) {
+			this.log.debug({ err, embedId: embed.id }, 'vídeo do preview não pôde ser baixado');
+			return undefined;
+		}
 	}
 
 	private async onPapoReaction(e: PapoWsReactEvent): Promise<void> {
@@ -816,7 +890,6 @@ export class Bridge {
 	 * agora, na fila do link que acabou de criar o mapeamento.
 	 */
 	private flushDeferred(source: 'papo' | 'discord', sourceMessageId: string, linkId: number): void {
-		if (source !== 'papo') return;
 		const link = this.store.getChannelLinkById(linkId);
 		if (!link) return;
 		let flushed = 0;
@@ -824,17 +897,30 @@ export class Bridge {
 		// no meio, nada foi removido e os eventos voltam no próximo flush
 		this.store.withTransaction(() => {
 			for (const row of this.store.takeDeferredEvents(source, sourceMessageId)) {
-				const payload = JSON.parse(row.payload) as PapoWsReactEvent | PapoWsPinEvent | PapoWsEmbedsEvent;
-				if (row.kind === 'reaction' && link.bridge_reactions) {
-					this.enqueuePapoReaction(link, payload as PapoWsReactEvent);
-					flushed += 1;
-				} else if (row.kind === 'pin' && link.bridge_pins) {
-					this.enqueuePapoPin(link, payload as PapoWsPinEvent);
-					flushed += 1;
-				} else if (row.kind === 'embeds' && link.bridge_embeds) {
+				if (row.kind === 'embeds' && link.bridge_embeds) {
 					// a revisão é o instante em que o evento chegou: um preview adiado não
 					// pode vencer uma atualização mais recente que já entrou na fila
-					flushed += this.enqueuePapoEmbeds(link, this.store.findMapByPapo(sourceMessageId), payload as PapoWsEmbedsEvent, row.created_at);
+					flushed +=
+						source === 'papo'
+							? this.enqueuePapoEmbeds(
+									link,
+									this.store.findMapByPapo(sourceMessageId),
+									JSON.parse(row.payload) as PapoWsEmbedsEvent,
+									row.created_at
+								)
+							: this.enqueuePapoPreview(
+									link,
+									this.store.findMapByDiscord(sourceMessageId),
+									sourceMessageId,
+									(JSON.parse(row.payload) as DiscordPreviewDeferred).embed,
+									row.created_at
+								);
+				} else if (source === 'papo' && row.kind === 'reaction' && link.bridge_reactions) {
+					this.enqueuePapoReaction(link, JSON.parse(row.payload) as PapoWsReactEvent);
+					flushed += 1;
+				} else if (source === 'papo' && row.kind === 'pin' && link.bridge_pins) {
+					this.enqueuePapoPin(link, JSON.parse(row.payload) as PapoWsPinEvent);
+					flushed += 1;
 				} else {
 					this.log.debug({ kind: row.kind, sourceMessageId }, 'evento adiado descartado: desligado no link');
 				}
@@ -920,8 +1006,22 @@ export class Bridge {
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
 		const preview = link.bridge_embeds
-			? firstDiscordPreview(m.embeds as APIEmbed[], m.attachments.map((a) => a.url))
+			? firstDiscordPreview(rawDiscordEmbeds(m.embeds as APIEmbed[]), m.attachments.map((a) => a.url))
 			: undefined;
+		// GIF de preview: o Papo re-encode a imagem do embed como thumbnail estática, então
+		// animação só sobrevive como arquivo da mensagem.
+		const previewGif = preview && !preview.video && preview.thumbnail?.mime_type === 'image/gif' ? preview.thumbnail.url : undefined;
+		if (preview && previewGif && link.bridge_attachments) {
+			sources.push({
+				side: 'discord',
+				id: `${m.id}:preview`,
+				name: this.previewFileName(previewGif, 'preview.gif'),
+				mime: 'image/gif',
+				sizeBytes: 0,
+				url: previewGif
+			});
+			preview.thumbnail = undefined;
+		}
 		const linkEmbeds = preview ? [preview] : [];
 
 		if (!chunks.length && !sources.length && !linkEmbeds.length) return;
@@ -971,7 +1071,7 @@ export class Bridge {
 		void before;
 		if (this.stopping) return;
 		const link = this.linkForDiscordChannel(after.channelId);
-		if (!link || !link.bridge_edits) return;
+		if (!link || (!link.bridge_edits && !link.bridge_embeds)) return;
 		// mensagem parcial (não estava no cache): só temos id e canal, o conteúdo precisa ser buscado
 		const fresh = after.partial ? await this.discord.fetchMessage(after.channelId, after.id) : (after as DiscordMessage);
 		if (!fresh) {
@@ -998,28 +1098,84 @@ export class Bridge {
 					.map((m) => ({ chunkIndex: m.chunk_index, chunkTotal: Math.max(chunks.length, m.chunk_total) }))
 			: chunks.map((_, i) => ({ chunkIndex: i, chunkTotal: chunks.length }));
 		const revision = fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : new Date().toISOString();
+		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
+		// e sem isso o cartão do Papo fica só com a URL escrita
+		const preview = link.bridge_embeds
+			? firstDiscordPreview(rawDiscordEmbeds(fresh.embeds as APIEmbed[]), fresh.attachments.map((a) => a.url))
+			: undefined;
+		if (preview) {
+			if (maps.length) this.enqueuePapoPreview(link, maps, fresh.id, preview, revision);
+			else {
+				// a cópia ainda está na fila de bridge: o preview espera o mapeamento em vez de
+				// queimar as tentativas de um job que não tem para onde ir
+				this.store.deferEvent({
+					source: 'discord',
+					sourceMessageId: fresh.id,
+					kind: 'embeds',
+					payload: { embed: preview } satisfies DiscordPreviewDeferred
+				});
+				this.log.debug({ messageId: fresh.id }, 'preview adiado: mensagem ainda não bridgeada');
+			}
+		}
 		for (const target of targets) {
+			if (link.bridge_edits) {
+				const job: EditJob = {
+					kind: 'edit',
+					side: 'discord',
+					linkId: link.id,
+					sourceMessageId: fresh.id,
+					targetChannelId: link.papo_channel_id,
+					chunkIndex: target.chunkIndex,
+					chunkTotal: target.chunkTotal,
+					text: chunks[target.chunkIndex] ?? '',
+					revision
+				};
+				this.outbox.enqueue({
+					linkId: link.id,
+					direction: 'to_papo',
+					kind: 'edit',
+					dedupeKey: `discord-edit:${fresh.id}:${target.chunkIndex}`,
+					revision,
+					payload: { job } satisfies Envelope
+				});
+			}
+		}
+		this.scheduleLink(link.id);
+	}
+
+	/** Enfileira o preview de link do Discord para cada cópia do Papo. Sincrono: cabe no flush transacional. */
+	private enqueuePapoPreview(
+		link: ChannelLink,
+		maps: MessageMapRow[],
+		sourceMessageId: string,
+		embed: PapoEmbedInput,
+		revision: string
+	): number {
+		let enqueued = 0;
+		for (const map of maps) {
+			if (!map.papo_message_id || map.direction !== 'discord_to_papo') continue;
 			const job: EditJob = {
 				kind: 'edit',
 				side: 'discord',
 				linkId: link.id,
-				sourceMessageId: fresh.id,
+				sourceMessageId,
 				targetChannelId: link.papo_channel_id,
-				chunkIndex: target.chunkIndex,
-				chunkTotal: target.chunkTotal,
-				text: chunks[target.chunkIndex] ?? '',
+				chunkIndex: map.chunk_index,
+				chunkTotal: map.chunk_total,
+				text: '',
 				revision
 			};
 			this.outbox.enqueue({
 				linkId: link.id,
 				direction: 'to_papo',
 				kind: 'edit',
-				dedupeKey: `discord-edit:${fresh.id}:${target.chunkIndex}`,
+				dedupeKey: `discord-embeds:${sourceMessageId}:${map.chunk_index}`,
 				revision,
-				payload: { job } satisfies Envelope
+				payload: { job, embedsOnly: true, papoPreviews: [embed] } satisfies Envelope
 			});
+			enqueued += 1;
 		}
-		this.scheduleLink(link.id);
+		return enqueued;
 	}
 
 	async onDiscordDelete(m: DiscordMessage | PartialDiscordMessage): Promise<void> {
@@ -1216,6 +1372,16 @@ export class Bridge {
 		}));
 	}
 
+	/** Nome de arquivo para mídia de preview que só existe como URL (o destino quer um nome). */
+	private previewFileName(url: string, fallback: string): string {
+		try {
+			const parts = new URL(url).pathname.split('/').filter(Boolean);
+			return sanitizeName(parts.slice(-2).join('-') || fallback);
+		} catch {
+			return fallback;
+		}
+	}
+
 	/**
 	 * Emoji custom na forma canônica do banco (`:nome:`) → token renderizável do destino.
 	 * Custom emoji só renderiza no `description` do embed: no Discord como `<:nome:id>`,
@@ -1283,21 +1449,35 @@ export class Bridge {
 		return { name: avatarAttachmentName(sha, this.media.extFor(sha)), buffer };
 	}
 
-	/** Arquivos que os embeds salvos referenciam por `attachment://`: um edit precisa reenviá-los. */
+	/**
+	 * Arquivos que os embeds salvos referenciam por `attachment://`: um edit precisa reenviá-los.
+	 * O nome enviado é o nome referenciado — o Discord resolve `attachment://<nome>` pelo
+	 * arquivo com esse nome na mensagem, e a mídia de preview (`media-<sha>`) tem nome próprio.
+	 */
 	private filesForEmbedRefs(embeds: DiscordEmbedPayload[]): { name: string; buffer: Buffer }[] {
 		const out: { name: string; buffer: Buffer }[] = [];
 		const seen = new Set<string>();
+		const push = (name: string, sha: string): void => {
+			if (seen.has(sha)) return;
+			const buffer = this.media.readFor(sha);
+			if (!buffer) return;
+			seen.add(sha);
+			out.push({ name, buffer });
+		};
 		for (const e of embeds) {
 			for (const url of [e.author?.icon_url, e.footer?.icon_url, e.thumbnail?.url, e.image?.url]) {
 				const sha = shaFromAttachmentRef(url);
-				if (!sha || seen.has(sha)) continue;
-				const buffer = this.media.readFor(sha);
-				if (!buffer) continue;
-				seen.add(sha);
-				out.push({ name: avatarAttachmentName(sha, this.media.extFor(sha)), buffer });
+				if (!sha) continue;
+				push(attachmentRefName(url) ?? avatarAttachmentName(sha, this.media.extFor(sha)), sha);
 			}
+			for (const ref of e.media_refs ?? []) push(ref.name, ref.sha);
 		}
 		return out;
+	}
+
+	/** Embeds prontos para a API do Discord: sem os campos que só o bridge usa. */
+	private discordApiEmbeds(embeds: DiscordEmbedPayload[]): APIEmbed[] {
+		return embeds.map((e) => discordApiEmbed(e) as APIEmbed);
 	}
 
 	private async sendToDiscord(
@@ -1313,10 +1493,12 @@ export class Bridge {
 		}
 
 		const avatar = this.avatarAttachment(job.authorIconSha, embed?.author?.icon_url);
+		// avatar e mídia do preview ocupam anexos da mensagem de cartão: o orçamento dos
+		// anexos da origem é o que sobra
+		const reservedFiles = (avatar ? 1 : 0) + this.filesForEmbedRefs(job.linkEmbeds ?? []).length;
 		const plan = await prepareAttachments(this.sourcesToAttachments(job.sources), {
 			maxFileBytes: this.cfg.discord.maxFileBytes,
-			// o avatar anexado ocupa um dos dez anexos da mensagem
-			maxFilesPerMessage: avatar ? DISCORD_LIMITS.attachmentsPerMessage - 1 : DISCORD_LIMITS.attachmentsPerMessage
+			maxFilesPerMessage: Math.max(1, DISCORD_LIMITS.attachmentsPerMessage - reservedFiles)
 		});
 
 		const notes = [...job.notes, ...plan.notes];
@@ -1384,6 +1566,8 @@ export class Bridge {
 				continue;
 			}
 			const files = groups[g]!.map((f) => ({ name: f.name, buffer: f.data }));
+			// a mídia do preview vai na mensagem do cartão, e só quando o preview ficou nela
+			if (g === 0) files.unshift(...this.filesForEmbedRefs(cardEmbeds));
 			if (avatar && g === 0 && built.author?.icon_url === attachmentRef(avatar.name)) files.unshift(avatar);
 			markAttempt();
 			const sent = await this.discord.send(job.discordChannelId, {
@@ -1396,7 +1580,7 @@ export class Bridge {
 								colorHex: job.colorHex
 							}) as APIEmbed
 						]
-					: (cardEmbeds as APIEmbed[]),
+					: this.discordApiEmbeds(cardEmbeds),
 				files,
 				replyTo: extra ? lastDiscordId : this.copyForPapoMessage(job.replyRefPapoId)
 			});
@@ -1541,6 +1725,7 @@ export class Bridge {
 			lastPapoId = created.id;
 			this.mapPapoCopy(job, created.id, g, extra, text, mainEmbed, signedBase);
 		}
+		this.flushDeferred('discord', job.discordMessageId, job.linkId);
 		// o delete chegou enquanto o envio estava em voo: a cópia recém-criada não sobrevive
 		if (this.store.isTombstoned('discord', job.discordMessageId)) {
 			await this.applyDelete({ kind: 'delete', side: 'discord', linkId: job.linkId, sourceMessageId: job.discordMessageId });
@@ -1644,7 +1829,7 @@ export class Bridge {
 			const embed = this.discordCopyEmbed(map, job);
 			const embeds = fitEmbedBudget([embed, ...this.mapPreviews<DiscordEmbedPayload>(map)], DISCORD_LIMITS.embedTotalChars);
 			await this.discord.edit(job.targetChannelId, map.discord_message_id, {
-				embeds: embeds as APIEmbed[],
+				embeds: this.discordApiEmbeds(embeds),
 				files: this.filesForEmbedRefs(embeds)
 			});
 			this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed, edit_revision: job.revision ?? null });
@@ -1667,9 +1852,14 @@ export class Bridge {
 	 * Aplica o preview de link à cópia: o cartão da ponte (autor, avatar, texto) continua
 	 * primeiro e o preview entra como embed extra atrás dele. Remover o preview reescreve a
 	 * cópia só com o cartão — o cartão e o resumo de reações nunca são tocados pelo preview.
+	 *
+	 * A cópia editável é sempre a que o bot criou: preview nascido no Papo vai para o Discord;
+	 * preview nascido no Discord — o link-preview que chega atrasado por `MESSAGE_UPDATE` — vai
+	 * para o Papo.
 	 */
 	private async applyPreviewEdit(env: Envelope, job: EditJob, map: MessageMapRow): Promise<void> {
-		if (job.side !== 'papo' || map.direction !== 'papo_to_discord') {
+		if (job.side === 'discord') return this.applyPapoPreviewEdit(env, job, map);
+		if (map.direction !== 'papo_to_discord') {
 			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'preview ignorado: a cópia editável não está no Discord');
 			return;
 		}
@@ -1696,9 +1886,38 @@ export class Bridge {
 		const embeds = fitEmbedBudget([...(card ? [card] : []), ...previews], DISCORD_LIMITS.embedTotalChars);
 		if (!embeds.length) return;
 		await this.discord.edit(job.targetChannelId, map.discord_message_id, {
-			embeds: embeds as APIEmbed[],
+			embeds: this.discordApiEmbeds(embeds),
 			files: this.filesForEmbedRefs(embeds)
 		});
+		this.store.updateMapSnapshot(map.id, { link_embeds: previews, embed_revision: job.revision ?? null });
+	}
+
+	/** Preview de link do Discord aplicado à cópia do Papo: o preview do Discord chega atrasado. */
+	private async applyPapoPreviewEdit(env: Envelope, job: EditJob, map: MessageMapRow): Promise<void> {
+		if (map.direction !== 'discord_to_papo') {
+			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'preview ignorado: a cópia editável não está no Papo');
+			return;
+		}
+		if (!map.papo_message_id) throw new RetryableError('sem mensagem do Papo mapeada');
+		if (job.revision && map.embed_revision && job.revision < map.embed_revision) {
+			this.log.debug(
+				{ sourceMessageId: job.sourceMessageId, revision: job.revision },
+				'preview obsoleto ignorado: estado mais recente já aplicado'
+			);
+			return;
+		}
+		const previews = env.papoPreviews ?? [];
+		const card = map.bridge_embed ? (JSON.parse(map.bridge_embed) as PapoEmbedInput) : undefined;
+		if (card) {
+			card.description = this.withReactionSummary(
+				map.rendered ?? '',
+				this.reactionSummaryForMap(map, 'papo'),
+				PAPO_LIMITS.embedDescriptionMax
+			);
+		}
+		const embeds = fitEmbedBudget([...(card ? [card] : []), ...previews], PAPO_LIMITS.embedTotalChars);
+		if (!embeds.length) return;
+		await this.api.editMessage(map.papo_message_id, '', embeds);
 		this.store.updateMapSnapshot(map.id, { link_embeds: previews, embed_revision: job.revision ?? null });
 	}
 
@@ -1795,7 +2014,7 @@ export class Bridge {
 				// reação não pode apagá-lo
 				const embeds = fitEmbedBudget([embed, ...this.mapPreviews<DiscordEmbedPayload>(map)], DISCORD_LIMITS.embedTotalChars);
 				await this.discord.edit(link.discord_channel_id, map.discord_message_id, {
-					embeds: embeds as APIEmbed[],
+					embeds: this.discordApiEmbeds(embeds),
 					files: this.filesForEmbedRefs(embeds)
 				});
 				continue;

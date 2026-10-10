@@ -47,6 +47,7 @@ interface EmbedLike {
 	footer?: { text?: string };
 	thumbnail?: { url?: string };
 	image?: { url?: string };
+	video?: { url?: string; mime_type?: string };
 	site_name?: string;
 }
 
@@ -62,18 +63,31 @@ interface PapoSend {
 	attachments?: { name: string }[];
 }
 
-const fixture = (opts: { embedImageDelayMs?: number } = {}) => {
+const fixture = (opts: { embedImageDelayMs?: number; mediaBaseUrl?: string | null; maxFileBytes?: number; bridgeEdits?: boolean } = {}) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
 	const outbox = new Outbox(db, { maxAttempts: cfg.bridge.maxAttempts, baseMs: 20, maxMs: 60 });
+	const config: Config = {
+		...cfg,
+		...(opts.maxFileBytes ? { discord: { ...cfg.discord, maxFileBytes: opts.maxFileBytes } } : {}),
+		...(opts.mediaBaseUrl === undefined ? {} : { bridge: { ...cfg.bridge, mediaBaseUrl: opts.mediaBaseUrl ?? undefined } })
+	};
 
 	const mediaFiles = new Map<string, { data: Buffer; ext: string }>();
+	const EXT_BY_MIME: Record<string, string> = {
+		'image/png': 'png',
+		'image/jpeg': 'jpg',
+		'image/webp': 'webp',
+		'image/gif': 'gif',
+		'video/mp4': 'mp4',
+		'video/webm': 'webm'
+	};
 	const media = {
 		save: (data: Buffer, mime?: string | null) => {
 			const sha256 = createHash('sha256').update(data).digest('hex');
-			const ext = mime === 'image/gif' ? 'gif' : 'webp';
+			const ext = EXT_BY_MIME[mime ?? ''] ?? 'bin';
 			if (!mediaFiles.has(sha256)) mediaFiles.set(sha256, { data, ext });
-			return { sha256 };
+			return { sha256, ext };
 		},
 		urlFor: (sha: string, base?: string) => (base ? `${base}/media/${sha}.${mediaFiles.get(sha)?.ext ?? 'bin'}` : undefined),
 		readFor: (sha: string) => mediaFiles.get(sha)?.data,
@@ -126,8 +140,9 @@ const fixture = (opts: { embedImageDelayMs?: number } = {}) => {
 		destroy: async () => {}
 	};
 
-	const bridge = new Bridge(cfg, store, outbox, api as never, { close: () => {}, connect: () => {} } as never, discord as never, media as never);
+	const bridge = new Bridge(config, store, outbox, api as never, { close: () => {}, connect: () => {} } as never, discord as never, media as never);
 	const link = store.upsertChannelLink({ papo_channel_id: 'chan-1', discord_channel_id: '111' });
+	if (opts.bridgeEdits === false) store.setChannelLinkFlag(link.id, 'bridge_edits', 0);
 	const settle = (quietMs = 700) => settleQueue(outbox, quietMs, 6000);
 	return { store, outbox, bridge, link, api, discord, settle };
 };
@@ -489,6 +504,279 @@ describe('message_embeds_update', () => {
 		const last = discord.edits.at(-1)!;
 		expect(last.embeds[0]!.author?.name).toBe('u');
 		expect(last.embeds[0]!.description).toContain('aaaa');
+		expect(outbox.counts().dead).toBe(0);
+	});
+});
+
+/** Preview em componentes: o formato que o Discord usa hoje para link de mídia (fixture do HAR). */
+const ogInstagramPreview = () => ({
+	type: 'components',
+	url: 'https://www.oginstagram.com/reel/DeSKFT8BTKO/',
+	components: [
+		{
+			type: 17,
+			accent_color: 16711785,
+			components: [
+				{ type: 10, content: '**South America Memes** <:verified:1556598045670514798>' },
+				{ type: 10, content: 'ligando pra nada só pro feriado segunda-feira 👿👿' },
+				{
+					type: 12,
+					items: [
+						{
+							media: {
+								url: 'https://www.oginstagram.com/offload/DeSKFT8BTKO/1?v=2',
+								proxy_url: 'https://images-ext-1.discordapp.net/external/_8DS/https/www.oginstagram.com/offload/DeSKFT8BTKO/1',
+								width: 720,
+								height: 1280,
+								content_type: 'video/mp4'
+							}
+						}
+					]
+				}
+			]
+		}
+	]
+});
+
+const videoPreview = () => ({
+	id: 'e-video',
+	source_type: 'link',
+	site_name: 'X',
+	url: 'https://x.com/i/status/1',
+	title: 'Vídeo',
+	description: 'resumo do vídeo',
+	thumbnail: { width: 720, height: 1280, mime_type: 'image/webp' },
+	video: { url: 'https://video.twimg.com/amplify_video/1/avc1/1280x720/x.mp4', mime_type: 'video/mp4' }
+});
+
+const youtubePreview = () => ({
+	id: 'e-youtube',
+	source_type: 'link',
+	fetch_method: 'oembed',
+	provider: 'YouTube',
+	url: 'https://www.youtube.com/watch?v=dwK9fhsOGK8',
+	title: 'Novo projeto: Cachaça Pinga Reactor 4',
+	thumbnail: { width: 480, height: 360, mime_type: 'image/webp' },
+	video: { url: 'https://www.youtube.com/embed/dwK9fhsOGK8' }
+});
+
+const withFetch = async <T>(handler: (url: string) => Promise<Response>, run: () => Promise<T>): Promise<{ result: T; urls: string[] }> => {
+	const original = globalThis.fetch;
+	const urls: string[] = [];
+	globalThis.fetch = (async (input: unknown) => {
+		const url = String(input);
+		urls.push(url);
+		return handler(url);
+	}) as never;
+	try {
+		return { result: await run(), urls };
+	} finally {
+		globalThis.fetch = original;
+	}
+};
+
+describe('preview do Discord que chega depois da mensagem', () => {
+	it('MESSAGE_UPDATE com o link-preview aplica o preview à cópia do Papo', async () => {
+		const { bridge, api, settle } = fixture();
+
+		// o Discord cria a mensagem sem o preview: a cópia sai só com o cartão
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
+		await settle();
+		expect(api.sent[0]!.embeds).toHaveLength(1);
+
+		await bridge.onDiscordEdit(
+			{} as never,
+			discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] })
+		);
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(2);
+		// o cartão continua primeiro e intacto; o preview entra atrás
+		expect(last.embeds[0]!.author?.name).toBe('Jenga');
+		expect(last.embeds[0]!.description).toContain('oginstagram');
+		expect(last.embeds[1]!.title).toBe('South America Memes');
+		expect(last.embeds[1]!.description).toContain('ligando pra nada');
+		// o mp4 do carrossel vira vídeo no Papo: é o que faz o preview ter player
+		expect(last.embeds[1]!.video?.mime_type).toBe('video/mp4');
+		expect(last.embeds[1]!.video?.url).toContain('oginstagram.com/offload/DeSKFT8BTKO/1');
+	});
+
+	it('preview do Discord fica no mapa e sobrevive às edições seguintes', async () => {
+		const { store, bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
+		await settle();
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
+		await settle();
+
+		expect(JSON.parse(store.findMapByDiscord('dm-1')[0]!.link_embeds!) as EmbedLike[]).toHaveLength(1);
+
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'texto corrigido', { embeds: [ogInstagramPreview()] }));
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(2);
+		expect(last.embeds[0]!.description).toContain('texto corrigido');
+		expect(last.embeds[1]!.title).toBe('South America Memes');
+	});
+
+	it('MESSAGE_UPDATE repetido não duplica o preview', async () => {
+		const { bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
+		await settle();
+
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
+		await settle();
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		expect(last.embeds.filter((e) => e.title === 'South America Memes')).toHaveLength(1);
+	});
+
+	it('preview que chega antes do mapeamento espera a cópia em vez de se perder', async () => {
+		const { store, bridge, api, outbox, settle } = fixture({ bridgeEdits: false });
+
+		// o MESSAGE_UPDATE chega antes do MESSAGE_CREATE bridgeado: sem destino, o preview fica
+		// adiado e é enfileirado pelo flush que acompanha a criação do mapeamento
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
+		expect(store.peekDeferredEvents('discord', 'dm-1').map((e) => e.kind)).toEqual(['embeds']);
+
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
+		await settle();
+
+		expect(store.peekDeferredEvents('discord', 'dm-1')).toEqual([]);
+		const last = api.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(2);
+		expect(last.embeds[1]!.title).toBe('South America Memes');
+		expect(outbox.counts().dead).toBe(0);
+	});
+
+	it('GIF que só existe como imagem do embed vai como arquivo animado', async () => {
+		const { bridge, api, settle } = fixture();
+		const { urls } = await withFetch(
+			async () => new Response(Buffer.from('gif-animado'), { status: 200, headers: { 'content-type': 'image/gif' } }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'https://giphy.com/gifs/lkdH8FmImcGoylv3t3', {
+						embeds: [
+							{
+								type: 'rich',
+								url: 'https://giphy.com/gifs/lkdH8FmImcGoylv3t3',
+								title: 'GIF',
+								image: {
+									url: 'https://media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif',
+									proxy_url: 'https://images-ext-1.discordapp.net/external/ZgLT/https/media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif',
+									width: 300,
+									height: 224,
+									content_type: 'image/gif'
+								}
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		// o Papo re-encode a imagem do embed como thumbnail estática: animação só sobrevive como arquivo
+		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['lkdH8FmImcGoylv3t3-giphy.gif']);
+		expect(urls.some((u) => u.includes('giphy.gif'))).toBe(true);
+		const preview = api.sent[0]!.embeds![1]!;
+		expect(preview.title).toBe('GIF');
+		expect(preview.thumbnail).toBeUndefined();
+	});
+});
+
+describe('mídia do preview no Discord', () => {
+	it('preview com mp4 vira anexo da mensagem: é o anexo que traz o player', async () => {
+		const { bridge, discord, settle } = fixture();
+		const { urls } = await withFetch(
+			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm1', 'https://x.com/i/status/1', { embeds: [videoPreview()] }));
+				await settle();
+			}
+		);
+
+		expect(urls).toContain('https://video.twimg.com/amplify_video/1/avc1/1280x720/x.mp4');
+		const send = discord.sends[0]!;
+		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
+		expect(send.embeds[1]!.thumbnail?.url).toMatch(/^http:\/\/media\.local:8080\/media\/[0-9a-f]{64}\.webp$/);
+		// o Discord ignora `video` em embed criado por bot: o payload não pode levar o campo
+		expect(send.embeds[1]).not.toHaveProperty('video');
+		expect(send.embeds[1]).not.toHaveProperty('media_refs');
+	});
+
+	it('sem media server público a thumbnail também vai como anexo', async () => {
+		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
+		await withFetch(
+			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm1', 'https://x.com/i/status/1', { embeds: [videoPreview()] }));
+				await settle();
+			}
+		);
+
+		const send = discord.sends[0]!;
+		expect(send.embeds[1]!.thumbnail?.url).toMatch(/^attachment:\/\/media-[0-9a-f]{64}\.webp$/);
+		expect(send.files).toEqual([
+			expect.stringMatching(/^media-[0-9a-f]{64}\.webp$/),
+			expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)
+		]);
+	});
+
+	it('o edit reenvia a mídia do preview: o Discord resolve a referência no mesmo request', async () => {
+		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
+		await withFetch(
+			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm1', 'https://x.com/i/status/1', { embeds: [videoPreview()] }));
+				await settle();
+				bridge.onPapoEvent({ type: 'message_edit', id: 'pm1', channel_id: 'chan-1', content: 'editado', edited_at: '2026-10-09T18:10:00Z' } as never);
+				await settle();
+			}
+		);
+
+		const last = discord.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(2);
+		expect(last.files).toEqual([
+			expect.stringMatching(/^media-[0-9a-f]{64}\.webp$/),
+			expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)
+		]);
+	});
+
+	it('página de player (YouTube) não é arquivo: nada é baixado, o preview segue com a thumbnail', async () => {
+		const { bridge, discord, settle } = fixture();
+		const { urls } = await withFetch(
+			async () => new Response(Buffer.from('html'), { status: 200, headers: { 'content-type': 'text/html' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm1', 'https://www.youtube.com/watch?v=dwK9fhsOGK8', { embeds: [youtubePreview()] }));
+				await settle();
+			}
+		);
+
+		expect(urls).toEqual([]);
+		const send = discord.sends[0]!;
+		expect(send.files).toEqual([]);
+		expect(send.embeds[1]!.url).toBe('https://www.youtube.com/watch?v=dwK9fhsOGK8');
+		expect(send.embeds[1]!.thumbnail?.url).toMatch(/^http:\/\/media\.local:8080\/media\/[0-9a-f]{64}\.webp$/);
+	});
+
+	it('vídeo que não cabe no limite do Discord fica de fora, e o preview continua', async () => {
+		const { bridge, discord, outbox, settle } = fixture({ maxFileBytes: 8 });
+		await withFetch(
+			async () => new Response(Buffer.from('mp4-maior-que-o-limite'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm1', 'https://x.com/i/status/1', { embeds: [videoPreview()] }));
+				await settle();
+			}
+		);
+
+		const send = discord.sends[0]!;
+		expect(send.files).toEqual([]);
+		expect(send.embeds).toHaveLength(2);
+		expect(send.embeds[1]!.title).toBe('Vídeo');
 		expect(outbox.counts().dead).toBe(0);
 	});
 });
