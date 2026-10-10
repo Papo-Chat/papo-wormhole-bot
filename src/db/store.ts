@@ -286,6 +286,34 @@ export class Store {
 				m.footer_base ?? null
 			);
 	}
+
+	/**
+	 * Atualiza o snapshot do que foi enviado no destino. Uma edição reescreve o embed da
+	 * cópia: sem regravar o snapshot, o próximo resumo de reações reenviaria o texto velho.
+	 */
+	updateMapSnapshot(
+		id: number,
+		snapshot: { rendered?: string | null; bridge_embed?: unknown; footer_base?: string | null }
+	): void {
+		const sets: string[] = [];
+		const args: (string | number | null)[] = [];
+		if (snapshot.rendered !== undefined) {
+			sets.push('rendered = ?');
+			args.push(snapshot.rendered);
+		}
+		if (snapshot.bridge_embed !== undefined) {
+			sets.push('bridge_embed = ?');
+			args.push(snapshot.bridge_embed === null ? null : JSON.stringify(snapshot.bridge_embed));
+		}
+		if (snapshot.footer_base !== undefined) {
+			sets.push('footer_base = ?');
+			args.push(snapshot.footer_base);
+		}
+		if (!sets.length) return;
+		args.push(id);
+		this.db.prepare(`UPDATE message_map SET ${sets.join(', ')} WHERE id = ?`).run(...args);
+	}
+
 	findMapByPapo(papoMessageId: string): MessageMapRow[] {
 		return rows<MessageMapRow>(
 			this.db

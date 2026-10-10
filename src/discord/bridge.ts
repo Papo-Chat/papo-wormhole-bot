@@ -192,11 +192,18 @@ export class DiscordBridge {
 	): Promise<void> {
 		const message = await this.fetchMessage(channelId, messageId);
 		if (!message) return;
+		const files = options.files ?? [];
+		// `files`/`attachments` reescrevem a lista de anexos da mensagem: o Discord apaga tudo
+		// que não for redeclarado. Mandar só o avatar do embed derrubava a imagem que a
+		// mensagem tinha.
+		const resending = new Set(files.map((f) => f.name));
+		const keep = message.attachments.filter((a) => !resending.has(a.name)).map((a) => ({ id: a.id }));
 		await message.edit({
 			...(options.content !== undefined ? { content: options.content } : {}),
 			...(options.embeds ? { embeds: options.embeds } : {}),
 			// embed que referencia `attachment://` precisa do arquivo reenviado no edit
-			...(options.files?.length ? { files: options.files.map((f) => ({ attachment: f.buffer, name: f.name })) } : {})
+			...(files.length ? { files: files.map((f) => ({ attachment: f.buffer, name: f.name })) } : {}),
+			...(keep.length ? { attachments: keep } : {})
 		});
 	}
 
@@ -275,5 +282,17 @@ export class DiscordBridge {
 	channelName(channelId: string): string | undefined {
 		const channel = this.client.channels.cache.get(channelId);
 		return channel && 'name' in channel ? String(channel.name) : undefined;
+	}
+
+	/**
+	 * Nome da role do guild (`GUILD_CREATE` traz a lista inteira — não exige o intent
+	 * `GuildMembers`). Menção de role não tem equivalente no Papo: vira texto.
+	 */
+	roleName(roleId: string): string | undefined {
+		for (const guild of this.client.guilds.cache.values()) {
+			const name = guild.roles.cache.get(roleId)?.name;
+			if (name) return name;
+		}
+		return undefined;
 	}
 }

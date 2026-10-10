@@ -6,14 +6,22 @@ export interface ReactionDisplay {
 	count: number;
 }
 
-/** `👍 3 · ❤️ 1 · :papu: 2` (mais usados primeiro). */
-export const reactionSummaryText = (rows: ReactionDisplay[], maxEmojis = 8): string =>
+/**
+ * `👍 3 · <:papu:123> 2` (mais usados primeiro).
+ * `tokenFor` converte o emoji para o dialeto do destino: só o `description` do embed
+ * renderiza custom emoji, e cada lado tem o seu (`<:nome:id>` no Discord, `:nome:` no Papo).
+ */
+export const reactionSummaryText = (
+	rows: ReactionDisplay[],
+	maxEmojis = 8,
+	tokenFor?: (emoji: string) => string
+): string =>
 	rows
 		.filter((r) => r.count > 0)
 		.slice()
 		.sort((a, b) => b.count - a.count || a.emoji.localeCompare(b.emoji))
 		.slice(0, maxEmojis)
-		.map((r) => `${r.emoji} ${r.count}`)
+		.map((r) => `${tokenFor?.(r.emoji) ?? r.emoji} ${r.count}`)
 		.join(' · ');
 
 /**
@@ -31,15 +39,4 @@ export const mergeReactionCounts = (sides: ReactionDisplay[][]): ReactionDisplay
 	return [...merged]
 		.map(([emoji, count]) => ({ emoji, count }))
 		.sort((a, b) => b.count - a.count || a.emoji.localeCompare(b.emoji));
-};
-
-/** Rodapé do embed de destino: base + resumo de reações, dentro do limite de footer. */
-export const footerWithReactions = (
-	base: string,
-	rows: ReactionDisplay[],
-	maxChars: number,
-	maxEmojis = 8
-): string => {
-	const summary = reactionSummaryText(rows, maxEmojis);
-	return clampText(summary ? `${base} · ${summary}` : base, maxChars);
 };

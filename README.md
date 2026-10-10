@@ -12,7 +12,7 @@ sentidos, preservando autoria (nome + avatar + data) e ordem de conversa.
 | Anexos | reenviados; compactados ou particionados se não cabem | idem |
 | Previews de link | embeds do Papo → embeds do Discord | embeds do Discord → embeds do Papo |
 | Emojis custom | `:nome:` ↔ `<:nome:id>` | idem |
-| Reações | reação nativa + contagem no rodapé do embed | idem |
+| Reações | reação nativa + contagem no `description` do embed | idem |
 | Edições / deleções | ✅ | ✅ |
 | Pins | ✅ | opcional |
 | Menções | texto simples (padrão) ou ping real (`propagate_mentions`) | idem |
@@ -187,12 +187,15 @@ trabalho (commite ou `git stash` antes).
 - Timestamp relativo `<t:…>` do Discord vira data absoluta no Papo.
 - Arquivo que não cabe no destino e não é recomprimível (vídeo/imagem grande) vira aviso
   com link direto, para não estourar o limite do Discord.
-- Reações viajam como reação nativa na mensagem de destino, e o rodapé do embed mostra a contagem
-  (`🕒 09/10/2026 14:22 · Papo 1/2 · 👍 3 · ❤️ 1`). Quem reagiu não é transportado: a reação fica
+- Reações viajam como reação nativa na mensagem de destino, e o `description` do embed fecha com a
+  contagem (`↳ 👍 3 · <:papu:1234> 1`). Quem reagiu não é transportado: a reação fica
   atribuída à conta do bridge nos dois lados.
+- O resumo fica no `description` e não no rodapé porque footer de embed não renderiza emoji custom
+  em nenhum dos lados: no Discord o `<:nome:id>` aparece cru, e no Papo o rodapé do card é texto
+  puro. No `description` o emoji renderiza como imagem nos dois lados.
 - Emoji custom do Papo sem homônimo no guild do Discord não gera reação nativa (seria 400); aparece
-  apenas como `:nome: 2` no resumo do rodapé. Emoji do guild marcado `available: false` no Discord
-  (69 no guild atual) também só aparece no rodapé: o Discord recusa a reação com 10014.
+  apenas como `:nome: 2` no resumo. Emoji do guild marcado `available: false` no Discord
+  (69 no guild atual) também só aparece no resumo: o Discord recusa a reação com 10014.
 - Menção só vira menção real quando o canal-link tem `mentions` ligado (`/bridge-config …`).
   Propagada, ela renderiza como chip clicável no card dos dois lados, mas não notifica: embed não
   gera ping no Discord e o trigger de notificação do Papo lê apenas `content`.

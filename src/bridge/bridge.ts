@@ -32,17 +32,13 @@ import {
 	buildDiscordBridgeEmbed,
 	buildPapoBridgeEmbed,
 	discordEmbedsToPapo,
+	fitEmbedBudget,
 	papoEmbedsToDiscord,
 	shaFromAttachmentRef,
 	type DiscordEmbedPayload
 } from './embeds.js';
 import { prepareAttachments, type SourceAttachment } from './attachments.js';
-import {
-	footerWithReactions as buildReactionFooter,
-	mergeReactionCounts,
-	reactionSummaryText,
-	type ReactionDisplay
-} from './reactions.js';
+import { mergeReactionCounts, reactionSummaryText, type ReactionDisplay } from './reactions.js';
 import { EMBED_CHUNK_CHARS, PAPO_LIMITS, PAPO_EMBED_CHUNK_CHARS, DISCORD_LIMITS, clampText } from './limits.js';
 import { EmojiBridge } from './emoji.js';
 import type { MediaStore } from './media.js';
@@ -60,6 +56,12 @@ const SELF_REACTION_TTL_SECONDS = 120;
 
 /** Janela em que uma edição do Discord ainda pode estar esperando o mapeamento da ponte. */
 const EDIT_MAP_GRACE_MS = 5 * 60_000;
+
+/** Selo de edição no rodapé do embed re-renderido (o texto novo vai no `description`). */
+const EDIT_MARK = '✏️ editado · ';
+
+/** Selo da linha de reações no `description` (footer de embed não renderiza emoji custom). */
+const REACTION_MARK = '↳ ';
 
 /** Identidade de uma reação do Papo, estável entre o evento WS e a execução do job. */
 const papoReactionKey = (e: { emoji_id: string | null; unicode: string | null }): string =>
@@ -80,7 +82,7 @@ interface Envelope {
 	embed?: DiscordEmbedPayload;
 	embedsOnly?: boolean;
 	embeds?: DiscordEmbedPayload[];
-	/** Re-rendera só o rodapé do embed de destino (resumo de reações). */
+	/** Re-rendera o embed da cópia com o resumo atual de reações (nome persistido no outbox). */
 	footerOnly?: boolean;
 }
 
@@ -237,6 +239,7 @@ export class Bridge {
 			},
 			papoUserIdForDiscord: (id) => this.store.getLinkByDiscordUser(id)?.papo_user_id,
 			discordChannelLabel: (id) => this.discord.channelName(id),
+			discordRoleLabel: (id) => this.discord.roleName(id),
 			discordEmoji: (name) => ({
 				token: this.emojis.tokenForDiscord(name, { findByName: (n) => this.discord.findGuildEmoji(n) })
 			})
@@ -506,7 +509,7 @@ export class Bridge {
 		this.queueFooterRefresh(link.id, 'papo', e.message_id, link.discord_channel_id);
 	}
 
-	/** Re-rendera o rodapé do embed de destino com o resumo atual de reações (máx. 1 a cada 3s). */
+	/** Re-rendera o embed da cópia com o resumo atual de reações (máx. 1 a cada 3s). */
 	private queueFooterRefresh(
 		linkId: number,
 		source: 'papo' | 'discord',
@@ -869,30 +872,55 @@ export class Bridge {
 		}));
 	}
 
-	/** Resumo de reações no formato do rodapé: `👍 3 · ❤️ 1 · :nome: 2`. */
-	private reactionSummary(linkId: number, source: 'papo' | 'discord', sourceMessageId: string): string {
-		return reactionSummaryText(this.store.listReactions(linkId, source, sourceMessageId));
+	/**
+	 * Emoji custom na forma canônica do banco (`:nome:`) → token renderizável do destino.
+	 * Custom emoji só renderiza no `description` do embed: no Discord como `<:nome:id>`,
+	 * no Papo como shortcode resolvido pelo renderizador do card. Footer de embed mostra
+	 * o texto cru nos dois lados.
+	 */
+	private emojiTokenFor(dest: 'papo' | 'discord', emoji: string): string {
+		if (dest === 'papo') return emoji;
+		const name = /^:([A-Za-z0-9_]{1,32}):$/.exec(emoji)?.[1];
+		if (!name) return emoji;
+		return this.emojis.tokenForDiscord(name, { findByName: (n) => this.discord.findGuildEmoji(n) });
 	}
 
-	private footerWithReactions(
-		base: string,
-		linkId: number,
-		source: 'papo' | 'discord',
-		sourceMessageId: string,
-		max: number
+	/** Resumo de reações no dialeto de emoji do destino: `👍 3 · <:papu:123> 2`. */
+	private reactionSummaryFor(
+		dest: 'papo' | 'discord',
+		rows: { emoji: string; count: number }[]
 	): string {
-		return buildReactionFooter(base, this.store.listReactions(linkId, source, sourceMessageId), max);
+		return reactionSummaryText(rows, 8, (emoji) => this.emojiTokenFor(dest, emoji));
 	}
 
 	/**
-	 * Rodapé de uma mensagem já bridgeada: mescla as contagens dos dois lados do par
-	 * (o eco da nossa própria reação conta 1 e nunca supera a contagem real).
+	 * Resumo de reações de uma mensagem já bridgeada: mescla as contagens dos dois lados do
+	 * par (o eco da nossa própria reação conta 1 e nunca supera a contagem real).
 	 */
-	private footerForMap(map: MessageMapRow, maxChars: number): string {
+	private reactionSummaryForMap(map: MessageMapRow, dest: 'papo' | 'discord'): string {
 		const sides: ReactionDisplay[][] = [];
 		if (map.papo_message_id) sides.push(this.store.listReactions(map.link_id, 'papo', map.papo_message_id));
 		if (map.discord_message_id) sides.push(this.store.listReactions(map.link_id, 'discord', map.discord_message_id));
-		return buildReactionFooter(map.footer_base ?? '', mergeReactionCounts(sides), maxChars);
+		return this.reactionSummaryFor(dest, mergeReactionCounts(sides));
+	}
+
+	/**
+	 * Descrição da mensagem bridgeada: texto + linha de reações. O resumo mora no
+	 * `description` porque nem o footer do Discord nem o do Papo renderizam emoji custom.
+	 */
+	private withReactionSummary(text: string, summary: string, max: number): string {
+		if (!summary) return clampText(text, max);
+		const line = `${REACTION_MARK}${summary}`;
+		const room = Math.max(1, max - Array.from(line).length - 2);
+		const clamped = clampText(text, room);
+		return clamped ? `${clamped}\n\n${line}` : line;
+	}
+
+	/** Rodapé base, preservando o selo de edição já aplicado ao embed. */
+	private footerText(map: MessageMapRow, embed: { footer?: { text?: string } }, max: number): string {
+		const base = map.footer_base ?? '';
+		const mark = base && embed.footer?.text?.startsWith(EDIT_MARK) ? EDIT_MARK : '';
+		return clampText(`${mark}${base}`, max);
 	}
 
 	/**
@@ -922,7 +950,7 @@ export class Bridge {
 				const buffer = this.media.readFor(sha);
 				if (!buffer) continue;
 				seen.add(sha);
-				out.push({ name: `avatar-${sha}.${this.media.extFor(sha)}`, buffer });
+				out.push({ name: avatarAttachmentName(sha, this.media.extFor(sha)), buffer });
 			}
 		}
 		return out;
@@ -951,10 +979,12 @@ export class Bridge {
 				footerText: footerBase,
 				colorHex: job.colorHex
 			});
-		built.description = clampText(description, DISCORD_LIMITS.embedDescriptionMax);
-		built.footer = {
-			text: this.footerWithReactions(footerBase, job.linkId, 'papo', job.papoMessageId, DISCORD_LIMITS.embedFooterMax)
-		};
+		built.description = this.withReactionSummary(
+			description,
+			this.reactionSummaryFor('discord', this.store.listReactions(job.linkId, 'papo', job.papoMessageId)),
+			DISCORD_LIMITS.embedDescriptionMax
+		);
+		built.footer = { text: clampText(footerBase, DISCORD_LIMITS.embedFooterMax) };
 		if (avatar && !built.author?.icon_url) {
 			built.author = {
 				name: built.author?.name ?? job.authorName,
@@ -1037,16 +1067,12 @@ export class Bridge {
 
 			const mainEmbed = extra ? undefined : embeds[0];
 			if (mainEmbed) {
-				mainEmbed.description = text;
-				mainEmbed.footer = {
-					text: this.footerWithReactions(
-						job.footerBase,
-						job.linkId,
-						'discord',
-						job.discordMessageId,
-						PAPO_LIMITS.embedFooterMax
-					)
-				};
+				mainEmbed.description = this.withReactionSummary(
+					text,
+					this.reactionSummaryFor('papo', this.store.listReactions(job.linkId, 'discord', job.discordMessageId)),
+					PAPO_LIMITS.embedDescriptionMax
+				);
+				mainEmbed.footer = { text: clampText(job.footerBase, PAPO_LIMITS.embedFooterMax) };
 			}
 			if (!text && !attachments.length && !embeds.length) return;
 
@@ -1106,26 +1132,31 @@ export class Bridge {
 			}
 			if (!map.discord_message_id) throw new RetryableError('sem mensagem do Discord mapeada');
 			if (env.embedsOnly) {
-				const embeds = (env.embeds ?? []) as APIEmbed[];
+				// preview de link do Papo: o card da ponte (texto/autor/avatar) continua primeiro,
+				// os embeds do Papo vêm atrás.
+				const card = map.bridge_embed ? (JSON.parse(map.bridge_embed) as DiscordEmbedPayload) : undefined;
+				if (card)
+					card.description = this.withReactionSummary(
+						map.rendered ?? '',
+						this.reactionSummaryForMap(map, 'discord'),
+						DISCORD_LIMITS.embedDescriptionMax
+					);
+				const embeds = fitEmbedBudget(
+					[...(card ? [card] : []), ...(env.embeds ?? [])],
+					DISCORD_LIMITS.embedTotalChars
+				);
 				await this.discord.edit(job.targetChannelId, map.discord_message_id, {
-					embeds,
+					embeds: embeds as APIEmbed[],
 					files: this.filesForEmbedRefs(embeds)
 				});
 				return;
 			}
-			const link = this.store.getChannelLinkById(job.linkId);
-			const original = this.store.findMapByPapo(job.sourceMessageId)[0];
-			if (!original) throw new RetryableError('mapeamento ainda não disponível');
+			const embed = this.discordCopyEmbed(map, job);
 			await this.discord.edit(job.targetChannelId, map.discord_message_id, {
-				embeds: [
-					buildDiscordBridgeEmbed({
-						authorName: 'mensagem editada',
-						description: job.text,
-						footerText: `✏️ editado · Papo${chunkLabel(job.chunkIndex, job.chunkTotal)}`,
-						colorHex: link?.color ?? undefined
-					}) as APIEmbed
-				]
+				embeds: [embed as APIEmbed],
+				files: this.filesForEmbedRefs([embed])
 			});
+			this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed });
 			return;
 		}
 
@@ -1136,7 +1167,29 @@ export class Bridge {
 			this.log.debug({ papoMessageId: map.papo_message_id }, 'edição ignorada: mensagem do Papo não é do bot');
 			return;
 		}
-		await this.api.editMessage(map.papo_message_id, '', [this.papoCopyEmbed(map, job.text)]);
+		const embed = this.papoCopyEmbed(map, job.text);
+		await this.api.editMessage(map.papo_message_id, '', [embed]);
+		this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed });
+	}
+
+	/**
+	 * Embed da cópia Discord: snapshot salvo em `message_map` com o texto novo no
+	 * `description`. Reconstruir o embed do zero perdia o autor/avatar do card e deixava o
+	 * anexo de avatar solto na mensagem — o Discord desenha como imagem quem nenhum embed
+	 * referencia, e o card virava só o avatar do autor.
+	 */
+	private discordCopyEmbed(map: MessageMapRow, job: EditJob): DiscordEmbedPayload {
+		const embed: DiscordEmbedPayload = map.bridge_embed
+			? (JSON.parse(map.bridge_embed) as DiscordEmbedPayload)
+			: { author: { name: 'Papo' } };
+		embed.description = this.withReactionSummary(
+			job.text,
+			this.reactionSummaryForMap(map, 'discord'),
+			DISCORD_LIMITS.embedDescriptionMax
+		);
+		const base = map.footer_base ?? `Papo${chunkLabel(job.chunkIndex, job.chunkTotal)}`;
+		embed.footer = { ...embed.footer, text: clampText(`${EDIT_MARK}${base}`, DISCORD_LIMITS.embedFooterMax) };
+		return embed;
 	}
 
 	/**
@@ -1147,13 +1200,20 @@ export class Bridge {
 		const embed: PapoEmbedInput = map.bridge_embed
 			? (JSON.parse(map.bridge_embed) as PapoEmbedInput)
 			: { author: { name: 'Discord' } };
-		embed.description = clampText(text, PAPO_LIMITS.embedDescriptionMax);
+		embed.description = this.withReactionSummary(
+			text,
+			this.reactionSummaryForMap(map, 'papo'),
+			PAPO_LIMITS.embedDescriptionMax
+		);
+		const base = map.footer_base ?? 'Discord';
+		embed.footer = { ...embed.footer, text: clampText(`${EDIT_MARK}${base}`, PAPO_LIMITS.embedFooterMax) };
 		if (!embed.site_name) embed.site_name = 'Discord';
 		return embed;
 	}
 
 	/**
-	 * Reescreve o rodapé do embed salvo em `message_map` com o resumo atual de reações.
+	 * Re-rendera o embed salvo em `message_map` com o resumo atual de reações (linha no
+	 * `description`: footer não renderiza emoji custom em nenhum dos lados).
 	 * O destino é a cópia que o bot criou (definida por `map.direction`): a mensagem original
 	 * do outro lado é de outro autor — Discord recusa edição (50005) e o backend do Papo também
 	 * (403), além de já mostrar as próprias reações.
@@ -1164,7 +1224,7 @@ export class Bridge {
 		const targets = maps.filter((m) => m.bridge_embed && !m.deleted);
 		if (!targets.length) {
 			// mensagem ponte antiga (sem snapshot) ou sem embed: nada a atualizar
-			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'rodapé sem embed salvo: resumo ignorado');
+			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'embed sem snapshot: resumo de reações ignorado');
 			return;
 		}
 		const link = this.store.getChannelLinkById(job.linkId);
@@ -1175,7 +1235,12 @@ export class Bridge {
 				// a cópia editável está no Discord
 				if (!map.discord_message_id) continue;
 				const embed = JSON.parse(map.bridge_embed!) as DiscordEmbedPayload;
-				embed.footer = { text: this.footerForMap(map, DISCORD_LIMITS.embedFooterMax) };
+				embed.description = this.withReactionSummary(
+					map.rendered ?? '',
+					this.reactionSummaryForMap(map, 'discord'),
+					DISCORD_LIMITS.embedDescriptionMax
+				);
+				embed.footer = { text: this.footerText(map, embed, DISCORD_LIMITS.embedFooterMax) };
 				await this.discord.edit(link.discord_channel_id, map.discord_message_id, {
 					embeds: [embed as APIEmbed],
 					files: this.filesForEmbedRefs([embed])
@@ -1185,8 +1250,12 @@ export class Bridge {
 			// a cópia editável está no Papo: o texto mora no embed, `content` fica limpo
 			if (!map.papo_message_id) continue;
 			const embed = JSON.parse(map.bridge_embed!) as PapoEmbedInput;
-			embed.footer = { text: this.footerForMap(map, PAPO_LIMITS.embedFooterMax) };
-			if (!embed.description) embed.description = clampText(map.rendered ?? '', PAPO_LIMITS.embedDescriptionMax);
+			embed.description = this.withReactionSummary(
+				map.rendered ?? '',
+				this.reactionSummaryForMap(map, 'papo'),
+				PAPO_LIMITS.embedDescriptionMax
+			);
+			embed.footer = { text: this.footerText(map, embed, PAPO_LIMITS.embedFooterMax) };
 			await this.api.editMessage(map.papo_message_id, '', [embed]);
 		}
 	}
@@ -1237,7 +1306,8 @@ export class Bridge {
 	/** Reação nascida no Papo: registra a contagem e reflete no Discord quando o emoji existe lá. */
 	private async applyPapoReaction(job: ReactionJob, map: MessageMapRow, link: ChannelLink): Promise<void> {
 		const name = job.emojiName ?? (job.emojiId ? (await this.emojis.papoById(job.emojiId))?.name : undefined);
-		// no rodapé o custom aparece como texto (:nome:) — footer não renderiza emoji custom
+		// forma canônica no banco: unicode literal, ou `:nome:` (o dialeto do destino é
+		// aplicado na hora de renderizar o resumo)
 		const display = job.unicode ?? (name ? `:${name}:` : undefined);
 		if (!display) return;
 		this.store.setReaction({
@@ -1257,7 +1327,7 @@ export class Bridge {
 			if (token.startsWith('<')) native = token;
 			else if (!this.discord.guildsCached()) throw new RetryableError('guilds ainda sem emojis no cache');
 			else {
-				this.log.debug({ emoji: display, messageId: job.sourceMessageId }, 'reação sem equivalente no guild: só o resumo do rodapé');
+				this.log.debug({ emoji: display, messageId: job.sourceMessageId }, 'reação sem equivalente no guild: só o resumo de reações');
 				return;
 			}
 		}
@@ -1275,7 +1345,7 @@ export class Bridge {
 			if (!retry?.startsWith('<') || retry === native) {
 				this.log.warn(
 					{ emoji: display, messageId: job.sourceMessageId },
-					'reação com emoji indisponível no guild: só o resumo do rodapé'
+					'reação com emoji indisponível no guild: só o resumo de reações'
 				);
 				return;
 			}

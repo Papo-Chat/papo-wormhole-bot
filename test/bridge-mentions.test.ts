@@ -58,6 +58,7 @@ const fixture = (opts: { propagateMentions?: boolean } = {}) => {
 		guildsCached: () => true,
 		findGuildEmoji: () => undefined,
 		channelName: () => 'geral',
+		roleName: (id: string) => (id === '206552277044035590' ? 'moderação' : undefined),
 		send: async (channelId: string, options: DiscordSend) => {
 			sends.push(options);
 			return { id: 'd1' };
@@ -149,5 +150,25 @@ describe('menção propaga pelo flag do link, não só pelo env global', () => {
 		const description = descriptionOf(papoSent[0]?.embeds);
 		expect(description).not.toContain('@mention(');
 		expect(description).toContain('@Jenga');
+	});
+
+	it('menção de role vira o nome da role (não o snowflake)', async () => {
+		const { bridge, papoSent, settle } = fixture();
+
+		await bridge.onDiscordMessage(discordMessage('chamem <@&206552277044035590> aqui') as never);
+		await settle();
+
+		const description = descriptionOf(papoSent[0]?.embeds);
+		expect(description).toContain('chamem moderação aqui');
+		expect(description).not.toContain('<@&');
+	});
+
+	it('role fora do cache do guild não some da mensagem', async () => {
+		const { bridge, papoSent, settle } = fixture();
+
+		await bridge.onDiscordMessage(discordMessage('chamem <@&999>') as never);
+		await settle();
+
+		expect(descriptionOf(papoSent[0]?.embeds)).toContain('<@&999>');
 	});
 });

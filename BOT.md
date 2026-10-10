@@ -178,29 +178,36 @@ Pipeline Papo → Discord:
 5. Se também falhar → `:name:`.
 
 Reações: `react_update` (Papo) ↔ `messageReactionAdd/Remove` (Discord), com o mesmo `emoji_map`.
-O Papo tem 20 tipos de reação por mensagem (o Discord não tem limite duro) → o resumo do rodapé
-mostra no máximo 8 emojis.
+O Papo tem 20 tipos de reação por mensagem (o Discord não tem limite duro) → o resumo mostra no
+máximo 8 emojis.
 
 **Comportamento implementado (v1)**
 
 - A reação é reproduzida como **reação nativa na mensagem de destino** — nunca como texto no corpo.
-- Além disso, o **rodapé do embed carrega o resumo de contagem**: `🕒 09/10/2026 14:22 · Papo 1/2 · 👍 3 · ❤️ 1`.
-  Isso existe porque a identidade de quem reagiu não sobrevive à travessia (o bridge só tem uma conta
-  em cada lado), então a contagem é o que se preserva. `GET /channels/{cid}/messages/{mid}/reactions`
-  devolve `user_id` por reação, caso uma versão futura queira nomes.
+- Além disso, o **`description` do embed carrega o resumo de contagem** numa linha final:
+  `texto da mensagem` + `\n\n↳ 👍 3 · <:papu:1234> 1`. Isso existe porque a identidade de quem
+  reagiu não sobrevive à travessia (o bridge só tem uma conta em cada lado), então a contagem é o
+  que se preserva. `GET /channels/{cid}/messages/{mid}/reactions` devolve `user_id` por reação,
+  caso uma versão futura queira nomes.
+- O resumo mora no `description`, **não no rodapé**: footer de embed não renderiza emoji custom em
+  nenhum dos lados (no Discord o `<:nome:id>` aparece cru; no Papo `EmbedCard` desenha
+  `footer.text` como texto puro). Só o `description` passa pelo renderizador de emoji nos dois
+  lados — no Discord como `<:nome:id>`, no Papo como shortcode `:nome:`. O rodapé fica com
+  data/origem (`🕒 09/10/2026 14:22 · Papo 1/2`).
 - Contagem vem **absoluta** nos dois lados (`react_update.count`; `MessageReaction.count` do Discord) e
   fica em `reaction_counts (link_id, source, source_message_id, emoji)`. `count = 0` remove o emoji do resumo.
+  A forma canônica do banco é unicode literal ou `:nome:`; o dialeto do destino é aplicado na renderização.
 - Emoji custom sem equivalente no destino: **sem reação nativa** (no Discord, `react(":nome:")` é 400);
-  o registro vira só o resumo, exibido como texto `:nome: 2` — footer de embed não renderiza emoji custom.
+  o registro vira só o resumo, exibido como `:nome: 2` (texto cru quando o guild não tem o emoji).
 - Emoji do guild que o Discord recusa (10014 `Unknown Emoji` — apagado por moderação ou marcado
   `available: false`, flag que o discord.js não expõe no cache do gateway): a lista de indisponíveis é
   lida de `GET /guilds/{id}/emojis` na conexão e re-carregada quando um 10014 aparece; sem equivalente
-  utilizável o job **não falha**, a reação fica só no resumo do rodapé.
+  utilizável o job **não falha**, a reação fica só no resumo.
 - A conversão do emoji acontece na **execução** do job (§10.1): guild ainda sem emojis no cache faz o
   job voltar para a fila, em vez de decidir "não existe equivalente" com o cache frio.
 - Remoção é propagada nos dois sentidos: `count = 0` no Papo → `MessageReaction#remove()` no Discord
   (remove a reação da conta do bot); `messageReactionRemove` → `DELETE .../reactions`.
-- Refresh do rodapé é agendado como job `edit` com `footerOnly` e dedupe por bucket de 3 s, para
+- O resumo é re-renderizado por um job `edit` com `footerOnly` e dedupe por bucket de 3 s, para
   rajadas de reação não virarem dezenas de edições. O embed re-renderizado vem do snapshot guardado
   em `message_map.rendered / bridge_embed / footer_base`, e o destino é a **cópia criada pelo bot**
   (definido por `map.direction`) — nunca a mensagem original do outro lado.
@@ -264,6 +271,7 @@ Discord embed:
             com o avatar enviado como anexo da própria mensagem)
   title:   (opcional, quando o conteúdo tem link)
   description: <conteúdo traduzido>
+               (linha final quando há reações: `↳ 👍 3 · <:papu:1234> 1`)
   fields:  (opcional)
   image:   <anexo imagem>
   footer:  { text: "🕒 09/10/2026 14:03 · Papo #geral · msg 1/2" }
@@ -272,7 +280,8 @@ Discord embed:
 Papo embed (EmbedInput):
   author:  { name: "<displayName>", icon_url: https://cdn.discordapp.com/avatars/<id>/<hash>.png }
   site_name: "<displayName>"        (linha de topo; o avatar ocupa o selo dessa linha)
-  description: <conteúdo traduzido>  (a mensagem do Papo sai sem `content`)
+  description: <conteúdo traduzido>  (a mensagem do Papo sai sem `content`;
+               linha final `↳ 👍 3 · :papu: 1` quando há reações)
   thumbnail: (somente imagem de conteúdo; nunca avatar)
   image:   { url: https://cdn.discordapp.com/attachments/... }
   footer:  { text: "🕒 09/10/2026 14:03 · Discord #geral · msg 1/2" }
@@ -368,7 +377,7 @@ execução, quando o destino está acessível:
 | emoji do Papo → token do guild | em `applyReaction`/`sendToDiscord`, não no evento WS |
 | emoji do Discord → emoji do Papo (import `POST /emojis`) | em `applyReaction`/`sendToPapo` |
 | download de anexo | em `execute` (o job só carrega `SourceRef`) |
-| contagem de reação no rodapé | em `applyReaction`, antes de tentar a reação nativa |
+| contagem de reação no resumo | em `applyReaction`, antes de tentar a reação nativa |
 
 Se o destino ainda não está pronto, o job lança `RetryableError` e volta para `pending` com
 backoff — em vez de virar `dead` ou ser descartado:
@@ -446,8 +455,8 @@ CREATE TABLE message_map (
   parent_map_id     INTEGER REFERENCES message_map(id),
   content_sha       TEXT,
   rendered          TEXT,      -- corpo enviado ao destino
-  bridge_embed      TEXT,      -- JSON do embed enviado (permite re-renderir o rodapé)
-  footer_base       TEXT,      -- rodapé sem resumo de reações
+  bridge_embed      TEXT,      -- JSON do embed enviado (permite re-renderir o embed)
+  footer_base       TEXT,      -- rodapé base (data/origem), sem o resumo de reações
   deleted           INTEGER NOT NULL DEFAULT 0,
   created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -733,10 +742,10 @@ envio com anexo responde **403** (não 413), e sem `pin_message` o pino responde
 | Autor deletado/banido | `author.name = "usuário removido"`, sem crash |
 | Autor banido no Papo | sessões revogadas → bridge continua só se o conteúdo já estiver em fila |
 | Autor sem `/link-user` | modo espelho (nome/avatar no embed) |
-| Reação com emoji que não existe no destino | Discord→Papo: importa via `POST /emojis` (exige `manage_server`); Papo→Discord: sem homônimo no guild, só o resumo `:nome: N` no rodapé |
+| Reação com emoji que não existe no destino | Discord→Papo: importa via `POST /emojis` (exige `manage_server`); Papo→Discord: sem homônimo no guild, só o resumo `:nome: N` no `description` |
 | Reação removida | remove nos dois lados; `count = 0` no Papo remove a reação do bot no Discord e some do resumo |
 | Reação/pino chega antes da mensagem ser bridgeada | guardado em `deferred_events` e enfileirado quando o mapeamento aparece (§10.2) |
-| Guild sem emojis no cache (reconexão, guild indisponível) | o job de reação volta para a fila com backoff; a contagem do rodapé é registrada na hora |
+| Guild sem emojis no cache (reconexão, guild indisponível) | o job de reação volta para a fila com backoff; a contagem do resumo é registrada na hora |
 | Mensagem editada que agora estoura limite | re-chunk e apagar chunks excedentes |
 | Mensagem deletada no destino manualmente | `message_map` marcado; edição vira recriação |
 | Reply a mensagem não bridgeada | envia sem `reply_to`, com citação textual `> <autor>: <trecho>` |

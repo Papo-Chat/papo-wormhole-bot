@@ -25,6 +25,57 @@ describe('payload de envio (discord.js 14)', () => {
 	});
 });
 
+describe('edit de mensagem: anexos preservados', () => {
+	const stub = (attachments: { id: string; name: string }[]) => {
+		const bridge = new DiscordBridge({ token: 'x', handlers: {} });
+		const payloads: { attachments?: unknown; files?: unknown }[] = [];
+		bridge.fetchMessage = async () =>
+			({
+				attachments,
+				edit: async (options: unknown) => void payloads.push(options as never)
+			}) as never;
+		return { bridge, payloads };
+	};
+
+	it('redeclara os anexos existentes: o Discord apaga o que não vem no edit', async () => {
+		const { bridge, payloads } = stub([{ id: '111', name: 'foto.png' }]);
+
+		await bridge.edit('111', '222', {
+			embeds: [{ description: 'novo texto' }],
+			files: [{ name: 'avatar-aa.png', buffer: Buffer.from('a') }]
+		});
+
+		expect(payloads[0]?.attachments).toEqual([{ id: '111' }]);
+		expect(payloads[0]?.files).toEqual([{ attachment: expect.any(Buffer), name: 'avatar-aa.png' }]);
+		await bridge.destroy();
+	});
+
+	it('anexo reenviado não é mantido em duplicidade', async () => {
+		const { bridge, payloads } = stub([
+			{ id: '111', name: 'foto.png' },
+			{ id: '222', name: 'avatar-aa.png' }
+		]);
+
+		await bridge.edit('111', '222', {
+			embeds: [{ description: 'novo texto' }],
+			files: [{ name: 'avatar-aa.png', buffer: Buffer.from('a') }]
+		});
+
+		expect(payloads[0]?.attachments).toEqual([{ id: '111' }]);
+		await bridge.destroy();
+	});
+
+	it('edit só de embed mantém os anexos da mensagem', async () => {
+		const { bridge, payloads } = stub([{ id: '111', name: 'foto.png' }]);
+
+		await bridge.edit('111', '222', { embeds: [{ description: 'novo texto' }] });
+
+		expect(payloads[0]?.attachments).toEqual([{ id: '111' }]);
+		expect(payloads[0]?.files).toBeUndefined();
+		await bridge.destroy();
+	});
+});
+
 describe('intents do bridge', () => {
 	it('inclui GuildMessageReactions: sem ele nenhum evento de reação chega', () => {
 		const bridge = new DiscordBridge({ token: 'x', handlers: {} });

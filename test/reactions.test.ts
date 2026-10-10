@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { footerWithReactions, mergeReactionCounts, reactionSummaryText } from '../src/bridge/reactions.js';
+import { mergeReactionCounts, reactionSummaryText } from '../src/bridge/reactions.js';
 
 describe('reactionSummaryText', () => {
 	it('ordena por contagem e separa com ·', () => {
@@ -44,22 +44,25 @@ describe('mergeReactionCounts', () => {
 	});
 });
 
-describe('footerWithReactions', () => {
-	it('anexa o resumo ao rodapé base', () => {
-		expect(footerWithReactions('🕒 09/10/2026 · Papo', [{ emoji: '👍', count: 2 }], 2048)).toBe(
-			'🕒 09/10/2026 · Papo · 👍 2'
+describe('reactionSummaryText com dialeto de emoji', () => {
+	it('converte o custom para o token do destino', () => {
+		const out = reactionSummaryText(
+			[
+				{ emoji: '👍', count: 3 },
+				{ emoji: ':papu:', count: 2 }
+			],
+			8,
+			(emoji) => (emoji === ':papu:' ? '<:papu:123>' : emoji)
 		);
+		expect(out).toBe('👍 3 · <:papu:123> 2');
 	});
 
-	it('mantém o rodapé intacto sem reações', () => {
-		expect(footerWithReactions('🕒 09/10/2026 · Papo 1/2', [], 2048)).toBe('🕒 09/10/2026 · Papo 1/2');
+	it('sem conversor mantém a forma canônica do banco', () => {
+		expect(reactionSummaryText([{ emoji: ':papu:', count: 2 }])).toBe(':papu: 2');
 	});
 
-	it('nunca ultrapassa o limite de footer', () => {
-		const rows = Array.from({ length: 8 }, (_, i) => ({ emoji: '👍'.repeat(30), count: i + 1 }));
-		const out = footerWithReactions('base', rows, 60, 8);
-		// clampText conta code points: emoji de surrogate pair ocupa 2 unidades em .length
-		expect(Array.from(out).length).toBeLessThanOrEqual(60);
-		expect(out.endsWith('…')).toBe(true);
+	it('nunca ultrapassa o limite de emojis mesmo com token expandido', () => {
+		const rows = Array.from({ length: 12 }, (_, i) => ({ emoji: `:e${i}:`, count: 100 - i }));
+		expect(reactionSummaryText(rows, 8, (e) => `<${e.slice(1, -1)}:1>`).split(' · ').length).toBe(8);
 	});
 });
