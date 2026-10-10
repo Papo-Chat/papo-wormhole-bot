@@ -70,9 +70,15 @@ CREATE TABLE IF NOT EXISTS message_map (
   rendered           TEXT,
   bridge_embed       TEXT,
   footer_base        TEXT,
+  -- embed extra de preview de link aplicado à cópia (JSON array). Guardado porque todo
+  -- re-render do cartão (resumo de reações, edição) precisa reenviá-lo junto.
+  link_embeds        TEXT,
   -- revisão (timestamp ISO da origem) da última edição aplicada à cópia: impede que uma
   -- edição mais antiga, enfileirada depois, sobrescreva a mais recente
   edit_revision      TEXT,
+  -- revisão da última atualização de preview aplicada: preview e texto são estados
+  -- separados e cada um tem sua própria ordem
+  embed_revision     TEXT,
   deleted            INTEGER NOT NULL DEFAULT 0,
   created_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -101,7 +107,7 @@ CREATE TABLE IF NOT EXISTS deferred_events (
   id                INTEGER PRIMARY KEY,
   source            TEXT    NOT NULL CHECK (source IN ('papo','discord')),
   source_message_id TEXT    NOT NULL,
-  kind              TEXT    NOT NULL CHECK (kind IN ('reaction','edit','delete','pin')),
+  kind              TEXT    NOT NULL CHECK (kind IN ('reaction','edit','delete','pin','embeds')),
   payload           TEXT    NOT NULL,
   created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );

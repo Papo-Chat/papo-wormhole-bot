@@ -254,3 +254,82 @@ CREATE TABLE outbox (
 		expect(indexOrigins(db).some((i) => i.name === 'ux_outbox_dedupe_active')).toBe(true);
 	});
 });
+
+describe('migração dos eventos adiados e do mapa de mensagens', () => {
+	/** `deferred_events` como era antes: o CHECK inline não conhecia `embeds`. */
+	const asLegacyDeferred = (db: DatabaseSync) => {
+		db.exec('DROP TABLE deferred_events');
+		db.exec(`CREATE TABLE deferred_events (
+			id                INTEGER PRIMARY KEY,
+			source            TEXT    NOT NULL CHECK (source IN ('papo','discord')),
+			source_message_id TEXT    NOT NULL,
+			kind              TEXT    NOT NULL CHECK (kind IN ('reaction','edit','delete','pin')),
+			payload           TEXT    NOT NULL,
+			created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+		)`);
+	};
+
+	it('base legada passa a aceitar o evento adiado de preview', () => {
+		const db = openDb(':memory:');
+		const store = new Store(db);
+		asLegacyDeferred(db);
+		db.exec("INSERT INTO deferred_events (source, source_message_id, kind, payload) VALUES ('papo','pm1','reaction','{\"count\":1}')");
+
+		migrate(db, SCHEMA);
+
+		// o preview que chegou antes do mapeamento precisa caber na mesma tabela
+		store.deferEvent({ source: 'papo', sourceMessageId: 'pm1', kind: 'embeds', payload: { embeds: [{ id: 'e1' }] } });
+		const kinds = store.peekDeferredEvents('papo', 'pm1').map((r) => r.kind);
+		expect(kinds).toEqual(['reaction', 'embeds']);
+	});
+
+	it('migração dos eventos adiados preserva o conteúdo e é idempotente', () => {
+		const db = openDb(':memory:');
+		const store = new Store(db);
+		asLegacyDeferred(db);
+		db.exec("INSERT INTO deferred_events (source, source_message_id, kind, payload, created_at) VALUES ('papo','pm1','pin','{\"is_pinned\":true}','2026-10-09T12:00:00.000Z')");
+
+		migrate(db, SCHEMA);
+		migrate(db, SCHEMA);
+
+		const [row] = store.peekDeferredEvents('papo', 'pm1');
+		expect(row?.kind).toBe('pin');
+		expect(row?.payload).toBe('{"is_pinned":true}');
+		expect(row?.created_at).toBe('2026-10-09T12:00:00.000Z');
+		expect(
+			db
+				.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ix_deferred_msg'`)
+				.all()
+		).toHaveLength(1);
+	});
+
+	it('mapa legado ganha as colunas do preview sem perder o que já foi enviado', () => {
+		const db = openDb(':memory:');
+		const store = new Store(db);
+		const link = store.upsertChannelLink({ papo_channel_id: 'papo-1', discord_channel_id: '111' });
+		db.exec('ALTER TABLE message_map DROP COLUMN link_embeds');
+		db.exec('ALTER TABLE message_map DROP COLUMN embed_revision');
+
+		migrate(db, SCHEMA);
+
+		store.mapMessage({
+			link_id: link.id,
+			direction: 'papo_to_discord',
+			papo_message_id: 'pm1',
+			discord_message_id: '9999',
+			rendered: 'oi',
+			bridge_embed: { description: 'oi' },
+			footer_base: '🕒 · Papo'
+		});
+
+		const before = store.findMapByPapo('pm1')[0]!;
+		expect(before.rendered).toBe('oi');
+		expect(before.link_embeds).toBeNull();
+		expect(before.embed_revision).toBeNull();
+
+		store.updateMapSnapshot(before.id, { link_embeds: [{ title: 'artigo' }], embed_revision: '2026-10-09T12:00:00Z' });
+		const after = store.findMapByPapo('pm1')[0]!;
+		expect(JSON.parse(after.link_embeds!) as { title: string }[]).toEqual([{ title: 'artigo' }]);
+		expect(after.embed_revision).toBe('2026-10-09T12:00:00Z');
+	});
+});

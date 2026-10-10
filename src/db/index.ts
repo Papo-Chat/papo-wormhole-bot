@@ -28,7 +28,9 @@ const COLUMN_ADDITIONS: [string, string][] = [
 	['message_map', 'rendered TEXT'],
 	['message_map', 'bridge_embed TEXT'],
 	['message_map', 'footer_base TEXT'],
+	['message_map', 'link_embeds TEXT'],
 	['message_map', 'edit_revision TEXT'],
+	['message_map', 'embed_revision TEXT'],
 	['self_reactions', 'pending_echoes INTEGER NOT NULL DEFAULT 1'],
 	['outbox', 'revision TEXT'],
 	['outbox', 'remote_attempts INTEGER NOT NULL DEFAULT 0']
@@ -105,11 +107,48 @@ function rebuildOutboxDedupe(db: Db): boolean {
 	return true;
 }
 
+/**
+ * `deferred_events.kind` já não aceitou `embeds`: o CHECK inline não muda com
+ * `CREATE TABLE IF NOT EXISTS`, então o table é reconstruído uma vez. O conteúdo é
+ * efêmero (eventos adiados são descartados por idade), por isso a reconstrução é barata.
+ */
+function rebuildDeferredKinds(db: Db): boolean {
+	const ddl = rows<{ sql: string | null }>(
+		db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deferred_events'`).all()
+	)[0]?.sql;
+	if (!ddl || ddl.includes("'embeds'")) return false;
+
+	db.exec('BEGIN IMMEDIATE');
+	try {
+		db.exec(`CREATE TABLE deferred_events_rebuilt (
+			id                INTEGER PRIMARY KEY,
+			source            TEXT    NOT NULL CHECK (source IN ('papo','discord')),
+			source_message_id TEXT    NOT NULL,
+			kind              TEXT    NOT NULL CHECK (kind IN ('reaction','edit','delete','pin','embeds')),
+			payload           TEXT    NOT NULL,
+			created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+		)`);
+		db.exec(
+			`INSERT INTO deferred_events_rebuilt (id, source, source_message_id, kind, payload, created_at)
+			 SELECT id, source, source_message_id, kind, payload, created_at FROM deferred_events`
+		);
+		db.exec('DROP TABLE deferred_events');
+		db.exec('ALTER TABLE deferred_events_rebuilt RENAME TO deferred_events');
+		db.exec('COMMIT');
+	} catch (err) {
+		db.exec('ROLLBACK');
+		throw err;
+	}
+	db.exec('CREATE INDEX IF NOT EXISTS ix_deferred_msg ON deferred_events (source, source_message_id)');
+	return true;
+}
+
 /** Correções de banco para bases criadas por versões anteriores. */
 export function migrate(db: Db, schema: string = SCHEMA): void {
 	addColumns(db);
 	// o rebuild apaga os índices da tabela: recriar a partir do schema idempotente
 	if (rebuildOutboxDedupe(db)) db.exec(schema);
+	rebuildDeferredKinds(db);
 }
 
 export type Db = DatabaseSync;

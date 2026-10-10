@@ -563,8 +563,17 @@ export class PapoApi {
 		return (await res.json()) as T;
 	}
 
-	private async download(path: string): Promise<Buffer> {
+	/**
+	 * Requisição binária (anexo, thumbnail, mídia). A recuperação de sessão vale aqui tanto
+	 * quanto vale nas requisições JSON: um 401 no meio do download de um anexo derrubaria a
+	 * mensagem inteira, e `PapoApiError.transient` não chega a ser consultado se a sessão
+	 * pudesse ser renovada antes. Uma única recuperação, um único retry.
+	 */
+	private async download(path: string, allowRecovery = true): Promise<Buffer> {
 		const res = await this.raw(path, { method: 'GET' });
+		if (res.status === 401 && allowRecovery) {
+			if (await this.recoverSession()) return this.download(path, false);
+		}
 		if (res.status >= 400) await this.problem(res, path);
 		return Buffer.from(await res.arrayBuffer());
 	}

@@ -1,5 +1,4 @@
 import { setTimeout as sleep } from 'node:timers/promises';
-import { createHash } from 'node:crypto';
 import type { Logger } from 'pino';
 import type { APIEmbed, Message as DiscordMessage, PartialMessage as PartialDiscordMessage } from 'discord.js';
 import type { Config } from '../config.js';
@@ -40,9 +39,7 @@ import {
 	avatarAttachmentName,
 	buildDiscordBridgeEmbed,
 	buildPapoBridgeEmbed,
-	discordEmbedsToPapo,
 	fitEmbedBudget,
-	papoEmbedsToDiscord,
 	shaFromAttachmentRef,
 	type DiscordEmbedPayload
 } from './embeds.js';
@@ -52,6 +49,9 @@ import { EMBED_CHUNK_CHARS, PAPO_LIMITS, PAPO_EMBED_CHUNK_CHARS, DISCORD_LIMITS,
 import { EmojiBridge } from './emoji.js';
 import type { MediaStore } from './media.js';
 import { PapoIdentity } from './identity.js';
+import { copySignatures, signedFooter } from './signature.js';
+import { firstDiscordPreview, firstPapoPreview, giphyEmbed } from './previews.js';
+import { GiphyResolver, giphyId } from './giphy.js';
 import { EXTRA_CHUNK_BASE, type BridgeJob, type DeleteJob, type EditJob, type PinJob, type ReactionJob, type SourceRef, type ToDiscordMessageJob, type ToPapoMessageJob } from './jobs.js';
 
 /** Erro permanente: retry não resolve (payload inválido, permissão, recurso sumido). */
@@ -92,13 +92,6 @@ const MENTION_LOOKUP_LIMIT = 10;
 const papoReactionKey = (e: { emoji_id: string | null; unicode: string | null }): string =>
 	e.emoji_id ? `e:${e.emoji_id}` : `u:${e.unicode ?? ''}`;
 
-/**
- * Assunto do conteúdo (hash), para chave idempotente de estado: duas atualizações com a
- * mesma forma mas conteúdo diferente não podem ser confundidas.
- */
-const contentSha = (value: unknown): string =>
-	createHash('sha256').update(JSON.stringify(value ?? null)).digest('hex').slice(0, 16);
-
 /** Chave canônica de um emoji no destino: id (custom) ou nome/unicode. */
 const mirrorEmojiKey = (emojiId: string | null | undefined, nameOrUnicode: string | null | undefined): string =>
 	emojiId ? `i:${emojiId}` : `u:${nameOrUnicode ?? ''}`;
@@ -124,6 +117,12 @@ interface Envelope {
 	embed?: DiscordEmbedPayload;
 	embedsOnly?: boolean;
 	embeds?: DiscordEmbedPayload[];
+	/**
+	 * Embeds **da origem (Papo)**, ainda não convertidos: a conversão e a busca da imagem
+	 * acontecem na execução do job, como com os anexos. Assim a preparação de mídia não
+	 * atrasa a entrada na fila — e não é ela que decide a ordem das atualizações.
+	 */
+	papoEmbeds?: PapoEmbed[];
 	/** Re-rendera o embed da cópia com o resumo atual de reações (nome persistido no outbox). */
 	footerOnly?: boolean;
 }
@@ -149,6 +148,8 @@ export class Bridge {
 	private papoUserId?: string;
 	private readonly identity: PapoIdentity;
 	private readonly emojis: EmojiBridge;
+	/** GIF do picker do Papo (`content = giphy:<id>`) convertido em imagem para o Discord. */
+	private readonly gifs: GiphyResolver;
 	/** Um worker serializado por canal-link (preserva a ordem da conversa). */
 	private readonly running = new Map<number, Promise<void>>();
 	/** Encerramento: para a ingestão e deixa só os jobs em voo terminarem. */
@@ -174,6 +175,7 @@ export class Bridge {
 		this.log = scoped('bridge');
 		this.identity = new PapoIdentity(api, store, media, cfg.bridge.mediaBaseUrl);
 		this.emojis = new EmojiBridge(api, store, { autoImport: cfg.bridge.emojiAutoImport });
+		this.gifs = new GiphyResolver(cfg.bridge.giphyApiKey, this.log);
 	}
 
 	// ── ciclo de vida ──────────────────────────────────────
@@ -345,10 +347,11 @@ export class Bridge {
 
 		const author = await this.identity.author(msg.author_id);
 		await this.warmPapoMentions(msg.content ?? '');
-		const translated = papoToDiscordContent(msg.content ?? '', this.resolvers(link));
+		const preview = await this.papoPreview(msg);
+		const translated = papoToDiscordContent(preview.text, this.resolvers(link));
 		const chunks = chunkText(translated, EMBED_CHUNK_CHARS);
 		const sources = link.bridge_attachments ? this.sourceRefs(msg) : [];
-		if (!chunks.length && !sources.length) return;
+		if (!chunks.length && !sources.length && !preview.embed) return;
 
 		const total = Math.max(chunks.length, 1);
 		for (let i = 0; i < total; i++) {
@@ -368,6 +371,7 @@ export class Bridge {
 				timestamp: msg.created_at,
 				notes: [],
 				sources: i === 0 ? sources : [],
+				linkEmbeds: i === 0 && preview.embed ? [preview.embed] : [],
 				replyRefPapoId: i === 0 ? (msg.reply_to ?? undefined) : undefined
 			};
 			const embed = buildDiscordBridgeEmbed({
@@ -387,6 +391,42 @@ export class Bridge {
 		}
 		this.store.setPapoCursor(link.id, msg.created_at);
 		this.scheduleLink(link.id);
+	}
+
+	/**
+	 * Preview que acompanha o cartão da ponte no Discord.
+	 *
+	 * Duas origens: o picker de GIF do Papo (`content = giphy:<id>`, resolvido em imagem —
+	 * o Discord não conhece o marcador) e o link-preview que o backfill traz junto da
+	 * mensagem. Na vida ao vivo o preview chega depois, por `message_embeds_update`.
+	 * Preview que não converte não derruba a ponte: a mensagem segue sem ele.
+	 */
+	private async papoPreview(msg: { content?: string | null; embeds?: PapoEmbed[] | null }): Promise<{
+		text: string;
+		embed?: DiscordEmbedPayload;
+	}> {
+		const content = msg.content ?? '';
+		const gifId = giphyId(content);
+		if (gifId) {
+			const gif = await this.gifs.resolve(gifId).catch((err) => {
+				this.log.debug({ err, gifId }, 'GIF do picker do Papo não resolvido');
+				return undefined;
+			});
+			if (!gif) return { text: content };
+			return { text: '', embed: giphyEmbed(gif) };
+		}
+		if (msg.embeds?.length) {
+			const embed = await this.papoPreviewEmbed(msg.embeds);
+			if (embed) return { text: content, embed };
+		}
+		return { text: content };
+	}
+
+	/** Primeiro preview do Papo convertido para o Discord, com a imagem re-hospedada. */
+	private async papoPreviewEmbed(embeds: PapoEmbed[] | null | undefined): Promise<DiscordEmbedPayload | undefined> {
+		if (!embeds?.length) return undefined;
+		const mediaUrls = await this.embedMediaUrls(embeds);
+		return firstPapoPreview(embeds, { thumbnailUrlFor: (embed) => (embed.id ? mediaUrls.get(embed.id) : undefined) });
 	}
 
 	/**
@@ -410,13 +450,15 @@ export class Bridge {
 			return;
 		}
 		await this.warmPapoMentions(e.content ?? '');
-		const chunks = chunkText(papoToDiscordContent(e.content ?? '', this.resolvers(link)), EMBED_CHUNK_CHARS);
+		const preview = await this.papoPreview(e);
+		const chunks = chunkText(papoToDiscordContent(preview.text, this.resolvers(link)), EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
 			? maps
 					.filter((m) => m.discord_message_id && m.direction === 'papo_to_discord')
 					.map((m) => ({ chunkIndex: m.chunk_index, chunkTotal: Math.max(chunks.length, m.chunk_total) }))
 			: chunks.map((_, i) => ({ chunkIndex: i, chunkTotal: chunks.length }));
+		if (!targets.length && preview.embed) targets.push({ chunkIndex: 0, chunkTotal: 1 });
 		const revision = e.edited_at ?? new Date().toISOString();
 		for (const target of targets) {
 			const job: EditJob = {
@@ -440,8 +482,38 @@ export class Bridge {
 				revision,
 				payload: { job } satisfies Envelope
 			});
+			// preview é estado separado do texto: tem chave e revisão próprias
+			if (preview.embed) this.enqueueDiscordPreview(link, e.id, target, preview.embed, revision);
 		}
 		this.scheduleLink(link.id);
+	}
+
+	private enqueueDiscordPreview(
+		link: ChannelLink,
+		sourceMessageId: string,
+		target: { chunkIndex: number; chunkTotal: number },
+		embed: DiscordEmbedPayload,
+		revision: string
+	): void {
+		const job: EditJob = {
+			kind: 'edit',
+			side: 'papo',
+			linkId: link.id,
+			sourceMessageId,
+			targetChannelId: link.discord_channel_id,
+			chunkIndex: target.chunkIndex,
+			chunkTotal: target.chunkTotal,
+			text: '',
+			revision
+		};
+		this.outbox.enqueue({
+			linkId: link.id,
+			direction: 'to_discord',
+			kind: 'edit',
+			dedupeKey: `papo-embeds:${sourceMessageId}:${target.chunkIndex}`,
+			revision,
+			payload: { job, embedsOnly: true, embeds: [embed] } satisfies Envelope
+		});
 	}
 
 	private async onPapoDelete(e: PapoWsDeleteEvent): Promise<void> {
@@ -487,17 +559,33 @@ export class Bridge {
 		return maps.every((m) => m.direction === copyDirection);
 	}
 
+	/**
+	 * `message_embeds_update` do Papo: o preview de link da mensagem.
+	 *
+	 * A revisão é capturada na **chegada** do evento, antes de qualquer espera: buscar a
+	 * imagem do preview é assíncrono, e uma atualização antiga que demorasse mais seria
+	 * enfileirada depois da mais recente. A conversão acontece na execução do job, então a
+	 * fila (serializada por link) decide a ordem — e a revisão decide qual estado vence.
+	 */
 	private async onPapoEmbeds(e: PapoWsEmbedsEvent): Promise<void> {
 		const link = this.linkForPapoChannel(e.channel_id);
 		if (!link || !link.bridge_embeds) return;
+		const revision = new Date().toISOString();
 		const maps = this.store.findMapByPapo(e.message_id);
-		if (!maps.length) return;
-		const mediaUrls = await this.embedMediaUrls(e.embeds ?? []);
-		const embeds = papoEmbedsToDiscord(e.embeds ?? [], {
-			thumbnailUrlFor: (embed) => (embed.id ? mediaUrls.get(embed.id) : undefined)
-		});
-		// hash do conteúdo: a quantidade de embeds sozinha confunde duas atualizações diferentes
-		const sha = contentSha(embeds);
+		if (!maps.length) {
+			// o preview chegou antes da cópia: fica adiado e é enfileirado pelo flush que
+			// acompanha a criação do mapeamento
+			this.store.deferEvent({ source: 'papo', sourceMessageId: e.message_id, kind: 'embeds', payload: e });
+			this.log.debug({ messageId: e.message_id }, 'preview adiado: mensagem ainda não bridgeada');
+			return;
+		}
+		this.enqueuePapoEmbeds(link, maps, e, revision);
+		this.scheduleLink(link.id);
+	}
+
+	/** Enfileira o preview de uma mensagem Papo para cada cópia Discord. Sincrono: cabe no flush transacional. */
+	private enqueuePapoEmbeds(link: ChannelLink, maps: MessageMapRow[], e: PapoWsEmbedsEvent, revision: string): number {
+		let enqueued = 0;
 		for (const map of maps) {
 			if (!map.discord_message_id || map.direction !== 'papo_to_discord') continue;
 			const job: EditJob = {
@@ -508,17 +596,22 @@ export class Bridge {
 				targetChannelId: link.discord_channel_id,
 				chunkIndex: map.chunk_index,
 				chunkTotal: map.chunk_total,
-				text: ''
+				text: '',
+				revision
 			};
+			// chave por mensagem/chunk, com revisão: conteúdo diferente é estado novo da
+			// mesma chave, e o mais recente substitui o que ainda não saiu
 			this.outbox.enqueue({
 				linkId: link.id,
 				direction: 'to_discord',
 				kind: 'edit',
-				dedupeKey: `papo-embeds:${e.message_id}:${map.chunk_index}:${sha}`,
-				payload: { job, embedsOnly: true, embeds } satisfies Envelope
+				dedupeKey: `papo-embeds:${e.message_id}:${map.chunk_index}`,
+				revision,
+				payload: { job, embedsOnly: true, papoEmbeds: e.embeds ?? [] } satisfies Envelope
 			});
+			enqueued += 1;
 		}
-		this.scheduleLink(link.id);
+		return enqueued;
 	}
 
 	/**
@@ -583,12 +676,19 @@ export class Bridge {
 			return;
 		}
 
-		const map = this.store.findMapByPapo(e.message_id)[0];
-		// o espelho do bridge vive na cópia: se a contagem observada é a da própria cópia,
-		// ela inclui a nossa reação e precisa ser descontada antes de decidir o estado desejado
-		const mirrored =
-			map?.direction === 'discord_to_papo' &&
-			this.store.hasMirrorReaction({ linkId: link.id, side: 'papo', destinationMessageId: e.message_id, emoji: key });
+		/**
+		 * O espelho do bridge pode estar na mensagem observada **dos dois lados**: uma reação
+		 * nascida no Discord é espelhada na cópia do Papo, e uma nascida no Discord original
+		 * também pode ter sido espelhada na mensagem do Papo que o bridge criou. O que define
+		 * o desconto é o registro em `mirror_reactions` para este lado, esta mensagem e este
+		 * emoji — não a direção original do `message_map`.
+		 */
+		const mirrored = this.store.hasMirrorReaction({
+			linkId: link.id,
+			side: 'papo',
+			destinationMessageId: e.message_id,
+			emoji: key
+		});
 		const count = Math.max(0, e.count - (mirrored ? 1 : 0));
 
 		const job: ReactionJob = {
@@ -724,13 +824,17 @@ export class Bridge {
 		// no meio, nada foi removido e os eventos voltam no próximo flush
 		this.store.withTransaction(() => {
 			for (const row of this.store.takeDeferredEvents(source, sourceMessageId)) {
-				const payload = JSON.parse(row.payload) as PapoWsReactEvent | PapoWsPinEvent;
+				const payload = JSON.parse(row.payload) as PapoWsReactEvent | PapoWsPinEvent | PapoWsEmbedsEvent;
 				if (row.kind === 'reaction' && link.bridge_reactions) {
 					this.enqueuePapoReaction(link, payload as PapoWsReactEvent);
 					flushed += 1;
 				} else if (row.kind === 'pin' && link.bridge_pins) {
 					this.enqueuePapoPin(link, payload as PapoWsPinEvent);
 					flushed += 1;
+				} else if (row.kind === 'embeds' && link.bridge_embeds) {
+					// a revisão é o instante em que o evento chegou: um preview adiado não
+					// pode vencer uma atualização mais recente que já entrou na fila
+					flushed += this.enqueuePapoEmbeds(link, this.store.findMapByPapo(sourceMessageId), payload as PapoWsEmbedsEvent, row.created_at);
 				} else {
 					this.log.debug({ kind: row.kind, sourceMessageId }, 'evento adiado descartado: desligado no link');
 				}
@@ -803,7 +907,6 @@ export class Bridge {
 
 		const content = discordToPapoContent(m.content ?? '', this.resolvers(link));
 		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
-		const linkEmbeds = link.bridge_embeds ? discordEmbedsToPapo(m.embeds as APIEmbed[]) : [];
 		const sources: SourceRef[] = link.bridge_attachments
 			? m.attachments.map((a) => ({
 					side: 'discord',
@@ -814,6 +917,12 @@ export class Bridge {
 					url: a.url
 				}))
 			: [];
+		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
+		// já sai como anexo não precisa de um segundo embed igual
+		const preview = link.bridge_embeds
+			? firstDiscordPreview(m.embeds as APIEmbed[], m.attachments.map((a) => a.url))
+			: undefined;
+		const linkEmbeds = preview ? [preview] : [];
 
 		if (!chunks.length && !sources.length && !linkEmbeds.length) return;
 		const total = Math.max(chunks.length, 1);
@@ -836,7 +945,8 @@ export class Bridge {
 				footerBase: `🕒 ${formatDate(m.createdAt.toISOString(), this.cfg.bridge.timezone)} · Discord${chunkLabel(i, total)}`,
 				notes: [],
 				sources: i === 0 ? sources : [],
-				linkEmbeds,
+				linkEmbeds: i === 0 ? linkEmbeds : [],
+				timestamp: m.createdAt.toISOString(),
 				replyRefDiscordId: i === 0 ? (m.reference?.messageId ?? undefined) : undefined
 			};
 			const bridgeEmbed = buildPapoBridgeEmbed({
@@ -960,12 +1070,14 @@ export class Bridge {
 
 		const custom = Boolean(emojiId);
 		const key = mirrorEmojiKey(emojiId, emojiName);
-		const map = this.store.findMapByDiscord(messageId)[0];
-		// a cópia Discord é mensagem do bot: quando a contagem observada é a dela, ela inclui
-		// o espelho que o bridge aplicou lá — descontar evita ler a reação do bot como humana
-		const mirrored =
-			map?.direction === 'papo_to_discord' &&
-			this.store.hasMirrorReaction({ linkId: link.id, side: 'discord', destinationMessageId: messageId, emoji: key });
+		// a contagem observada é a desta mensagem do Discord; o espelho do bridge conta nela
+		// sempre que estiver registrado aqui — não só quando o Discord é a cópia
+		const mirrored = this.store.hasMirrorReaction({
+			linkId: link.id,
+			side: 'discord',
+			destinationMessageId: messageId,
+			emoji: key
+		});
 		const human = Math.max(0, count - (mirrored ? 1 : 0));
 		// estado desejado reconciliado pela contagem absoluta, não pela ação individual:
 		// uma pessoa removendo a reação não derruba o espelho enquanto outras ainda reagiram
@@ -1057,12 +1169,14 @@ export class Bridge {
 		switch (env.job.kind) {
 			case 'message': {
 				const job = env.job as ToDiscordMessageJob | ToPapoMessageJob;
-				// registrar antes de chamar: é o que distingue "nunca saiu" de "saiu e o
-				// resultado é incerto" quando o processo cai depois de o destino aceitar
-				this.outbox.markRemoteAttempt(row.id);
-				const uncertain = this.outbox.remoteAttempts(row.id) > 1;
-				if ('description' in job) return this.sendToDiscord(job as ToDiscordMessageJob, env.embed, uncertain);
-				return this.sendToPapo(job as ToPapoMessageJob, env.embed, uncertain);
+				// Uma tentativa remota anterior é o que distingue "saiu e o resultado é incerto"
+				// de "nunca saiu". A marcação acontece imediatamente antes da chamada de envio,
+				// não antes de preparar os anexos: falhar na preparação não pode empurrar a
+				// próxima execução para a reconciliação atrás de uma cópia que nunca existiu.
+				const uncertain = this.outbox.remoteAttempts(row.id) > 0;
+				const markAttempt = (): void => this.outbox.markRemoteAttempt(row.id);
+				if ('description' in job) return this.sendToDiscord(job as ToDiscordMessageJob, env.embed, uncertain, markAttempt);
+				return this.sendToPapo(job as ToPapoMessageJob, env.embed, uncertain, markAttempt);
 			}
 			case 'edit':
 				return this.applyEdit(env);
@@ -1086,8 +1200,17 @@ export class Bridge {
 			download: async () => {
 				if (s.side === 'papo') return this.api.downloadAttachment(s.id);
 				if (!s.url) throw new PermanentError(`attachment ${s.id} sem URL de origem`);
-				const res = await fetch(s.url, { signal: AbortSignal.timeout(60_000) });
-				if (!res.ok) throw new Error(`download ${s.url} → HTTP ${res.status}`);
+				let res: Response;
+				try {
+					res = await fetch(s.url, { signal: AbortSignal.timeout(60_000) });
+				} catch (err) {
+					// rede instável não é motivo para matar a mensagem: volta para a fila
+					throw new RetryableError(`download ${s.url}: ${(err as Error).message}`);
+				}
+				if (!res.ok) {
+					if (res.status === 429 || res.status >= 500) throw new RetryableError(`download ${s.url} → HTTP ${res.status}`);
+					throw new PermanentError(`download ${s.url} → HTTP ${res.status}`);
+				}
 				return Buffer.from(await res.arrayBuffer());
 			}
 		}));
@@ -1177,7 +1300,12 @@ export class Bridge {
 		return out;
 	}
 
-	private async sendToDiscord(job: ToDiscordMessageJob, embed?: DiscordEmbedPayload, uncertain = false): Promise<void> {
+	private async sendToDiscord(
+		job: ToDiscordMessageJob,
+		embed?: DiscordEmbedPayload,
+		uncertain = false,
+		markAttempt: () => void = () => {}
+	): Promise<void> {
 		// a origem já foi apagada: criar a cópia agora deixaria uma mensagem órfã no Discord
 		if (this.store.isTombstoned('papo', job.papoMessageId)) {
 			this.log.debug({ papoMessageId: job.papoMessageId }, 'criação suprimida: mensagem de origem já excluída');
@@ -1196,7 +1324,22 @@ export class Bridge {
 			? `${job.description}${job.description ? '\n\n' : ''}${notes.map((n) => `> ${n}`).join('\n')}`.trim()
 			: job.description;
 
-		const footerBase = `🕒 ${formatDate(job.timestamp, this.cfg.bridge.timezone)} · Papo${chunkLabel(job.chunkIndex, job.chunkTotal)}`;
+		const groups = plan.groups.length ? plan.groups : [[]];
+		const stamp = formatDate(job.timestamp, this.cfg.bridge.timezone);
+		// selo determinístico por grupo: é a assinatura que permite reconhecer a cópia já
+		// criada quando o resultado de um envio anterior é incerto
+		const signatures = copySignatures('papo', job.papoMessageId, job.chunkIndex, groups.length);
+		const footerBase = signedFooter(
+			`🕒 ${stamp} · Papo${chunkLabel(job.chunkIndex, job.chunkTotal)}`,
+			signatures[0]!,
+			DISCORD_LIMITS.embedFooterMax
+		);
+		const footers = groups.map((_, g) =>
+			g === 0
+				? footerBase
+				: signedFooter(`🕒 ${stamp} · Papo · 📎 ${g + 1}/${groups.length}`, signatures[g]!, DISCORD_LIMITS.embedFooterMax)
+		);
+
 		const built: DiscordEmbedPayload =
 			embed ??
 			buildDiscordBridgeEmbed({
@@ -1211,7 +1354,7 @@ export class Bridge {
 			this.reactionSummaryFor('discord', this.store.listReactions(job.linkId, 'papo', job.papoMessageId)),
 			DISCORD_LIMITS.embedDescriptionMax
 		);
-		built.footer = { text: clampText(footerBase, DISCORD_LIMITS.embedFooterMax) };
+		built.footer = { text: footerBase };
 		if (avatar && !built.author?.icon_url) {
 			built.author = {
 				name: built.author?.name ?? job.authorName,
@@ -1219,14 +1362,10 @@ export class Bridge {
 				icon_url: attachmentRef(avatar.name)
 			};
 		}
+		// o preview de link entra como embed extra, atrás do cartão
+		const cardEmbeds = fitEmbedBudget([built, ...(job.linkEmbeds ?? [])], DISCORD_LIMITS.embedTotalChars);
 
-		const groups = plan.groups.length ? plan.groups : [[]];
-		// rodapé determinístico por grupo: é a assinatura que permite reconhecer a cópia já
-		// criada quando o resultado de um envio anterior é incerto
-		const footers = groups.map((_, g) =>
-			g === 0 ? footerBase : `🕒 ${formatDate(job.timestamp, this.cfg.bridge.timezone)} · Papo · 📎 ${g + 1}/${groups.length}`
-		);
-		const existing = uncertain ? await this.findDiscordCopies(job.discordChannelId, footers, job.timestamp) : new Map<string, string>();
+		const existing = uncertain ? await this.findDiscordCopies(job.discordChannelId, signatures, job.timestamp) : new Map<string, string>();
 		if (existing.size) {
 			this.log.warn(
 				{ papoMessageId: job.papoMessageId, found: existing.size },
@@ -1238,7 +1377,7 @@ export class Bridge {
 
 		for (let g = 0; g < groups.length; g++) {
 			const extra = g > 0;
-			const already = existing.get(footers[g]!);
+			const already = existing.get(signatures[g]!);
 			if (already) {
 				lastDiscordId = already;
 				this.mapDiscordCopy(job, already, g, extra, description, built, footerBase);
@@ -1246,6 +1385,7 @@ export class Bridge {
 			}
 			const files = groups[g]!.map((f) => ({ name: f.name, buffer: f.data }));
 			if (avatar && g === 0 && built.author?.icon_url === attachmentRef(avatar.name)) files.unshift(avatar);
+			markAttempt();
 			const sent = await this.discord.send(job.discordChannelId, {
 				embeds: extra
 					? [
@@ -1256,7 +1396,7 @@ export class Bridge {
 								colorHex: job.colorHex
 							}) as APIEmbed
 						]
-					: [built as APIEmbed, ...((job.linkEmbeds ?? []) as APIEmbed[])],
+					: (cardEmbeds as APIEmbed[]),
 				files,
 				replyTo: extra ? lastDiscordId : this.copyForPapoMessage(job.replyRefPapoId)
 			});
@@ -1289,29 +1429,37 @@ export class Bridge {
 			chunk_total: job.chunkTotal,
 			rendered: extra ? null : description,
 			bridge_embed: extra ? null : built,
-			footer_base: extra ? null : footerBase
+			footer_base: extra ? null : footerBase,
+			link_embeds: extra ? null : (job.linkEmbeds ?? [])
 		});
 	}
 
 	/**
 	 * Reconcilia um envio de resultado incerto: procura no destino a cópia que o bridge já
-	 * criou, reconhecida pelo rodapé determinístico e por ser posterior à mensagem de origem.
+	 * criou, reconhecida pela **assinatura** do rodapé e por ser posterior à mensagem de
+	 * origem. O rodapé com data ao minuto não bastava: duas mensagens do mesmo minuto têm o
+	 * mesmo rodapé, e a cópia antiga seria tomada pela nova.
 	 */
-	private async findDiscordCopies(channelId: string, footers: string[], sourceTimestamp: string): Promise<Map<string, string>> {
+	private async findDiscordCopies(channelId: string, signatures: string[], sourceTimestamp: string): Promise<Map<string, string>> {
 		const out = new Map<string, string>();
 		const selfId = this.discord.selfId;
-		if (!selfId || !footers.length) return out;
+		if (!selfId || !signatures.length) return out;
 		const recent = await this.discord.recentByAuthor(channelId, selfId, 50).catch(() => undefined);
 		if (!recent) return out;
 		const after = Date.parse(sourceTimestamp) || 0;
-		for (const footer of footers) {
-			const hit = recent.find((m) => m.footers.includes(footer) && m.createdAt >= after);
-			if (hit) out.set(footer, hit.id);
+		for (const signature of signatures) {
+			const hit = recent.find((m) => m.createdAt >= after && m.footers.some((f) => f.includes(signature)));
+			if (hit) out.set(signature, hit.id);
 		}
 		return out;
 	}
 
-	private async sendToPapo(job: ToPapoMessageJob, embed?: DiscordEmbedPayload, uncertain = false): Promise<void> {
+	private async sendToPapo(
+		job: ToPapoMessageJob,
+		embed?: DiscordEmbedPayload,
+		uncertain = false,
+		markAttempt: () => void = () => {}
+	): Promise<void> {
 		// a origem já foi apagada: criar a cópia agora deixaria uma mensagem órfã no Papo
 		if (this.store.isTombstoned('discord', job.discordMessageId)) {
 			this.log.debug({ discordMessageId: job.discordMessageId }, 'criação suprimida: mensagem de origem já excluída');
@@ -1334,13 +1482,16 @@ export class Bridge {
 		);
 
 		const groups = plan.groups.length ? plan.groups : [[]];
+		const signatures = copySignatures('discord', job.discordMessageId, job.chunkIndex, groups.length);
+		const signedBase = signedFooter(job.footerBase, signatures[0]!, PAPO_LIMITS.embedFooterMax);
 		const footers = groups.map((_, g) =>
-			clampText(
-				g === 0 ? job.footerBase : `${job.footerBase} · 📎 ${g + 1}/${groups.length}`,
-				PAPO_LIMITS.embedFooterMax
-			)
+			g === 0
+				? signedBase
+				: signedFooter(`${job.footerBase} · 📎 ${g + 1}/${groups.length}`, signatures[g]!, PAPO_LIMITS.embedFooterMax)
 		);
-		const existing = uncertain ? await this.findPapoCopies(job.papoChannelId, footers) : new Map<string, string>();
+		const existing = uncertain
+			? await this.findPapoCopies(job.papoChannelId, signatures, job.timestamp)
+			: new Map<string, string>();
 		if (existing.size) {
 			this.log.warn({ discordMessageId: job.discordMessageId, found: existing.size }, 'cópia já criada no Papo: envio não repetido');
 		}
@@ -1372,13 +1523,14 @@ export class Bridge {
 			}
 			if (!text && !attachments.length && !embeds.length) return;
 
-			const already = existing.get(footers[g]!);
+			const already = existing.get(signatures[g]!);
 			if (already) {
 				lastPapoId = already;
-				this.mapPapoCopy(job, already, g, extra, text, mainEmbed);
+				this.mapPapoCopy(job, already, g, extra, text, mainEmbed, signedBase);
 				continue;
 			}
 
+			markAttempt();
 			const created = await this.sendToPapoSafe({
 				channelId: job.papoChannelId,
 				content: undefined,
@@ -1387,7 +1539,7 @@ export class Bridge {
 				embeds: embeds.length ? (embeds as ToPapoMessageJob['linkEmbeds']) : undefined
 			});
 			lastPapoId = created.id;
-			this.mapPapoCopy(job, created.id, g, extra, text, mainEmbed);
+			this.mapPapoCopy(job, created.id, g, extra, text, mainEmbed, signedBase);
 		}
 		// o delete chegou enquanto o envio estava em voo: a cópia recém-criada não sobrevive
 		if (this.store.isTombstoned('discord', job.discordMessageId)) {
@@ -1401,7 +1553,8 @@ export class Bridge {
 		group: number,
 		extra: boolean,
 		text: string,
-		mainEmbed: unknown
+		mainEmbed: unknown,
+		footerBase: string
 	): void {
 		this.store.mapMessage({
 			link_id: job.linkId,
@@ -1412,20 +1565,34 @@ export class Bridge {
 			chunk_total: job.chunkTotal,
 			rendered: extra ? null : text,
 			bridge_embed: extra ? null : mainEmbed ?? null,
-			footer_base: extra ? null : job.footerBase
+			footer_base: extra ? null : footerBase,
+			link_embeds: extra ? null : (job.linkEmbeds ?? [])
 		});
 	}
 
-	/** Reconcilia envio incerto no Papo: a cópia é reconhecida pelo rodapé determinístico. */
-	private async findPapoCopies(channelId: string, footers: string[]): Promise<Map<string, string>> {
+	/**
+	 * Reconcilia envio incerto no Papo: a cópia é reconhecida pela assinatura do rodapé e por
+	 * ser posterior à mensagem de origem. Sem a assinatura, qualquer mensagem antiga do bot
+	 * com o mesmo rodapé do minuto servia — e o job se ligava à cópia errada.
+	 */
+	private async findPapoCopies(
+		channelId: string,
+		signatures: string[],
+		sourceTimestamp: string
+	): Promise<Map<string, string>> {
 		const out = new Map<string, string>();
-		if (!this.papoUserId || !footers.length) return out;
+		if (!this.papoUserId || !signatures.length) return out;
 		const since = new Date(Date.now() - 3600_000).toISOString();
 		const list = await this.api.listMessages(channelId, { since, order: 'desc' }).catch(() => undefined);
 		const mine = (list?.messages ?? []).filter((m) => m.author_id === this.papoUserId);
-		for (const footer of footers) {
-			const hit = mine.find((m) => (m.embeds ?? []).some((e) => e.footer?.text === footer));
-			if (hit) out.set(footer, hit.id);
+		const after = Date.parse(sourceTimestamp) || 0;
+		for (const signature of signatures) {
+			const hit = mine.find(
+				(m) =>
+					(m.created_at ? (Date.parse(m.created_at) || 0) >= after : true) &&
+					(m.embeds ?? []).some((e) => e.footer?.text?.includes(signature))
+			);
+			if (hit) out.set(signature, hit.id);
 		}
 		return out;
 	}
@@ -1454,6 +1621,8 @@ export class Bridge {
 			job.side === 'papo' ? this.store.findMapByPapo(job.sourceMessageId) : this.store.findMapByDiscord(job.sourceMessageId);
 		const map = maps.find((m) => m.chunk_index === job.chunkIndex) ?? maps[0];
 		if (!map) throw new RetryableError('mensagem de destino ainda não mapeada');
+		// preview e texto são estados separados da mesma cópia: cada um tem sua revisão
+		if (env.embedsOnly) return this.applyPreviewEdit(env, job, map);
 		// a fila serializa a execução, não a cronologia da origem: uma edição mais antiga,
 		// enfileirada depois, não pode sobrescrever o estado mais recente já aplicado
 		if (job.revision && map.edit_revision && job.revision <= map.edit_revision) {
@@ -1472,30 +1641,11 @@ export class Bridge {
 				return;
 			}
 			if (!map.discord_message_id) throw new RetryableError('sem mensagem do Discord mapeada');
-			if (env.embedsOnly) {
-				// preview de link do Papo: o card da ponte (texto/autor/avatar) continua primeiro,
-				// os embeds do Papo vêm atrás.
-				const card = map.bridge_embed ? (JSON.parse(map.bridge_embed) as DiscordEmbedPayload) : undefined;
-				if (card)
-					card.description = this.withReactionSummary(
-						map.rendered ?? '',
-						this.reactionSummaryForMap(map, 'discord'),
-						DISCORD_LIMITS.embedDescriptionMax
-					);
-				const embeds = fitEmbedBudget(
-					[...(card ? [card] : []), ...(env.embeds ?? [])],
-					DISCORD_LIMITS.embedTotalChars
-				);
-				await this.discord.edit(job.targetChannelId, map.discord_message_id, {
-					embeds: embeds as APIEmbed[],
-					files: this.filesForEmbedRefs(embeds)
-				});
-				return;
-			}
 			const embed = this.discordCopyEmbed(map, job);
+			const embeds = fitEmbedBudget([embed, ...this.mapPreviews<DiscordEmbedPayload>(map)], DISCORD_LIMITS.embedTotalChars);
 			await this.discord.edit(job.targetChannelId, map.discord_message_id, {
-				embeds: [embed as APIEmbed],
-				files: this.filesForEmbedRefs([embed])
+				embeds: embeds as APIEmbed[],
+				files: this.filesForEmbedRefs(embeds)
 			});
 			this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed, edit_revision: job.revision ?? null });
 			return;
@@ -1509,8 +1659,68 @@ export class Bridge {
 			return;
 		}
 		const embed = this.papoCopyEmbed(map, job.text);
-		await this.api.editMessage(map.papo_message_id, '', [embed]);
+		await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
 		this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed, edit_revision: job.revision ?? null });
+	}
+
+	/**
+	 * Aplica o preview de link à cópia: o cartão da ponte (autor, avatar, texto) continua
+	 * primeiro e o preview entra como embed extra atrás dele. Remover o preview reescreve a
+	 * cópia só com o cartão — o cartão e o resumo de reações nunca são tocados pelo preview.
+	 */
+	private async applyPreviewEdit(env: Envelope, job: EditJob, map: MessageMapRow): Promise<void> {
+		if (job.side !== 'papo' || map.direction !== 'papo_to_discord') {
+			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'preview ignorado: a cópia editável não está no Discord');
+			return;
+		}
+		if (!map.discord_message_id) throw new RetryableError('sem mensagem do Discord mapeada');
+		// só uma revisão **anterior** é descartada. Duas atualizações do mesmo milissegundo têm
+		// a mesma revisão; a ordem da fila (chegada) é o que as distingue, e a última chegada é
+		// a mais recente — descartar por igualdade perderia o preview novo.
+		if (job.revision && map.embed_revision && job.revision < map.embed_revision) {
+			this.log.debug(
+				{ sourceMessageId: job.sourceMessageId, revision: job.revision },
+				'preview obsoleto ignorado: estado mais recente já aplicado'
+			);
+			return;
+		}
+		const previews = await this.previewFromEnvelope(env);
+		const card = map.bridge_embed ? (JSON.parse(map.bridge_embed) as DiscordEmbedPayload) : undefined;
+		if (card) {
+			card.description = this.withReactionSummary(
+				map.rendered ?? '',
+				this.reactionSummaryForMap(map, 'discord'),
+				DISCORD_LIMITS.embedDescriptionMax
+			);
+		}
+		const embeds = fitEmbedBudget([...(card ? [card] : []), ...previews], DISCORD_LIMITS.embedTotalChars);
+		if (!embeds.length) return;
+		await this.discord.edit(job.targetChannelId, map.discord_message_id, {
+			embeds: embeds as APIEmbed[],
+			files: this.filesForEmbedRefs(embeds)
+		});
+		this.store.updateMapSnapshot(map.id, { link_embeds: previews, embed_revision: job.revision ?? null });
+	}
+
+	/** Preview pronto para aplicar: já convertido, ou convertido agora a partir da origem. */
+	private async previewFromEnvelope(env: Envelope): Promise<DiscordEmbedPayload[]> {
+		if (env.embeds?.length) return env.embeds.slice(0, 1);
+		if (env.papoEmbeds !== undefined) {
+			const preview = await this.papoPreviewEmbed(env.papoEmbeds);
+			return preview ? [preview] : [];
+		}
+		return [];
+	}
+
+	/** Embeds extra guardados no mapa: o preview que acompanha o cartão daquela cópia. */
+	private mapPreviews<T>(map: MessageMapRow): T[] {
+		if (!map.link_embeds) return [];
+		try {
+			const parsed = JSON.parse(map.link_embeds) as T[];
+			return Array.isArray(parsed) ? parsed.slice(0, 1) : [];
+		} catch {
+			return [];
+		}
 	}
 
 	/**
@@ -1573,7 +1783,6 @@ export class Bridge {
 
 		for (const map of targets) {
 			if (map.direction === 'papo_to_discord') {
-				// a cópia editável está no Discord
 				if (!map.discord_message_id) continue;
 				const embed = JSON.parse(map.bridge_embed!) as DiscordEmbedPayload;
 				embed.description = this.withReactionSummary(
@@ -1582,9 +1791,12 @@ export class Bridge {
 					DISCORD_LIMITS.embedDescriptionMax
 				);
 				embed.footer = { text: this.footerText(map, embed, DISCORD_LIMITS.embedFooterMax) };
+				// o preview é parte do estado da cópia: reescrever o cartão por causa de uma
+				// reação não pode apagá-lo
+				const embeds = fitEmbedBudget([embed, ...this.mapPreviews<DiscordEmbedPayload>(map)], DISCORD_LIMITS.embedTotalChars);
 				await this.discord.edit(link.discord_channel_id, map.discord_message_id, {
-					embeds: [embed as APIEmbed],
-					files: this.filesForEmbedRefs([embed])
+					embeds: embeds as APIEmbed[],
+					files: this.filesForEmbedRefs(embeds)
 				});
 				continue;
 			}
@@ -1597,7 +1809,7 @@ export class Bridge {
 				PAPO_LIMITS.embedDescriptionMax
 			);
 			embed.footer = { text: this.footerText(map, embed, PAPO_LIMITS.embedFooterMax) };
-			await this.api.editMessage(map.papo_message_id, '', [embed]);
+			await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
 		}
 	}
 
@@ -1681,6 +1893,20 @@ export class Bridge {
 			}
 		}
 
+		// estado já sincronizado: repetir a chamada é redundante. No Discord é só um pedido a
+		// mais; no Papo é o que deixa um marcador de eco pendente, pronto para consumir a
+		// próxima reação legítima igual à nossa.
+		const mirror = {
+			linkId: link.id,
+			side: 'discord' as const,
+			destinationMessageId: map.discord_message_id,
+			emoji: discordMirrorKey(native)
+		};
+		if (this.store.hasMirrorReaction(mirror) === job.add) {
+			this.log.debug({ messageId: job.sourceMessageId, emoji: display }, 'espelho do Discord já sincronizado: chamada evitada');
+			return;
+		}
+
 		try {
 			await this.reactOnDiscord(job, link.discord_channel_id, map.discord_message_id, native);
 		} catch (err) {
@@ -1702,7 +1928,8 @@ export class Bridge {
 			await this.reactOnDiscord(job, link.discord_channel_id, map.discord_message_id, native);
 		}
 		// o espelho vive no Discord: registrar é o que permite descontar a reação do bot
-		// quando uma contagem observada naquela mensagem a incluir
+		// quando uma contagem observada naquela mensagem a incluir. A chave é o emoji
+		// realmente aplicado (o retry pode ter trocado de token).
 		this.trackMirrorReaction({
 			linkId: link.id,
 			side: 'discord',
@@ -1737,24 +1964,31 @@ export class Bridge {
 		const papoEmoji = custom ? await this.emojis.papoByName(display.replace(/:/g, '')) : undefined;
 		const args = papoEmoji ? { emojiId: papoEmoji.id } : { unicode: display };
 		const selfKey = papoEmoji ? `e:${papoEmoji.id}` : `u:${display}`;
+		// Estado já sincronizado: um add/remove redundante pode não gerar `react_update` no
+		// Papo, e o marcador de eco ficaria pendente — a próxima reação legítima igual à
+		// nossa seria consumida como eco. Não chamar quando não há nada a mudar.
+		const mirror = {
+			linkId: link.id,
+			side: 'papo' as const,
+			destinationMessageId: map.papo_message_id,
+			emoji: selfKey
+		};
+		if (this.store.hasMirrorReaction(mirror) === job.add) {
+			this.log.debug({ messageId: job.sourceMessageId, emoji: display }, 'espelho do Papo já sincronizado: chamada evitada');
+			return;
+		}
 		// Marca ANTES de aplicar: o Papo transmite o `react_update` antes de devolver o
 		// HTTP, então o eco chega enquanto a chamada ainda está em voo. Marcando depois,
 		// o eco não era reconhecido e a reação voltava ao Discord como duplicada.
-		this.store.markSelfReaction({ linkId: link.id, destinationMessageId: map.papo_message_id, emoji: selfKey });
+		this.store.markSelfReaction(mirror);
 		try {
 			if (job.add) await this.api.addReaction(link.papo_channel_id, map.papo_message_id, args);
 			else await this.api.removeReaction(link.papo_channel_id, map.papo_message_id, args);
 		} catch (err) {
-			this.store.clearSelfReaction({ linkId: link.id, destinationMessageId: map.papo_message_id, emoji: selfKey });
+			this.store.clearSelfReaction(mirror);
 			throw err;
 		}
-		this.trackMirrorReaction({
-			linkId: link.id,
-			side: 'papo',
-			destinationMessageId: map.papo_message_id,
-			emoji: selfKey,
-			present: job.add
-		});
+		this.trackMirrorReaction({ ...mirror, present: job.add });
 	}
 
 	/**

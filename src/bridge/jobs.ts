@@ -59,6 +59,12 @@ export interface ToPapoMessageJob {
 	linkEmbeds?: PapoEmbedInput[];
 	notes: string[];
 	sources: SourceRef[];
+	/**
+	 * Instante da mensagem no Discord. A reconciliação de um envio incerto só aceita uma
+	 * cópia posterior à origem: uma cópia antiga do mesmo rodapé não pode ser confundida
+	 * com a que este job tentou criar.
+	 */
+	timestamp: string;
 	/** Mensagem Discord respondida (origem); a cópia Papo é resolvida na execução do job. */
 	replyRefDiscordId?: string;
 }

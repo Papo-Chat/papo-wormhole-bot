@@ -14,6 +14,8 @@ interface Handlers {
 	whoami?: number;
 	refresh?: number;
 	login?: number;
+	/** Statuses consumidos, em ordem, pelas rotas binárias (`/attachments/…`, `/media/…`). */
+	binary?: number[];
 }
 
 /** Instala um fetch falso que conta as rotas chamadas. */
@@ -47,6 +49,12 @@ function stubServer(statuses: Handlers): { calls: string[] } {
 				headers.set('set-cookie', 'Auth=sessao-do-login');
 				headers.set('content-type', 'application/json');
 				return new Response('{}', { status, headers });
+			}
+			if (path.startsWith('/attachments/') || path.startsWith('/media/')) {
+				const status = remaining.binary?.shift() ?? 200;
+				if (status !== 200) return new Response(problem(status), { status, headers: { 'content-type': 'application/problem+json' } });
+				headers.set('content-type', 'application/octet-stream');
+				return new Response(Buffer.from('bytes-do-anexo'), { status, headers });
 			}
 			throw new Error(`rota inesperada ${path}`);
 		})
@@ -173,5 +181,64 @@ describe('PapoApi: recuperação depois de 401', () => {
 		expect(calls.filter((p) => p === '/auth/refresh')).toHaveLength(1);
 		expect(calls.filter((p) => p === '/auth/login')).toHaveLength(1);
 		expect(api.authCookie).toBe('Auth=sessao-do-login');
+	});
+});
+
+describe('PapoApi: recuperação de sessão nos downloads binários', () => {
+	it('anexo com 401 renova a sessão e é baixado na repetição', async () => {
+		const api = await authedApi();
+		const { calls } = stubServer({ binary: [401, 200] });
+
+		const data = await api.downloadAttachment('a1');
+
+		expect(data.toString()).toBe('bytes-do-anexo');
+		expect(calls).toEqual(['/attachments/a1', '/auth/refresh', '/attachments/a1']);
+	});
+
+	it('refresh expirado: o download é refeito depois do login', async () => {
+		const api = await authedApi();
+		const { calls } = stubServer({ refresh: 401, binary: [401, 200] });
+
+		const data = await api.downloadAttachment('a1');
+
+		expect(data.toString()).toBe('bytes-do-anexo');
+		expect(calls.filter((p) => p === '/auth/refresh')).toHaveLength(1);
+		expect(calls.filter((p) => p === '/auth/login')).toHaveLength(1);
+		expect(calls.filter((p) => p === '/attachments/a1')).toHaveLength(2);
+	});
+
+	it('thumbnail e mídia re-hospedada têm a mesma recuperação', async () => {
+		const api = await authedApi();
+		const { calls } = stubServer({ binary: [401, 200, 401, 200] });
+
+		const thumb = await api.downloadAttachmentThumbnail('a1');
+		const media = await api.downloadMedia('abc123');
+
+		expect(thumb.toString()).toBe('bytes-do-anexo');
+		expect(media.toString()).toBe('bytes-do-anexo');
+		expect(calls.filter((p) => p === '/auth/refresh')).toHaveLength(2);
+	});
+
+	it('401 sem recuperação possível continua sendo falha transitória do job', async () => {
+		const api = await authedApi();
+		const { calls } = stubServer({ refresh: 401, login: 401, binary: [401] });
+
+		const err = await api.downloadAttachment('a1').catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(PapoApiError);
+		expect((err as PapoApiError).status).toBe(401);
+		// transitório: o job volta para a fila em vez de morrer com a mensagem perdida
+		expect((err as PapoApiError).transient).toBe(true);
+		// uma única recuperação, um único retry
+		expect(calls.filter((p) => p === '/attachments/a1')).toHaveLength(1);
+	});
+
+	it('404 no anexo não dispara recuperação de sessão', async () => {
+		const api = await authedApi();
+		const { calls } = stubServer({ binary: [404] });
+
+		const err = await api.downloadAttachment('a1').catch((e: unknown) => e);
+		expect((err as PapoApiError).status).toBe(404);
+		expect(calls.filter((p) => p === '/auth/refresh')).toHaveLength(0);
+		expect(calls.filter((p) => p === '/attachments/a1')).toHaveLength(1);
 	});
 });

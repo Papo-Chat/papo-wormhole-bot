@@ -56,7 +56,11 @@ export interface MessageMapRow {
 	rendered: string | null;
 	bridge_embed: string | null;
 	footer_base: string | null;
+	/** JSON dos embeds extra de preview aplicados à cópia (atrás do cartão). */
+	link_embeds: string | null;
 	edit_revision: string | null;
+	/** Revisão da última atualização de preview aplicada à cópia. */
+	embed_revision: string | null;
 	deleted: number;
 }
 
@@ -69,7 +73,7 @@ export interface DeferredEventRow {
 	id: number;
 	source: 'papo' | 'discord';
 	source_message_id: string;
-	kind: 'reaction' | 'edit' | 'delete' | 'pin';
+	kind: 'reaction' | 'edit' | 'delete' | 'pin' | 'embeds';
 	payload: string;
 	created_at: string;
 }
@@ -277,6 +281,10 @@ export class Store {
 	}
 
 	// ── message map ────────────────────────────────────────
+	/**
+	 * Snapshot do que foi enviado no destino. `link_embeds` são os embeds extra de preview
+	 * que acompanham o cartão: todo re-render posterior precisa reenviá-los junto.
+	 */
 	mapMessage(m: {
 		link_id: number;
 		direction: 'papo_to_discord' | 'discord_to_papo';
@@ -288,11 +296,12 @@ export class Store {
 		rendered?: string | null;
 		bridge_embed?: unknown;
 		footer_base?: string | null;
+		link_embeds?: unknown;
 	}): void {
 		this.db
 			.prepare(
-				`INSERT INTO message_map (link_id, direction, papo_message_id, discord_message_id, chunk_index, chunk_total, content_sha, rendered, bridge_embed, footer_base)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`INSERT INTO message_map (link_id, direction, papo_message_id, discord_message_id, chunk_index, chunk_total, content_sha, rendered, bridge_embed, footer_base, link_embeds)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT DO NOTHING`
 			)
 			.run(
@@ -305,7 +314,8 @@ export class Store {
 				m.content_sha ?? null,
 				m.rendered ?? null,
 				m.bridge_embed === undefined ? null : JSON.stringify(m.bridge_embed),
-				m.footer_base ?? null
+				m.footer_base ?? null,
+				m.link_embeds === undefined || m.link_embeds === null ? null : JSON.stringify(m.link_embeds)
 			);
 	}
 
@@ -315,7 +325,14 @@ export class Store {
 	 */
 	updateMapSnapshot(
 		id: number,
-		snapshot: { rendered?: string | null; bridge_embed?: unknown; footer_base?: string | null; edit_revision?: string | null }
+		snapshot: {
+			rendered?: string | null;
+			bridge_embed?: unknown;
+			footer_base?: string | null;
+			link_embeds?: unknown;
+			edit_revision?: string | null;
+			embed_revision?: string | null;
+		}
 	): void {
 		const sets: string[] = [];
 		const args: (string | number | null)[] = [];
@@ -331,9 +348,17 @@ export class Store {
 			sets.push('footer_base = ?');
 			args.push(snapshot.footer_base);
 		}
+		if (snapshot.link_embeds !== undefined) {
+			sets.push('link_embeds = ?');
+			args.push(snapshot.link_embeds === null ? null : JSON.stringify(snapshot.link_embeds));
+		}
 		if (snapshot.edit_revision !== undefined) {
 			sets.push('edit_revision = ?');
 			args.push(snapshot.edit_revision);
+		}
+		if (snapshot.embed_revision !== undefined) {
+			sets.push('embed_revision = ?');
+			args.push(snapshot.embed_revision);
 		}
 		if (!sets.length) return;
 		args.push(id);
@@ -544,7 +569,7 @@ export class Store {
 	deferEvent(e: {
 		source: 'papo' | 'discord';
 		sourceMessageId: string;
-		kind: 'reaction' | 'edit' | 'delete' | 'pin';
+		kind: 'reaction' | 'edit' | 'delete' | 'pin' | 'embeds';
 		payload: unknown;
 	}): void {
 		this.db
