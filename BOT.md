@@ -123,6 +123,13 @@ Regra geral: **CommonMark é pass-through**; só reescrever sintaxe específica 
 | emoji custom | `<:name:id>` / `<a:name:id>` | confirmar sintaxe inline | ver §6 |
 | sticker / poll / botão / thread | componentes | não existem | fallback textual (ex. `[sticker: nome]`, `[enquete: …]`) |
 
+**Rótulo de menção** (o caminho padrão, sem `propagate_mentions`): o id do mencionado é resolvido
+pelo cache de usuários do lado de destino — `users_discord` (nome global e apelido do guild, que o
+payload do Discord traz em `message.mentions`; o que faltar é buscado uma vez por `users.fetch`) e
+`users_papo` (batch `POST /users/user_summary_batch` antes de traduzir). Mencionado normalmente não
+está no cache porque nunca autorou uma mensagem ponte, e snowflake/uuid não diz nada a quem lê: sem
+rótulo o bridge assina `@usuário`, nunca o id cru.
+
 **Anti-loop (obrigatório)**: descartar na entrada qualquer mensagem cujo autor seja o usuário-bot
 do Papo ou o próprio bot/webhook do Discord; além disso `message_map` é único por
 `(origem, id_da_mensagem_origem)` — uma mensagem já bridgeada nunca é re-bridgeada.

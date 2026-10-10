@@ -32,13 +32,20 @@ const cfg: Config = {
 
 const PAPO_USER = '68c858a1-8d68-44d1-b7a5-05d95089fb97';
 const DISCORD_USER = '206552277044035584';
+/** Papo user sem link com o Discord e sem cache: o bridge precisa buscar o perfil. */
+const OTHER_PAPO_USER = '11111111-2222-4333-8444-555555555555';
 
 interface DiscordSend {
 	channelId: string;
 	embeds?: { description?: string }[];
 }
 
-const fixture = (opts: { propagateMentions?: boolean } = {}) => {
+interface FakeMentions {
+	users?: Map<string, { id: string; username: string; displayName?: string; avatar?: string }>;
+	members?: Map<string, { user: { id: string; username: string; displayName?: string; avatar?: string }; displayName: string }>;
+}
+
+const fixture = (opts: { propagateMentions?: boolean; profilesFail?: boolean } = {}) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
 	const outbox = new Outbox(db, { maxAttempts: 5, baseMs: 20, maxMs: 60 });
@@ -46,7 +53,10 @@ const fixture = (opts: { propagateMentions?: boolean } = {}) => {
 	const papoSent: { embeds?: { description?: string }[] }[] = [];
 	const api = {
 		listAllEmojis: async () => [],
-		summariesBatch: async (ids: string[]) => ids.map((id) => ({ id, username: 'jenga' })),
+		summariesBatch: async (ids: string[]) => {
+			if (opts.profilesFail) throw new Error('papo fora do ar');
+			return ids.map((id) => ({ id, username: 'ana_s', nickname: 'Ana' }));
+		},
 		profilesBatch: async (ids: string[]) => ids.map((id) => ({ id, username: 'jenga', nickname: 'Jenga' })),
 		sendMessage: async (input: { embeds?: { description?: string }[] }) => {
 			papoSent.push(input);
@@ -59,6 +69,7 @@ const fixture = (opts: { propagateMentions?: boolean } = {}) => {
 		findGuildEmoji: () => undefined,
 		channelName: () => 'geral',
 		roleName: (id: string) => (id === '206552277044035590' ? 'moderação' : undefined),
+		username: async (id: string) => (id === '999999' ? 'sem_link' : undefined),
 		send: async (channelId: string, options: DiscordSend) => {
 			sends.push(options);
 			return { id: 'd1' };
@@ -91,7 +102,7 @@ const papoMessage = (content: string) => ({
 	attachments: []
 });
 
-const discordMessage = (content: string) => ({
+const discordMessage = (content: string, mentions: FakeMentions = {}) => ({
 	id: 'dm-1',
 	channelId: '111',
 	channel: { isThread: () => false },
@@ -106,7 +117,8 @@ const discordMessage = (content: string) => ({
 	content,
 	createdAt: new Date(),
 	attachments: [],
-	embeds: []
+	embeds: [],
+	mentions
 });
 
 const descriptionOf = (embeds?: { description?: string }[]): string => embeds?.[0]?.description ?? '';
@@ -170,5 +182,79 @@ describe('menção propaga pelo flag do link, não só pelo env global', () => {
 		await settle();
 
 		expect(descriptionOf(papoSent[0]?.embeds)).toContain('<@&999>');
+	});
+});
+
+describe('mencionado sem link-user: rótulo, nunca snowflake', () => {
+	it('usa o nome que vem no payload do Discord', async () => {
+		const { bridge, papoSent, store, settle } = fixture();
+
+		await bridge.onDiscordMessage(
+			discordMessage('oi <@300>', {
+				users: new Map([['300', { id: '300', username: 'ana_s', displayName: 'Ana', avatar: 'h' }]])
+			}) as never
+		);
+		await settle();
+
+		expect(descriptionOf(papoSent[0]?.embeds)).toContain('oi @Ana');
+		expect(store.getDiscordUser('300')?.display_name).toBe('Ana');
+	});
+
+	it('apelido do guild vence o nome global da conta', async () => {
+		const { bridge, papoSent, settle } = fixture();
+		const user = { id: '300', username: 'ana_s', displayName: 'Ana' };
+
+		await bridge.onDiscordMessage(
+			discordMessage('oi <@300>', {
+				users: new Map([['300', user]]),
+				members: new Map([['300', { user, displayName: 'Ana (mod)' }]])
+			}) as never
+		);
+		await settle();
+
+		expect(descriptionOf(papoSent[0]?.embeds)).toContain('oi @Ana (mod)');
+	});
+
+	it('menção que o payload não traz é buscada no Discord e cacheada', async () => {
+		const { bridge, papoSent, store, settle } = fixture();
+
+		await bridge.onDiscordMessage(discordMessage('oi <@999999>') as never);
+		await settle();
+
+		expect(descriptionOf(papoSent[0]?.embeds)).toContain('oi @sem_link');
+		expect(store.getDiscordUser('999999')?.username).toBe('sem_link');
+	});
+
+	it('mencionado inacessível não atravessa como snowflake', async () => {
+		const { bridge, papoSent, settle } = fixture();
+
+		await bridge.onDiscordMessage(discordMessage('oi <@1234567890>') as never);
+		await settle();
+
+		const description = descriptionOf(papoSent[0]?.embeds);
+		expect(description).toContain('oi @usuário');
+		expect(description).not.toContain('<@1234567890>');
+	});
+
+	it('menção do Papo sem link no Discord vira rótulo, não uuid', async () => {
+		const { bridge, sends, settle } = fixture();
+
+		bridge.onPapoEvent(papoMessage(`olá @mention(<@${OTHER_PAPO_USER}>)`) as never);
+		await settle();
+
+		const description = descriptionOf(sends[0]?.embeds);
+		expect(description).toContain('olá @Ana');
+		expect(description).not.toContain(OTHER_PAPO_USER);
+	});
+
+	it('perfil de mencionado indisponível não derruba a ponte', async () => {
+		const { bridge, sends, settle } = fixture({ profilesFail: true });
+
+		bridge.onPapoEvent(papoMessage(`olá @mention(<@${OTHER_PAPO_USER}>)`) as never);
+		await settle();
+
+		const description = descriptionOf(sends[0]?.embeds);
+		expect(description).toContain('olá @usuário');
+		expect(description).not.toContain(OTHER_PAPO_USER);
 	});
 });

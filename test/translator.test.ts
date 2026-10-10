@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { authorLabel, discordToPapoContent, formatDate, papoToDiscordContent } from '../src/bridge/translator.js';
+import { authorLabel, discordToPapoContent, discordUserMentionIds, formatDate, papoMentionIds, papoToDiscordContent } from '../src/bridge/translator.js';
 
 const PAPO_UUID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 
@@ -17,6 +17,11 @@ describe('discordToPapoContent', () => {
 			papoUserIdForDiscord: () => PAPO_UUID
 		});
 		expect(out).toBe(`oi @mention(<@${PAPO_UUID}>)`);
+	});
+
+	it('menção sem rótulo não atravessa como snowflake', () => {
+		expect(discordToPapoContent('oi <@111>')).toBe('oi @usuário');
+		expect(discordToPapoContent('oi <@!111>', { discordUserLabel: () => undefined })).toBe('oi @usuário');
 	});
 
 	it('converte emoji custom do Discord em shortcode do Papo', () => {
@@ -58,6 +63,18 @@ describe('discordToPapoContent', () => {
 	});
 });
 
+describe('ids de menção (rótulo resolvido antes de traduzir)', () => {
+	it('extrai as menções de usuário do Discord', () => {
+		expect(discordUserMentionIds('oi <@111> e <@!222>, role <@&7>, canal <#42>')).toEqual(['111', '222']);
+		expect(discordUserMentionIds('nada aqui')).toEqual([]);
+	});
+
+	it('extrai as menções no formato do Papo', () => {
+		expect(papoMentionIds(`olá @mention(<@${PAPO_UUID}>)`)).toEqual([PAPO_UUID]);
+		expect(papoMentionIds('sem menção')).toEqual([]);
+	});
+});
+
 describe('papoToDiscordContent', () => {
 	it('converte @mention(<@uuid>) em ping quando propagado', () => {
 		const out = papoToDiscordContent(`chamando @mention(<@${PAPO_UUID}>)`, {
@@ -72,6 +89,10 @@ describe('papoToDiscordContent', () => {
 			papoUserLabel: () => 'Jonas'
 		});
 		expect(out).toBe('chamando @Jonas');
+	});
+
+	it('menção sem rótulo não atravessa como uuid', () => {
+		expect(papoToDiscordContent(`chamando @mention(<@${PAPO_UUID}>)`)).toBe('chamando @usuário');
 	});
 
 	it('converte shortcode em emoji do guild', () => {

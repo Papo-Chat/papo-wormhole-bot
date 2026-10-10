@@ -93,9 +93,10 @@ const fixture = (discord: FakeDiscord) => {
 		footer_base: '🕒 18:09 · Papo'
 	});
 	const settle = async (): Promise<void> => {
+		// `onPapoEvent` é fire-and-forget: dá tempo do job entrar na fila antes de esvaziar.
+		await new Promise((r) => setTimeout(r, 40));
 		const until = Date.now() + 1200;
-		while (Date.now() < until) {
-			if (outbox.counts().in_flight === 0 && outbox.counts().pending === 0) return;
+		while (Date.now() < until && (outbox.counts().in_flight > 0 || outbox.counts().pending > 0)) {
 			await new Promise((r) => setTimeout(r, 25));
 		}
 	};

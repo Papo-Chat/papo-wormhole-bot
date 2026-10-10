@@ -199,6 +199,9 @@ trabalho (commite ou `git stash` antes).
 - Menção só vira menção real quando o canal-link tem `mentions` ligado (`/bridge-config …`).
   Propagada, ela renderiza como chip clicável no card dos dois lados, mas não notifica: embed não
   gera ping no Discord e o trigger de notificação do Papo lê apenas `content`.
+- Menção de quem não tem link de usuário vira nome (`@Ana`), não id: o bridge resolve o mencionado
+  pelo payload do Discord (apelido do guild tem prioridade sobre o nome da conta) ou pelo batch de
+  perfil do Papo. Sem como resolver, aparece `@usuário` — nunca o snowflake ou o uuid cru.
 - Reply é propagado por referência mapeada (`message.reference` ↔ `reply_to`): se a mensagem
   respondida não tem cópia do outro lado (anterior ao link, apagada), o reply simplesmente não vai.
 - Attachment do Papo em análise de moderação (`pending`/`processing`) é reenviado normalmente — o

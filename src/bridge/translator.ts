@@ -41,6 +41,17 @@ const DISCORD_TIMESTAMP_RE = /<t:(-?\d{1,12})(?::[A-Za-z])?>/g;
 const PAPO_MENTION_RE = /@mention\(<@([0-9a-fA-F-]{16,})>\)/g;
 const PAPO_SHORTCODE_RE = /:([A-Za-z0-9_]{1,32}):/g;
 
+/** Rótulo de menção que não pôde ser resolvida (mesma convenção de `authorLabel`). */
+const UNKNOWN_LABEL = 'usuário';
+
+/** ids de menção de usuário no conteúdo do Discord (para resolver rótulo antes de traduzir). */
+export const discordUserMentionIds = (content: string): string[] =>
+	[...content.matchAll(DISCORD_USER_RE)].flatMap((m) => (m[1] ? [m[1]] : []));
+
+/** ids de menção no formato canônico do Papo. */
+export const papoMentionIds = (content: string): string[] =>
+	[...content.matchAll(PAPO_MENTION_RE)].flatMap((m) => (m[1] ? [m[1]] : []));
+
 export function formatDate(isoOrEpoch: string | number, timezone = 'America/Sao_Paulo'): string {
 	const date = typeof isoOrEpoch === 'number' ? new Date(isoOrEpoch * 1000) : new Date(isoOrEpoch);
 	if (Number.isNaN(date.getTime())) return String(isoOrEpoch);
@@ -75,13 +86,15 @@ export function discordToPapoContent(content: string, r: TranslateResolvers = {}
 	// menções
 	out = out.replace(DISCORD_ROLE_RE, (raw, id: string) => r.discordRoleLabel?.(id) ?? raw);
 	out = out.replace(DISCORD_CHANNEL_RE, (raw, id: string) => (r.discordChannelLabel?.(id) ? `#${r.discordChannelLabel!(id)}` : raw));
-	out = out.replace(DISCORD_USER_RE, (raw, id: string) => {
+	out = out.replace(DISCORD_USER_RE, (_raw, id: string) => {
 		if (r.propagateMentions) {
 			const papoId = r.papoUserIdForDiscord?.(id);
 			if (papoId) return `@mention(<@${papoId}>)`;
 		}
+		// snowflake não diz nada a quem lê o Papo: sem link-user o rótulo vem do cache de
+		// usuários Discord, e o último recurso é `@usuário` (nunca o id cru).
 		const label = r.discordUserLabel?.(id);
-		return label ? `@${label}` : raw;
+		return label ? `@${label}` : `@${UNKNOWN_LABEL}`;
 	});
 
 	// sublinhado do Discord não existe no Papo
@@ -102,13 +115,14 @@ export function papoToDiscordContent(content: string, r: TranslateResolvers = {}
 	if (!content) return '';
 	let out = content;
 
-	out = out.replace(PAPO_MENTION_RE, (raw, id: string) => {
+	out = out.replace(PAPO_MENTION_RE, (_raw, id: string) => {
 		if (r.propagateMentions) {
 			const discordId = r.discordUserIdForPapo?.(id);
 			if (discordId) return `<@${discordId}>`;
 		}
+		// uuid do Papo não significa nada no Discord: rótulo do cache, senão `@usuário`
 		const label = r.papoUserLabel?.(id);
-		return label ? `@${label}` : raw;
+		return label ? `@${label}` : `@${UNKNOWN_LABEL}`;
 	});
 
 	out = out.replace(PAPO_SHORTCODE_RE, (raw, name: string) => {

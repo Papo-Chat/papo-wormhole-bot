@@ -25,7 +25,15 @@ import type {
 } from '../papo/types.js';
 import { DiscordBridge } from '../discord/bridge.js';
 import { chunkLabel, chunkText } from './chunk.js';
-import { authorLabel, discordToPapoContent, formatDate, papoToDiscordContent, type TranslateResolvers } from './translator.js';
+import {
+	authorLabel,
+	discordToPapoContent,
+	discordUserMentionIds,
+	formatDate,
+	papoMentionIds,
+	papoToDiscordContent,
+	type TranslateResolvers
+} from './translator.js';
 import {
 	attachmentRef,
 	avatarAttachmentName,
@@ -62,6 +70,9 @@ const EDIT_MARK = '✏️ editado · ';
 
 /** Selo da linha de reações no `description` (footer de embed não renderiza emoji custom). */
 const REACTION_MARK = '↳ ';
+
+/** Buscas no Discord por menção que o payload não trouxe, por mensagem. */
+const MENTION_LOOKUP_LIMIT = 10;
 
 /** Identidade de uma reação do Papo, estável entre o evento WS e a execução do job. */
 const papoReactionKey = (e: { emoji_id: string | null; unicode: string | null }): string =>
@@ -279,6 +290,7 @@ export class Bridge {
 		if (this.store.findMapByPapo(msg.id).length) return; // idempotência
 
 		const author = await this.identity.author(msg.author_id);
+		await this.warmPapoMentions(msg.content ?? '');
 		const translated = papoToDiscordContent(msg.content ?? '', this.resolvers(link));
 		const chunks = chunkText(translated, EMBED_CHUNK_CHARS);
 		const sources = link.bridge_attachments ? this.sourceRefs(msg) : [];
@@ -323,16 +335,27 @@ export class Bridge {
 		this.scheduleLink(link.id);
 	}
 
+	/**
+	 * Rótulos das menções do Papo: batch de perfil (`POST /users/user_summary_batch`) antes de
+	 * traduzir. Busca que falha não derruba a ponte de texto — o tradutor cai em `@usuário`.
+	 */
+	private async warmPapoMentions(content: string): Promise<void> {
+		const ids = papoMentionIds(content);
+		if (!ids.length) return;
+		await this.identity.warm(ids).catch((err) => this.log.debug({ err }, 'perfil de mencionado não resolvido'));
+	}
+
 	private async onPapoEdit(e: PapoWsEditEvent): Promise<void> {
 		const link = this.linkForPapoChannel(e.channel_id);
 		if (!link || !link.bridge_edits) return;
 		const maps = this.store.findMapByPapo(e.id);
 		if (this.allCopiesHere(maps, 'papo')) {
-			// eco: foi o próprio bridge que reescreveu o embed da cópia (rodapé de reação).
+			// eco: foi o próprio bridge que reescreveu o embed da cópia (resumo de reação).
 			// A mensagem do Discord é de outro autor e o Discord recusa a edição (50005).
 			this.log.debug({ messageId: e.id }, 'edição de cópia do bot no Papo: eco ignorado');
 			return;
 		}
+		await this.warmPapoMentions(e.content ?? '');
 		const chunks = chunkText(papoToDiscordContent(e.content ?? '', this.resolvers(link)), EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
@@ -614,6 +637,46 @@ export class Bridge {
 
 	// ── eventos Discord ────────────────────────────────────
 
+	/**
+	 * Mencionados entram no cache de usuários Discord antes de traduzir. Sem rótulo a menção
+	 * atravessaria como snowflake (`<@206…>`), que o Papo não sabe renderizar — e o mencionado
+	 * costuma não estar no cache porque nunca autorou uma mensagem ponte. O payload do Discord
+	 * traz nome/avatar de cada um; o que faltar é buscado uma vez e cacheado.
+	 */
+	private async cacheMentionedDiscordUsers(m: DiscordMessage): Promise<void> {
+		for (const user of m.mentions?.users?.values() ?? []) {
+			// o payload não traz apelido de guild: não serve para estragar um cache mais rico
+			if (this.store.getDiscordUser(user.id)) continue;
+			this.store.upsertDiscordUser({
+				id: user.id,
+				username: user.username,
+				display_name: user.displayName ?? user.username,
+				avatar_hash: user.avatar
+			});
+		}
+		// por cima: apelido do guild é o que quem lê o canal reconhece
+		for (const member of m.mentions?.members?.values() ?? []) {
+			const user = member.user;
+			if (!user) continue;
+			this.store.upsertDiscordUser({
+				id: user.id,
+				username: user.username,
+				display_name: member.displayName ?? user.displayName ?? user.username,
+				avatar_hash: user.avatar
+			});
+		}
+		// menção que o payload não trouxe (mensagem parcial, conta de fora do guild). O teto
+		// evita busca em massa atrás de id inventado em mensagem de spam.
+		const unknown = discordUserMentionIds(m.content ?? '').filter((id) => !this.store.getDiscordUser(id));
+		for (const id of unknown.slice(0, MENTION_LOOKUP_LIMIT)) {
+			const username = await this.discord.username(id);
+			if (username) this.store.upsertDiscordUser({ id, username, display_name: username });
+		}
+		if (unknown.length > MENTION_LOOKUP_LIMIT) {
+			this.log.debug({ messageId: m.id, missing: unknown.length }, 'menções sem rótulo: limite de busca');
+		}
+	}
+
 	async onDiscordMessage(m: DiscordMessage): Promise<void> {
 		if (this.discord.isSelf(m.author.id)) return; // anti-loop
 		if (m.channel.isThread()) return; // v1: threads fora do escopo
@@ -628,6 +691,7 @@ export class Bridge {
 			display_name: displayName,
 			avatar_hash: m.author.avatar
 		});
+		await this.cacheMentionedDiscordUsers(m);
 
 		const content = discordToPapoContent(m.content ?? '', this.resolvers(link));
 		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
@@ -696,7 +760,7 @@ export class Bridge {
 			return;
 		}
 		if (this.discord.isSelf(fresh.author.id)) {
-			// eco: foi o próprio bridge que reescreveu o embed (rodapé de reação).
+			// eco: foi o próprio bridge que reescreveu o embed (resumo de reação).
 			this.log.debug({ messageId: fresh.id }, 'edição de embed ponte: eco ignorado');
 			return;
 		}
@@ -706,6 +770,7 @@ export class Bridge {
 			this.log.debug({ messageId: fresh.id }, 'edição sem mapeamento: mensagem não ponte');
 			return;
 		}
+		await this.cacheMentionedDiscordUsers(fresh);
 		const chunks = chunkText(discordToPapoContent(fresh.content ?? '', this.resolvers(link)), PAPO_EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
