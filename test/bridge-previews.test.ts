@@ -63,7 +63,13 @@ interface PapoSend {
 	attachments?: { name: string }[];
 }
 
-const fixture = (opts: { embedImageDelayMs?: number; mediaBaseUrl?: string | null; maxFileBytes?: number; bridgeEdits?: boolean } = {}) => {
+const fixture = (opts: {
+	embedImageDelayMs?: number;
+	mediaBaseUrl?: string | null;
+	maxFileBytes?: number;
+	bridgeEdits?: boolean;
+	avatar?: boolean;
+} = {}) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
 	const outbox = new Outbox(db, { maxAttempts: cfg.bridge.maxAttempts, baseMs: 20, maxMs: 60 });
@@ -97,7 +103,13 @@ const fixture = (opts: { embedImageDelayMs?: number; mediaBaseUrl?: string | nul
 	const api = {
 		listAllEmojis: async () => [],
 		summariesBatch: async (ids: string[]) => ids.map((id) => ({ id, username: 'u' })),
-		profilesBatch: async (ids: string[]) => ids.map((id) => ({ id, username: 'u', nickname: null })),
+		profilesBatch: async (ids: string[]) =>
+			ids.map((id) => ({
+				id,
+				username: 'u',
+				nickname: null,
+				...(opts.avatar ? { avatar_blob: Buffer.from('avatar-bytes').toString('base64'), avatar_format: 'png' } : {})
+			})),
 		whoami: async () => ({ id: 'bot', username: 'bot' }),
 		ensureSession: async () => true,
 		getEmbed: async (id: string) => {
@@ -191,6 +203,23 @@ const richPreview = (title: string, url = `https://example.com/${title}`) => ({
 	thumbnail: { url: `${url}/thumb.png` }
 });
 
+/** GIF de Twitter no Discord (espelho vxTwitter/fixvx): conversor avif carregando o mp4 no query. */
+const vxTwitterGif = () => ({
+	type: 'rich',
+	url: 'https://vxtwitter.com/hardestgifs/status/2108436160964136985',
+	description: 'https://t.co/rGCV8x7bXD',
+	author: { name: 'Hardest GIFs 🔥 (@hardestgifs)', icon_url: 'https://pbs.twimg.com/profile_images/1640140330/breakdance_normal.gif' },
+	image: {
+		url: 'https://gifconvert.vxtwitter.com/convert.avif?url=https%3A%2F%2Fvideo.twimg.com%2Ftweet_video%2FHUKrfRHXIAAdssa.mp4',
+		proxy_url:
+			'https://images-ext-1.discordapp.net/external/ynozJlOM/%3Furl%3Dhttps%3A%2F%2Fvideo.twimg.com%2Ftweet_video%2FHUKrfRHXIAAdssa.mp4/https/gifconvert.vxtwitter.com/convert.avif',
+		width: 720,
+		height: 612,
+		content_type: 'image/avif'
+	},
+	footer: { text: 'vxTwitter / fixvx • GIF' }
+});
+
 describe('preview no bridge Discord → Papo', () => {
 	it('texto + URL cria o cartão principal e um embed extra com o primeiro preview', async () => {
 		const { bridge, api, settle } = fixture();
@@ -232,6 +261,24 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(embeds[0]!.description).toContain('texto');
 		expect(embeds[1]!.title).toBe('convertível');
 		expect(outbox.counts().dead).toBe(0);
+	});
+
+	it('GIF do Twitter via espelho chega como vídeo, não como imagem que o backend do Papo descarta', async () => {
+		const { bridge, api, settle } = fixture();
+
+		await bridge.onDiscordMessage(
+			discordMessage('dm-1', 'https://fixvx.com/hardestgifs/status/2108436160964136985', { embeds: [vxTwitterGif()] })
+		);
+		await settle();
+
+		const previews = api.sent[0]!.embeds ?? [];
+		expect(previews).toHaveLength(2);
+		const preview = previews.at(-1)!;
+		// o mp4 está escondido no query do conversor avif: é ele que o Papo reproduz
+		expect(preview.video?.url).toBe('https://video.twimg.com/tweet_video/HUKrfRHXIAAdssa.mp4');
+		expect(preview.video?.mime_type).toBe('video/mp4');
+		expect(preview.thumbnail).toBeUndefined();
+		expect(preview.url).toBe('https://vxtwitter.com/hardestgifs/status/2108436160964136985');
 	});
 
 	it('anexo e preview convivem: o cartão não perde o arquivo nem o preview', async () => {
@@ -332,6 +379,21 @@ describe('preview no bridge Papo → Discord', () => {
 
 		expect(discord.sends[0]!.embeds).toHaveLength(1);
 		expect(outbox.counts().dead).toBe(0);
+	});
+
+	it('avatar e mídia do preview são anexados uma única vez', async () => {
+		const { bridge, discord, settle } = fixture({ avatar: true, mediaBaseUrl: null });
+
+		bridge.onPapoEvent(papoMessage('pm1', 'olá https://example.com/a', { embeds: [linkPreview('artigo')] }));
+		await settle();
+
+		const files = discord.sends[0]!.files;
+		// sem media server público o avatar do cartão é um anexo referenciado; reenviá-lo pelo
+		// caminho das referências deixa uma cópia sem embed consumindo-a, e o Discord desenha
+		// no corpo da mensagem todo arquivo órfão — uma foto grande do avatar
+		expect(files.filter((f) => f.startsWith('avatar-'))).toHaveLength(1);
+		expect(files.filter((f) => f.startsWith('media-'))).toHaveLength(1);
+		expect(discord.sends[0]!.embeds[0]!.author?.icon_url).toMatch(/^attachment:\/\/avatar-[0-9a-f]{64}\.png$/);
 	});
 });
 

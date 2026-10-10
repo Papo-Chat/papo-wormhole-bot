@@ -1566,9 +1566,15 @@ export class Bridge {
 				continue;
 			}
 			const files = groups[g]!.map((f) => ({ name: f.name, buffer: f.data }));
-			// a mídia do preview vai na mensagem do cartão, e só quando o preview ficou nela
-			if (g === 0) files.unshift(...this.filesForEmbedRefs(cardEmbeds));
-			if (avatar && g === 0 && built.author?.icon_url === attachmentRef(avatar.name)) files.unshift(avatar);
+			// avatar e mídia do preview vão na mensagem do cartão, cada um uma única vez: o
+			// Discord mostra no corpo todo arquivo que nenhum embed consumiu, então reenviar o
+			// avatar que o cartão já referencia por `attachment://` faz dele uma foto grande
+			if (g === 0) {
+				const refs = this.filesForEmbedRefs(cardEmbeds);
+				if (avatar && !refs.some((f) => f.name === avatar.name) && built.author?.icon_url === attachmentRef(avatar.name))
+					refs.unshift(avatar);
+				files.unshift(...refs);
+			}
 			markAttempt();
 			const sent = await this.discord.send(job.discordChannelId, {
 				embeds: extra

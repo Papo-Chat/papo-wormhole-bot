@@ -1,9 +1,5 @@
 import type { PapoEmbed, PapoEmbedInput } from '../papo/types.js';
-import {
-	DISCORD_LIMITS,
-	PAPO_LIMITS,
-	clampText
-} from './limits.js';
+import { DISCORD_LIMITS, PAPO_IMAGE_MIMES, PAPO_LIMITS, PAPO_VIDEO_MIMES, clampText } from './limits.js';
 
 /** Shape de embed: o que a API do Discord aceita gravar, mais o que ela devolve ao ler. */
 export interface DiscordEmbedPayload {
@@ -134,16 +130,40 @@ const areaOf = (m: DiscordMedia): number => (m.width ?? 0) * (m.height ?? 0);
  * `proxy_url` tem prioridade: é o que o próprio Discord re-serva — sem hotlink bloqueado na
  * origem e sem assinatura que expira, o que importa porque o relay de vídeo do Papo busca a
  * URL horas depois. Classifica pelo `content_type` e, na falta dele, pela extensão: um
- * `video.url` de página (o `/embed/` do YouTube) não é arquivo e não vira mídia.
+ * `video.url` de página (o `/embed/` do YouTube) não é arquivo e não vira mídia. Como último
+ * recurso, `playerFallback` aceita um `video` de embed que o Discord desenhou como player
+ * quando ele re-serva o arquivo — é o mp4 sem extensão dos espelhos de Twitter/Instagram.
  */
-const discordMediaOf = (m?: DiscordEmbedMedia | null): DiscordMedia | undefined => {
+const discordMediaOf = (m?: DiscordEmbedMedia | null, playerFallback = false): DiscordMedia | undefined => {
 	const url = m?.proxy_url ?? m?.url;
 	if (!url) return undefined;
 	const declared = (m?.content_type ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
-	const mime = declared || mimeFromUrl(url);
+	// sem tipo declarado nem extensão, o único sinal confiável de que é arquivo e não página:
+	// o Discord desenhou um player (gifv/gif/video) e re-serviu a mídia. O `/embed/` do YouTube
+	// não tem proxy; o mp4 sem extensão de um espelho de Twitter tem
+	const mime = declared || mimeFromUrl(url) || (playerFallback && m?.proxy_url ? 'video/mp4' : '');
 	if (!mime) return undefined;
 	return { url, origin: m?.url ?? undefined, mime, width: m?.width ?? undefined, height: m?.height ?? undefined };
 };
+
+/**
+ * URL de mídia que o próprio URL carrega no query. Conversores de preview entregam um
+ * intermediário (`convert.avif?url=https://video.twimg.com/....mp4`): o arquivo de verdade é o
+ * de dentro — é o que preserva a animação, e o de fora costuma vir num formato que o destino
+ * não decodifica.
+ */
+function embeddedMediaUrls(m?: DiscordEmbedMedia | null): string[] {
+	if (!m?.url) return [];
+	try {
+		const out: string[] = [];
+		for (const value of new URL(m.url).searchParams.values()) {
+			if (/^https?:\/\//i.test(value) && mimeFromUrl(value)) out.push(value);
+		}
+		return out;
+	} catch {
+		return [];
+	}
+}
 
 /** Percorre a árvore de componentes de um embed `components` do Discord. */
 function walkComponents(nodes?: DiscordComponentNode[]): DiscordComponentNode[] {
@@ -165,15 +185,27 @@ function walkComponents(nodes?: DiscordComponentNode[]): DiscordComponentNode[] 
 export function discordEmbedMedia(embed: DiscordEmbedPayload): { images: DiscordMedia[]; videos: DiscordMedia[] } {
 	const images: DiscordMedia[] = [];
 	const videos: DiscordMedia[] = [];
-	const add = (m?: DiscordEmbedMedia | null): void => {
-		const media = discordMediaOf(m);
-		if (!media) return;
-		if (media.mime.startsWith('video/')) videos.push(media);
-		else if (media.mime.startsWith('image/')) images.push(media);
+	// o tipo é o que o Discord desenhou: player. Autoriza aceitar um `video` sem tipo declarado
+	// nem extensão desde que o Discord re-serva o arquivo
+	const player = embed.type === 'video' || embed.type === 'gifv' || embed.type === 'gif';
+	const add = (m?: DiscordEmbedMedia | null, allowPlayerFallback = false): void => {
+		const push = (media: DiscordMedia | undefined): void => {
+			if (!media) return;
+			if (media.mime.startsWith('video/')) videos.push(media);
+			else if (media.mime.startsWith('image/')) images.push(media);
+		};
+		push(discordMediaOf(m, allowPlayerFallback));
+		// o URL entregue pode ser um conversor carregando o arquivo no query: o de dentro também
+		// entra, e é ele que costuma ser reproduzível
+		for (const url of embeddedMediaUrls(m)) {
+			const mime = mimeFromUrl(url);
+			if (!mime) continue;
+			push({ url, origin: url, mime, width: m?.width ?? undefined, height: m?.height ?? undefined });
+		}
 	};
 	add(embed.image);
 	add(embed.thumbnail);
-	add(embed.video);
+	add(embed.video, player);
 	for (const node of walkComponents(embed.components)) {
 		add(node.media);
 		add(node.accessory?.media);
@@ -260,14 +292,16 @@ export function discordEmbedsToPapo(embeds: DiscordEmbedPayload[]): PapoEmbedInp
 		if (host) input.site_name = clampText(host, 128);
 		const { images, videos } = discordEmbedMedia(e);
 		// O Papo renderiza a imagem da thumbnail; a imagem principal vira thumbnail quando é a única.
-		const image = previewImageOf({ images, videos });
+		// Só os formatos que o backend decodifica: um avif seria baixado e descartado (o preview
+		// chegaria sem imagem), e um vídeo fora da allowlist faz o backend recusar a mensagem inteira.
+		const image = previewImageOf({ images: images.filter((m) => PAPO_IMAGE_MIMES.includes(m.mime)), videos });
 		if (image) {
 			input.thumbnail = { url: clampText(image.url, PAPO_LIMITS.embedUrlMax) };
 			if (image.mime === 'image/gif') input.thumbnail.mime_type = 'image/gif';
 		}
 		// Vídeo direto vira `video` no Papo: o backend re-serva pelo relay (GET /embeds/{id}/video)
 		// e o card desenha o player. Página de player (YouTube) não é arquivo: fica só o cartão.
-		const video = videos[0];
+		const video = videos.find((v) => PAPO_VIDEO_MIMES.includes(v.mime));
 		if (video) input.video = {
 			url: clampText(video.url, PAPO_LIMITS.embedUrlMax),
 			mime_type: video.mime

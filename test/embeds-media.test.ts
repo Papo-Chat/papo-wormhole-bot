@@ -128,6 +128,32 @@ const ogInstagramComponents = () => ({
 	]
 });
 
+/**
+ * GIF de Twitter no Discord pelo espelho vxTwitter/fixvx: o preview é `rich` e o `image` é um
+ * conversor avif **carregando o mp4 de verdade no query**. O avif não está na allowlist do Papo.
+ */
+const vxTwitterGif = () => ({
+	type: 'rich',
+	url: 'https://vxtwitter.com/hardestgifs/status/2108436160964136985',
+	description: 'https://t.co/rGCV8x7bXD',
+	color: 1942002,
+	author: {
+		name: 'Hardest GIFs 🔥 (@hardestgifs)',
+		url: 'https://x.com/hardestgifs/status/2108436160964136985',
+		icon_url: 'https://pbs.twimg.com/profile_images/1640140330/breakdance_normal.gif',
+		proxy_icon_url: 'https://images-ext-1.discordapp.net/external/LG_uv/https/pbs.twimg.com/profile_images/1640140330/breakdance_normal.gif'
+	},
+	image: {
+		url: 'https://gifconvert.vxtwitter.com/convert.avif?url=https%3A%2F%2Fvideo.twimg.com%2Ftweet_video%2FHUKrfRHXIAAdssa.mp4',
+		proxy_url:
+			'https://images-ext-1.discordapp.net/external/ynozJlOM/%3Furl%3Dhttps%3A%2F%2Fvideo.twimg.com%2Ftweet_video%2FHUKrfRHXIAAdssa.mp4/https/gifconvert.vxtwitter.com/convert.avif',
+		width: 720,
+		height: 612,
+		content_type: 'image/avif'
+	},
+	footer: { text: 'vxTwitter / fixvx • GIF' }
+});
+
 describe('preview do Discord → Papo: mídia', () => {
 	it('GIF Klipy leva o vídeo mp4: a thumbnail webp é estática e não representa o GIF', () => {
 		const embed = first(klipyGifv());
@@ -190,6 +216,43 @@ describe('preview do Discord → Papo: mídia', () => {
 		});
 		expect(embed.thumbnail?.mime_type).toBe('image/gif');
 		expect(embed.video).toBeUndefined();
+	});
+
+	it('GIF do Twitter via espelho: o mp4 que o conversor carrega no query é o vídeo do preview', () => {
+		const embed = first(vxTwitterGif());
+		// o `image` é um conversor: o arquivo de verdade está no query dele
+		expect(embed.video?.url).toBe('https://video.twimg.com/tweet_video/HUKrfRHXIAAdssa.mp4');
+		expect(embed.video?.mime_type).toBe('video/mp4');
+		// o avif do conversor não está na allowlist do Papo: seria baixado e descartado
+		expect(embed.thumbnail).toBeUndefined();
+		expect(embed.author?.icon_url).toContain('pbs.twimg.com/profile_images/1640140330/breakdance_normal.gif');
+	});
+
+	it('mídia fora da allowlist do Papo não é oferecida: o backend recusaria a mensagem inteira', () => {
+		const video = first({
+			type: 'video',
+			url: 'https://example.com/v/1',
+			video: {
+				url: 'https://cdn.example.com/v/1',
+				proxy_url: 'https://images-ext-1.discordapp.net/external/x/https/cdn.example.com/v/1',
+				content_type: 'video/quicktime'
+			}
+		});
+		const image = first({
+			type: 'rich',
+			url: 'https://example.com/a',
+			image: {
+				url: 'https://cdn.example.com/diagrama.svg',
+				proxy_url: 'https://images-ext-1.discordapp.net/external/x/https/cdn.example.com/diagrama.svg',
+				width: 400,
+				height: 400,
+				content_type: 'image/svg+xml'
+			}
+		});
+		expect(video.video).toBeUndefined();
+		expect(image.thumbnail).toBeUndefined();
+		// o texto do preview sobrevive: o que não reproduz vira cartão com link
+		expect(image.url).toBe('https://example.com/a');
 	});
 });
 
