@@ -8,6 +8,8 @@ import { Outbox, type OutboxRow } from '../db/outbox.js';
 import { PapoApi, type SendMessageInput } from '../papo/api.js';
 import { PapoApiError } from '../papo/types.js';
 import { PapoWs } from '../papo/ws.js';
+import { handlePapoCommand } from '../commands/papo-commands.js';
+
 import type {
 	PapoEmbed,
 	PapoEmbedInput,
@@ -360,6 +362,13 @@ export class Bridge {
 		if (!link) return;
 		if (msg.author_id === this.papoUserId) return; // anti-loop
 		if (this.store.findMapByPapo(msg.id).length) return; // idempotência
+
+		//se for um comando ja despachamos logo
+		if (await handlePapoCommand(
+		{ id: msg.id, channelId: msg.channel_id, authorId: msg.author_id, content: msg.content || "", createdAt: msg.created_at },
+		{api: this.api,bridge: this,outbox: this.outbox,store: this.store},           
+		{client: this.discord.client, reply: async (text) => {await this.api.sendMessage({channelId: msg.channel_id, content: text})} }
+		)) return;
 
 		const author = await this.identity.author(msg.author_id);
 		await this.warmPapoMentions(msg.content ?? '');
