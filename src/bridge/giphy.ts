@@ -75,7 +75,7 @@ export class GiphyResolver {
 				id,
 				url: image.url,
 				pageUrl: giphyPageUrl(id),
-				title: payload.data?.title?.trim() || 'GIF'
+				title: 'GIF'
 			};
 		} catch (err) {
 			// a URL direta do slug é estável: sem ela o GIF simplesmente não aparece

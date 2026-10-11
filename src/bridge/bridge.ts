@@ -399,13 +399,16 @@ export class Bridge {
 				linkEmbeds: i === 0 && preview.embed ? [preview.embed] : [],
 				replyRefPapoId: i === 0 ? (msg.reply_to ?? undefined) : undefined
 			};
-			const embed = buildDiscordBridgeEmbed({
+			let embed = buildDiscordBridgeEmbed({
 				authorName: author.name,
 				authorIconUrl: author.avatarUrl,
 				description,
 				footerText: `🕒 ${formatDate(msg.created_at, this.cfg.bridge.timezone)} · Papo${chunkLabel(i, total)}`,
 				colorHex: link.color ?? undefined
 			});
+			if (preview.embed?.title == "GIF" && embed.thumbnail) {
+				embed.thumbnail.url = preview.embed.url;
+			}
 			this.outbox.enqueue({
 				linkId: link.id,
 				direction: 'to_discord',
