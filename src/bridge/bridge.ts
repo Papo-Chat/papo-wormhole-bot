@@ -60,6 +60,7 @@ import { copySignatures, signedFooter } from './signature.js';
 import { firstDiscordPreview, firstPapoPreview, giphyEmbed, rawDiscordEmbeds } from './previews.js';
 import { GiphyResolver, giphyId } from './giphy.js';
 import { EXTRA_CHUNK_BASE, type BridgeJob, type DeleteJob, type EditJob, type PinJob, type ReactionJob, type SourceRef, type ToDiscordMessageJob, type ToPapoMessageJob } from './jobs.js';
+import { createHash } from 'node:crypto';
 
 /** Erro permanente: retry não resolve (payload inválido, permissão, recurso sumido). */
 class PermanentError extends Error {}
@@ -1505,8 +1506,17 @@ export class Bridge {
 		}
 
 		const avatar = this.avatarAttachment(job.authorIconSha, embed?.author?.icon_url);
+		console.log("avatar buffer: "+avatar?.buffer.toString().substring(0,10));
+		console.log("avatar name + ext: "+avatar?.name);
 		// avatar e mídia do preview ocupam anexos da mensagem de cartão: o orçamento dos
 		// anexos da origem é o que sobra
+		if (avatar) {
+			const info = this.media.sniffImage(avatar.buffer);
+			if (info) {
+				const sha = createHash('sha256').update(avatar.buffer).digest('hex');
+				job.authorIconSha = sha;
+			}
+		}
 		const reservedFiles = (avatar ? 1 : 0) + this.filesForEmbedRefs(job.linkEmbeds ?? []).length;
 		const plan = await prepareAttachments(this.sourcesToAttachments(job.sources), {
 			maxFileBytes: this.cfg.discord.maxFileBytes,
@@ -1538,11 +1548,12 @@ export class Bridge {
 			embed ??
 			buildDiscordBridgeEmbed({
 				authorName: job.authorName,
-				authorIconUrl: job.authorIconSha ? this.media.urlFor(job.authorIconSha, this.cfg.bridge.mediaBaseUrl) : undefined,
+				authorIconUrl: (job.authorIconSha && this.cfg.bridge.mediaBaseUrl && this.cfg.bridge.mediaBaseUrl?.length > 0) ? this.media.urlFor(job.authorIconSha, this.cfg.bridge.mediaBaseUrl) : undefined,
 				description,
 				footerText: footerBase,
 				colorHex: job.colorHex
 			});
+		console.log("icon on embed:"+built.author?.icon_url);
 		built.description = this.withReactionSummary(
 			description,
 			this.reactionSummaryFor('discord', this.store.listReactions(job.linkId, 'papo', job.papoMessageId)),
@@ -1556,6 +1567,8 @@ export class Bridge {
 				icon_url: attachmentRef(avatar.name)
 			};
 		}
+		console.log("icon on embed after fallback:"+built.author?.icon_url);
+
 		// o preview de link entra como embed extra, atrás do cartão
 		const cardEmbeds = fitEmbedBudget([built, ...(job.linkEmbeds ?? [])], DISCORD_LIMITS.embedTotalChars);
 
