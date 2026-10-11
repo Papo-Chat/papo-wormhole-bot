@@ -358,8 +358,6 @@ export class Bridge {
 	}
 
 	private async onPapoMessage(msg: PapoWsMessageEvent | PapoMessage): Promise<void> {
-		const link = this.linkForPapoChannel(msg.channel_id);
-		if (!link) return;
 		if (msg.author_id === this.papoUserId) return; // anti-loop
 		if (this.store.findMapByPapo(msg.id).length) return; // idempotência
 
@@ -369,6 +367,8 @@ export class Bridge {
 		{api: this.api,bridge: this,outbox: this.outbox,store: this.store},           
 		{client: this.discord.client, reply: async (text) => {await this.api.sendMessage({channelId: msg.channel_id, content: text})} }
 		)) return;
+		const link = this.linkForPapoChannel(msg.channel_id);
+		if (!link) return;
 
 		const author = await this.identity.author(msg.author_id);
 		await this.warmPapoMentions(msg.content ?? '');
