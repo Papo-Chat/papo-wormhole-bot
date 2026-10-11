@@ -14,6 +14,7 @@ import type {
 	PapoEmbed,
 	PapoEmbedInput,
 	PapoMessage,
+	PapoWsAvatarEvent,
 	PapoWsDeleteEvent,
 	PapoWsEditEvent,
 	PapoWsEmbedsEvent,
@@ -278,6 +279,8 @@ export class Bridge {
 				return this.onPapoEmbeds(event as PapoWsEmbedsEvent);
 			case 'react_update':
 				return this.onPapoReaction(event as PapoWsReactEvent);
+			case 'avatar_update':
+				return this.onAvatarUpdate(event as PapoWsAvatarEvent);
 			case 'attachment_moderation_update':
 				return this.onPapoModeration(event as PapoWsModerationEvent);
 			case 'message_pin':
@@ -743,6 +746,10 @@ export class Bridge {
 		if (!link || !link.bridge_reactions) return;
 		this.enqueuePapoReaction(link, e);
 		this.scheduleLink(link.id);
+	}
+
+	private async onAvatarUpdate(e: PapoWsAvatarEvent): Promise<void> {
+		this.identity.invalidate(e.user_id);
 	}
 
 	/**
