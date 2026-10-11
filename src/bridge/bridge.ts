@@ -406,15 +406,13 @@ export class Bridge {
 			let embed = buildDiscordBridgeEmbed({
 				authorName: author.name,
 				authorIconUrl: author.avatarUrl,
+				thumbnailUrl: preview.embed?.title == "GIF" ? preview.embed.url : undefined,
 				description,
 				footerText: `🕒 ${formatDate(msg.created_at, this.cfg.bridge.timezone)} · Papo${chunkLabel(i, total)}`,
 				colorHex: link.color ?? undefined
 			});
 			console.log("embed préformado: "+embed.author);
 			console.log("avatar no job préformado: "+job.authorIconSha?.substring(0,10));
-			if (preview.embed?.title == "GIF" && embed.thumbnail) {
-				embed.thumbnail.url = preview.embed.url;
-			}
 			this.outbox.enqueue({
 				linkId: link.id,
 				direction: 'to_discord',
