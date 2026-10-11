@@ -406,13 +406,10 @@ export class Bridge {
 			let embed = buildDiscordBridgeEmbed({
 				authorName: author.name,
 				authorIconUrl: author.avatarUrl,
-				thumbnailUrl: preview.embed?.title == "GIF" ? preview.embed.url : undefined,
 				description,
 				footerText: `🕒 ${formatDate(msg.created_at, this.cfg.bridge.timezone)} · Papo${chunkLabel(i, total)}`,
 				colorHex: link.color ?? undefined
 			});
-			console.log("embed préformado: "+embed.author);
-			console.log("avatar no job préformado: "+job.authorIconSha?.substring(0,10));
 			this.outbox.enqueue({
 				linkId: link.id,
 				direction: 'to_discord',
@@ -1513,8 +1510,6 @@ export class Bridge {
 		}
 
 		const avatar = this.avatarAttachment(job.authorIconSha, embed?.author?.icon_url);
-		console.log("avatar buffer: "+avatar?.buffer.toString().substring(0,10));
-		console.log("avatar name + ext: "+avatar?.name);
 		// avatar e mídia do preview ocupam anexos da mensagem de cartão: o orçamento dos
 		// anexos da origem é o que sobra
 		const reservedFiles = (avatar ? 1 : 0) + this.filesForEmbedRefs(job.linkEmbeds ?? []).length;
@@ -1553,7 +1548,6 @@ export class Bridge {
 				footerText: footerBase,
 				colorHex: job.colorHex
 			});
-		console.log("icon on embed:"+built.author?.icon_url);
 		built.description = this.withReactionSummary(
 			description,
 			this.reactionSummaryFor('discord', this.store.listReactions(job.linkId, 'papo', job.papoMessageId)),
@@ -1567,7 +1561,6 @@ export class Bridge {
 				icon_url: attachmentRef(avatar.name)
 			};
 		}
-		console.log("icon on embed after fallback:"+built.author?.icon_url);
 
 		// o preview de link entra como embed extra, atrás do cartão
 		const cardEmbeds = fitEmbedBudget([built, ...(job.linkEmbeds ?? [])], DISCORD_LIMITS.embedTotalChars);

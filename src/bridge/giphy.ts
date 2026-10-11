@@ -64,7 +64,7 @@ export class GiphyResolver {
 		try {
 			const res = await fetch(
 				`https://api.giphy.com/v1/gifs/${encodeURIComponent(id)}?api_key=${encodeURIComponent(this.apiKey)}`,
-				{ signal: AbortSignal.timeout(15_000) }
+				{ signal: AbortSignal.timeout(30_000) }
 			);
 			if (!res.ok) throw new Error(`giphy ${res.status}`);
 			const payload = (await res.json()) as GiphyApiResponse;
@@ -79,7 +79,7 @@ export class GiphyResolver {
 			};
 		} catch (err) {
 			// a URL direta do slug é estável: sem ela o GIF simplesmente não aparece
-			this.log?.debug({ err, id }, 'API do Giphy não respondeu: usando a URL direta do slug');
+			this.log?.warn({ err, id }, 'API do Giphy não respondeu: usando a URL direta do slug');
 			return fallback;
 		}
 	}
