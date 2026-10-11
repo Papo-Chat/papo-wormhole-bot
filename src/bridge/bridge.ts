@@ -407,6 +407,8 @@ export class Bridge {
 				footerText: `🕒 ${formatDate(msg.created_at, this.cfg.bridge.timezone)} · Papo${chunkLabel(i, total)}`,
 				colorHex: link.color ?? undefined
 			});
+			console.log("embed préformado: "+embed.author);
+			console.log("avatar no job préformado: "+job.authorIconSha?.substring(0,10));
 			if (preview.embed?.title == "GIF" && embed.thumbnail) {
 				embed.thumbnail.url = preview.embed.url;
 			}
@@ -1510,13 +1512,6 @@ export class Bridge {
 		console.log("avatar name + ext: "+avatar?.name);
 		// avatar e mídia do preview ocupam anexos da mensagem de cartão: o orçamento dos
 		// anexos da origem é o que sobra
-		if (avatar) {
-			const info = this.media.sniffImage(avatar.buffer);
-			if (info) {
-				const sha = createHash('sha256').update(avatar.buffer).digest('hex');
-				job.authorIconSha = sha;
-			}
-		}
 		const reservedFiles = (avatar ? 1 : 0) + this.filesForEmbedRefs(job.linkEmbeds ?? []).length;
 		const plan = await prepareAttachments(this.sourcesToAttachments(job.sources), {
 			maxFileBytes: this.cfg.discord.maxFileBytes,
