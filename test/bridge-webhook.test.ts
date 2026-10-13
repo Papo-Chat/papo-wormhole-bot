@@ -47,7 +47,9 @@ interface WebhookIdentity {
 }
 
 interface WebhookSend {
-	embeds?: { author?: { name?: string }; footer?: { text?: string } }[];
+	content?: string;
+	embeds?: { title?: string; url?: string; author?: { name?: string }; footer?: { text?: string } }[];
+	files?: { name: string }[];
 }
 
 interface DiscordSend {
@@ -60,7 +62,8 @@ const fixture = (opts: {
 	/** webhook existe mas a criação retorna null (limite do canal, sem Manage Webhooks) */
 	webhookUnavailable?: boolean;
 	avatar?: boolean;
-	webhookReturnsNull?: boolean;
+	/** primeira tentativa de envio pelo webhook falha com resultado certo (webhook morto); a segunda entrega */
+	webhookFailsOnce?: boolean;
 	isSelfMessage?: (m: { webhookId?: string | null }) => boolean;
 } = {}) => {
 	const db = openDb(':memory:');
@@ -123,7 +126,8 @@ const fixture = (opts: {
 					},
 					sendAsWebhook: async (_channelId: string, _userId: string, options: WebhookSend) => {
 						webhookSends.push(options);
-						return opts.webhookReturnsNull ? null : { id: 'w-1' };
+						if (opts.webhookFailsOnce && webhookSends.length === 1) return null;
+						return { id: 'w-1' };
 					}
 				}
 			: {})
@@ -131,7 +135,33 @@ const fixture = (opts: {
 	const bridge = new Bridge(cfg, store, outbox, api as never, {} as never, discord as never, media as never);
 	const link = store.upsertChannelLink({ papo_channel_id: 'chan-1', discord_channel_id: '111' });
 	const settle = () => settleQueue(outbox);
-	return { store, outbox, bridge, link, webhookRequests, webhookSends, sends, papoSent, settle };
+	/** Enfileira um job de envio direto (permite exercitar previews e reações sem passar pelo Papo). */
+	const enqueueJob = (job: Record<string, unknown>) => {
+		outbox.enqueue({
+			linkId: link.id,
+			direction: 'to_discord',
+			kind: 'message',
+			dedupeKey: `papo:${job.papoMessageId}:to_discord:0`,
+			payload: { job }
+		});
+	};
+	const baseJob = (id: string, extra: Record<string, unknown> = {}) => ({
+		kind: 'message',
+		linkId: link.id,
+		papoChannelId: 'chan-1',
+		discordChannelId: '111',
+		papoMessageId: id,
+		chunkIndex: 0,
+		chunkTotal: 1,
+		description: 'olá',
+		authorId: PAPO_USER,
+		authorName: 'Jenga',
+		timestamp: '2026-10-09T18:09:00Z',
+		notes: [],
+		sources: [],
+		...extra
+	});
+	return { store, outbox, bridge, link, enqueueJob, baseJob, webhookRequests, webhookSends, sends, papoSent, settle };
 };
 
 const papoMessage = (id: string) => ({
@@ -182,7 +212,7 @@ describe('nome do webhook por usuário', () => {
 });
 
 describe('envio via webhook do bridge', () => {
-	it('mensagem sai pelo webhook do usuário, com identidade pedida ao DiscordBridge', async () => {
+	it('mensagem sai pelo webhook com o conteúdo do Papo no content, sem cartão', async () => {
 		const { store, bridge, webhookRequests, webhookSends, sends, settle } = fixture({ webhook: true });
 
 		bridge.onPapoEvent(papoMessage('pm-1') as never);
@@ -199,14 +229,48 @@ describe('envio via webhook do bridge', () => {
 
 		expect(webhookSends).toHaveLength(1);
 		const sent = webhookSends[0]!;
+		// content = conteúdo do Papo; o bridge não gera cartão nem rodapé
+		expect(sent.content).toBe('olá');
+		expect(sent.embeds ?? []).toHaveLength(0);
 		// a identidade está no webhook: a mensagem não leva override de nick/avatar
 		expect(sent).not.toHaveProperty('username');
 		expect(sent).not.toHaveProperty('avatarUrl');
-		// o webhook já mostra nick + avatar como autor da mensagem: o cartão não repete
+		// a cópia fica mapeada e marcada como cópia de webhook
+		const map = store.findMapByDiscord('w-1')[0];
+		expect(map?.webhook_copy).toBe(1);
+		expect(map?.bridge_embed).toBeNull();
+	});
+
+	it('resumo de reações é anexado ao content (não há cartão)', async () => {
+		const { store, bridge, link, enqueueJob, baseJob, webhookSends, settle } = fixture({ webhook: true });
+		store.setReaction({ linkId: link.id, source: 'papo', sourceMessageId: 'pm-r', emoji: '👍', count: 2 });
+		enqueueJob(baseJob('pm-r'));
+		await bridge.drain();
+		await settle();
+
+		expect(webhookSends).toHaveLength(1);
+		expect(webhookSends[0]?.content).toBe('olá\n\n↳ 👍 2');
+	});
+
+	it('embeds que vêm do Papo são replicados como embeds da mensagem', async () => {
+		const { bridge, link, enqueueJob, baseJob, webhookSends, settle } = fixture({ webhook: true });
+		enqueueJob(
+			baseJob('pm-pv', {
+				linkEmbeds: [{ title: 'Post', url: 'https://example.com/post', description: 'preview do link' }]
+			})
+		);
+		await bridge.drain();
+		await settle();
+
+		expect(webhookSends).toHaveLength(1);
+		const sent = webhookSends[0]!;
+		expect(sent.content).toBe('olá');
+		expect(sent.embeds).toHaveLength(1);
+		// o preview chega como veio do Papo: sem autor/rodapé de cartão sobre ele
+		expect(sent.embeds?.[0]?.title).toBe('Post');
+		expect(sent.embeds?.[0]?.url).toBe('https://example.com/post');
+		expect(sent.embeds?.[0]?.footer).toBeUndefined();
 		expect(sent.embeds?.[0]?.author).toBeUndefined();
-		expect(sent.embeds?.[0]?.footer?.text).toContain('· Papo');
-		// a cópia fica mapeada pelo id retornado pelo webhook
-		expect(store.findMapByDiscord('w-1').length).toBe(1);
 	});
 
 	it('sem avatar o webhook ainda agrupa o usuário (identidade só de nome)', async () => {
@@ -243,15 +307,16 @@ describe('envio via webhook do bridge', () => {
 		expect(sends).toHaveLength(1);
 	});
 
-	it('webhook que falha na hora do envio faz fallback para o envio normal', async () => {
-		const { store, bridge, webhookSends, sends, settle } = fixture({ webhook: true, webhookReturnsNull: true });
+	it('webhook morto no envio re-tenta o job em vez de mandar cartão no meio da conversa', async () => {
+		const { store, bridge, webhookSends, sends, settle } = fixture({ webhook: true, webhookFailsOnce: true });
 
 		bridge.onPapoEvent(papoMessage('pm-5') as never);
 		await settle();
 
-		expect(webhookSends).toHaveLength(1);
-		expect(sends).toHaveLength(1);
-		expect(store.findMapByDiscord('d-new').length).toBe(1);
+		// primeira tentativa falha com certeza de não-entrega; a retomada entrega pelo webhook
+		expect(webhookSends).toHaveLength(2);
+		expect(sends).toHaveLength(0);
+		expect(store.findMapByDiscord('w-1').length).toBe(1);
 	});
 });
 

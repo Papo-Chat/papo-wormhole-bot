@@ -1602,9 +1602,14 @@ export class Bridge {
 		const webhookMode = Boolean(webhook);
 
 		const avatar = webhookMode ? undefined : this.avatarAttachment(job.authorIconSha, embed?.author?.icon_url);
-		// avatar e mídia do preview ocupam anexos da mensagem de cartão: o orçamento dos
-		// anexos da origem é o que sobra
-		const reservedFiles = (avatar ? 1 : 0) + this.filesForEmbedRefs(job.linkEmbeds ?? []).length;
+		// embeds **da origem Papo** (preview de link, GIF do picker): já vêm em `job.linkEmbeds`.
+		// O `embed` do envelope é o cartão pré-construído no enqueue — no modo webhook o bridge
+		// não gera cartão, então ele é ignorado e os únicos embeds são os previews da origem
+		const previewEmbeds = webhookMode ? [...(job.linkEmbeds ?? [])] : [];
+		// avatar e mídia do preview ocupam anexos da mensagem: o orçamento dos anexos da
+		// origem é o que sobra
+		const reservedFiles =
+			(avatar ? 1 : 0) + this.filesForEmbedRefs(webhookMode ? previewEmbeds : (job.linkEmbeds ?? [])).length;
 		const plan = await prepareAttachments(this.sourcesToAttachments(job.sources), {
 			maxFileBytes: this.cfg.discord.maxFileBytes,
 			maxFilesPerMessage: Math.max(1, DISCORD_LIMITS.attachmentsPerMessage - reservedFiles)
@@ -1616,51 +1621,67 @@ export class Bridge {
 			: job.description;
 
 		const groups = plan.groups.length ? plan.groups : [[]];
-		const stamp = formatDate(job.timestamp, this.cfg.bridge.timezone);
 		// selo determinístico por grupo: é a assinatura que permite reconhecer a cópia já
 		// criada quando o resultado de um envio anterior é incerto
 		const signatures = copySignatures('papo', job.papoMessageId, job.chunkIndex, groups.length);
-		const footerBase = signedFooter(
-			`🕒 ${stamp} · Papo${chunkLabel(job.chunkIndex, job.chunkTotal)}`,
-			signatures[0]!,
-			DISCORD_LIMITS.embedFooterMax
-		);
-		const footers = groups.map((_, g) =>
-			g === 0
-				? footerBase
-				: signedFooter(`🕒 ${stamp} · Papo · 📎 ${g + 1}/${groups.length}`, signatures[g]!, DISCORD_LIMITS.embedFooterMax)
-		);
+		const summary = this.reactionSummaryFor('discord', this.store.listReactions(job.linkId, 'papo', job.papoMessageId));
 
-		const built: DiscordEmbedPayload =
-			embed ??
-			buildDiscordBridgeEmbed({
-				authorName: job.authorName,
-				authorIconUrl: (job.authorIconSha && this.cfg.bridge.mediaBaseUrl && this.cfg.bridge.mediaBaseUrl?.length > 0) ? this.media.urlFor(job.authorIconSha, this.cfg.bridge.mediaBaseUrl) : undefined,
-				description,
-				footerText: footerBase,
-				colorHex: job.colorHex
-			});
-		built.description = this.withReactionSummary(
-			description,
-			this.reactionSummaryFor('discord', this.store.listReactions(job.linkId, 'papo', job.papoMessageId)),
-			DISCORD_LIMITS.embedDescriptionMax
-		);
-		built.footer = { text: footerBase };
-		if (webhookMode) {
-			// o webhook já mostra nick + avatar como autor da mensagem; o autor no cartão duplicaria
-			delete built.author;
-		} else if (avatar && !built.author?.icon_url) {
-			built.author = {
-				name: built.author?.name ?? job.authorName,
-				...(built.author?.url ? { url: built.author.url } : {}),
-				icon_url: attachmentRef(avatar.name)
-			};
+		// modo webhook: `content` = conteúdo do Papo (com a linha de reações anexada), embeds =
+		// só os previews que vieram do Papo. Sem cartão, sem rodapé, sem embed de continuação —
+		// a identidade e a data já são do próprio webhook/mensagem.
+		const webhookContent = this.withReactionSummary(description, summary, DISCORD_LIMITS.contentMax);
+		const webhookPreviews = webhookMode ? fitEmbedBudget(previewEmbeds, DISCORD_LIMITS.embedTotalChars) : [];
+
+		let footerBase = '';
+		let built: DiscordEmbedPayload | undefined;
+		let cardEmbeds: DiscordEmbedPayload[] = [];
+		let footers: string[] = [];
+		if (!webhookMode) {
+			const stamp = formatDate(job.timestamp, this.cfg.bridge.timezone);
+			footerBase = signedFooter(
+				`🕒 ${stamp} · Papo${chunkLabel(job.chunkIndex, job.chunkTotal)}`,
+				signatures[0]!,
+				DISCORD_LIMITS.embedFooterMax
+			);
+			footers = groups.map((_, g) =>
+				g === 0
+					? footerBase
+					: signedFooter(`🕒 ${stamp} · Papo · 📎 ${g + 1}/${groups.length}`, signatures[g]!, DISCORD_LIMITS.embedFooterMax)
+			);
+			built =
+				embed ??
+				buildDiscordBridgeEmbed({
+					authorName: job.authorName,
+					authorIconUrl: (job.authorIconSha && this.cfg.bridge.mediaBaseUrl && this.cfg.bridge.mediaBaseUrl?.length > 0) ? this.media.urlFor(job.authorIconSha, this.cfg.bridge.mediaBaseUrl) : undefined,
+					description,
+					footerText: footerBase,
+					colorHex: job.colorHex
+				});
+			built.description = this.withReactionSummary(description, summary, DISCORD_LIMITS.embedDescriptionMax);
+			built.footer = { text: footerBase };
+			if (avatar && !built.author?.icon_url) {
+				built.author = {
+					name: built.author?.name ?? job.authorName,
+					...(built.author?.url ? { url: built.author.url } : {}),
+					icon_url: attachmentRef(avatar.name)
+				};
+			}
+			// o preview de link entra como embed extra, atrás do cartão
+			cardEmbeds = fitEmbedBudget([built, ...(job.linkEmbeds ?? [])], DISCORD_LIMITS.embedTotalChars);
 		}
 
-		// o preview de link entra como embed extra, atrás do cartão
-		const cardEmbeds = fitEmbedBudget([built, ...(job.linkEmbeds ?? [])], DISCORD_LIMITS.embedTotalChars);
-
-		const existing = uncertain ? await this.findDiscordCopies(job.discordChannelId, signatures, job.timestamp) : new Map<string, string>();
+		// reconhecimento da cópia no envio incerto: cartão é achado pela assinatura do rodapé;
+		// cópia de webhook é achada pelo `content` (grupo 0) ou pelos nomes de anexo (grupos de
+		// arquivos, que no modo webhook saem sem embed)
+		const expectations = groups.map((files, g) => ({
+			signature: signatures[g]!,
+			...(webhookMode
+				? g === 0
+					? { contents: [webhookContent, clampText(description, DISCORD_LIMITS.contentMax)] }
+					: { files: files.map((f) => f.name) }
+				: {})
+		}));
+		const existing = uncertain ? await this.findDiscordCopies(job.discordChannelId, expectations, job.timestamp) : new Map<string, string>();
 		if (existing.size) {
 			this.log.warn(
 				{ papoMessageId: job.papoMessageId, found: existing.size },
@@ -1675,36 +1696,55 @@ export class Bridge {
 			const already = existing.get(signatures[g]!);
 			if (already) {
 				lastDiscordId = already;
-				this.mapDiscordCopy(job, already, g, extra, description, built, footerBase);
+				this.mapDiscordCopy(job, already, g, extra, description, built, footerBase, webhookMode, webhookPreviews);
 				continue;
 			}
 			const files = groups[g]!.map((f) => ({ name: f.name, buffer: f.data }));
-			// avatar e mídia do preview vão na mensagem do cartão, cada um uma única vez: o
-			// Discord mostra no corpo todo arquivo que nenhum embed consumiu, então reenviar o
-			// avatar que o cartão já referencia por `attachment://` faz dele uma foto grande
-			if (g === 0) {
-				const refs = this.filesForEmbedRefs(cardEmbeds);
-				if (avatar && !refs.some((f) => f.name === avatar.name) && built.author?.icon_url === attachmentRef(avatar.name))
-					refs.unshift(avatar);
-				files.unshift(...refs);
+			let embeds: APIEmbed[] = [];
+			if (webhookMode) {
+				if (g === 0) {
+					// a mídia que os previews referenciam por `attachment://` precisa ir junto
+					files.unshift(...this.filesForEmbedRefs(webhookPreviews));
+					embeds = this.discordApiEmbeds(webhookPreviews);
+				}
+				if (!extra && !webhookContent && !embeds.length && !files.length) {
+					this.log.debug({ papoMessageId: job.papoMessageId }, 'mensagem sem conteúdo, embed ou anexo: nada a enviar');
+					continue;
+				}
+			} else {
+				// avatar e mídia do preview vão na mensagem do cartão, cada um uma única vez: o
+				// Discord mostra no corpo todo arquivo que nenhum embed consumiu, então reenviar o
+				// avatar que o cartão já referencia por `attachment://` faz dele uma foto grande
+				if (g === 0) {
+					const refs = this.filesForEmbedRefs(cardEmbeds);
+					if (avatar && !refs.some((f) => f.name === avatar.name) && built?.author?.icon_url === attachmentRef(avatar.name))
+						refs.unshift(avatar);
+					files.unshift(...refs);
+				}
+				embeds = extra
+					? [
+							buildDiscordBridgeEmbed({
+								authorName: job.authorName,
+								description: `📎 continuação de anexos (${g + 1}/${groups.length})`,
+								footerText: footers[g]!,
+								colorHex: job.colorHex
+							}) as APIEmbed
+						]
+					: this.discordApiEmbeds(cardEmbeds);
 			}
-			const embeds = extra
-				? (() => {
-						const cont = buildDiscordBridgeEmbed({
-							authorName: job.authorName,
-							description: `📎 continuação de anexos (${g + 1}/${groups.length})`,
-							footerText: footers[g]!,
-							colorHex: job.colorHex
-						}) as APIEmbed;
-						if (webhookMode) delete cont.author;
-						return [cont];
-					})()
-				: this.discordApiEmbeds(cardEmbeds);
 			markAttempt();
 			const viaWebhook =
 				webhook && job.authorId
-					? await this.discord.sendAsWebhook?.(job.discordChannelId, job.authorId, { embeds, files })
+					? await this.discord.sendAsWebhook?.(job.discordChannelId, job.authorId, {
+							...(g === 0 ? { content: webhookContent } : {}),
+							embeds,
+							files
+						})
 					: undefined;
+			if (viaWebhook === null)
+				// webhook morto no envio (apagado por fora, sem permissão): nada foi entregue.
+				// O job re-tenta; a resolução recria o webhook ou cai para o cartão do bot.
+				throw new RetryableError('webhook do usuário indisponível no envio');
 			const sent =
 				viaWebhook ??
 				(await this.discord.send(job.discordChannelId, {
@@ -1713,7 +1753,7 @@ export class Bridge {
 					replyTo: extra ? lastDiscordId : this.copyForPapoMessage(job.replyRefPapoId)
 				}));
 			lastDiscordId = sent.id;
-			this.mapDiscordCopy(job, sent.id, g, extra, description, built, footerBase);
+			this.mapDiscordCopy(job, sent.id, g, extra, description, built, footerBase, webhookMode, webhookPreviews);
 		}
 		this.flushDeferred('papo', job.papoMessageId, job.linkId);
 		// o delete chegou enquanto o envio estava em voo: a cópia recém-criada não sobrevive
@@ -1728,8 +1768,10 @@ export class Bridge {
 		group: number,
 		extra: boolean,
 		description: string,
-		built: DiscordEmbedPayload,
-		footerBase: string
+		built: DiscordEmbedPayload | undefined,
+		footerBase: string,
+		webhookCopy = false,
+		webhookPreviews: DiscordEmbedPayload[] = []
 	): void {
 		this.store.mapMessage({
 			link_id: job.linkId,
@@ -1740,28 +1782,44 @@ export class Bridge {
 			chunk_index: extra ? EXTRA_CHUNK_BASE + group : job.chunkIndex,
 			chunk_total: job.chunkTotal,
 			rendered: extra ? null : description,
-			bridge_embed: extra ? null : built,
-			footer_base: extra ? null : footerBase,
-			link_embeds: extra ? null : (job.linkEmbeds ?? [])
+			// cópia de webhook não tem cartão: NULL de verdade, para o refresh de rodapé não
+			// tomar a linha como cartão
+			bridge_embed: extra || built === undefined ? undefined : built,
+			footer_base: extra || webhookCopy ? null : footerBase,
+			// no modo webhook o snapshot dos embeds da cópia são os previews da origem
+			link_embeds: extra ? null : webhookCopy ? webhookPreviews : (job.linkEmbeds ?? []),
+			webhook_copy: webhookCopy
 		});
 	}
 
 	/**
 	 * Reconcilia um envio de resultado incerto: procura no destino a cópia que o bridge já
-	 * criou, reconhecida pela **assinatura** do rodapé e por ser posterior à mensagem de
-	 * origem. O rodapé com data ao minuto não bastava: duas mensagens do mesmo minuto têm o
-	 * mesmo rodapé, e a cópia antiga seria tomada pela nova.
+	 * criou, reconhecida pela **assinatura** do rodapé (cartão), pelo `content` exato (cópia
+	 * de webhook) ou pelos nomes de anexo (grupos de arquivos sem embed), e por ser posterior
+	 * à mensagem de origem. O rodapé com data ao minuto não bastava: duas mensagens do mesmo
+	 * minuto têm o mesmo rodapé, e a cópia antiga seria tomada pela nova.
 	 */
-	private async findDiscordCopies(channelId: string, signatures: string[], sourceTimestamp: string): Promise<Map<string, string>> {
+	private async findDiscordCopies(
+		channelId: string,
+		expectations: { signature: string; contents?: string[]; files?: string[] }[],
+		sourceTimestamp: string
+	): Promise<Map<string, string>> {
 		const out = new Map<string, string>();
 		const selfId = this.discord.selfId;
-		if (!selfId || !signatures.length) return out;
+		if (!selfId || !expectations.length) return out;
 		const recent = await this.discord.recentByAuthor(channelId, selfId, 50).catch(() => undefined);
 		if (!recent) return out;
 		const after = Date.parse(sourceTimestamp) || 0;
-		for (const signature of signatures) {
-			const hit = recent.find((m) => m.createdAt >= after && m.footers.some((f) => f.includes(signature)));
-			if (hit) out.set(signature, hit.id);
+		for (const exp of expectations) {
+			const wanted = exp.files && exp.files.length ? [...exp.files].sort().join('\n') : undefined;
+			const hit = recent.find(
+				(m) =>
+					m.createdAt >= after &&
+					(m.footers.some((f) => f.includes(exp.signature)) ||
+						(exp.contents?.some((c) => c !== '' && m.content === c) ?? false) ||
+						(wanted !== undefined && Array.from(m.files ?? []).sort().join('\n') === wanted))
+			);
+			if (hit) out.set(exp.signature, hit.id);
 		}
 		return out;
 	}
@@ -1954,6 +2012,18 @@ export class Bridge {
 				return;
 			}
 			if (!map.discord_message_id) throw new RetryableError('sem mensagem do Discord mapeada');
+			if (map.webhook_copy) {
+				// cópia de webhook: o texto mora no `content`; o edit reescreve o content e o
+				// Discord já marca a mensagem como editada. Previews e anexos ficam intactos.
+				const content = this.withReactionSummary(
+					job.text,
+					this.reactionSummaryForMap(map, 'discord'),
+					DISCORD_LIMITS.contentMax
+				);
+				await this.discord.edit(job.targetChannelId, map.discord_message_id, { content });
+				this.store.updateMapSnapshot(map.id, { rendered: job.text, edit_revision: job.revision ?? null });
+				return;
+			}
 			const embed = this.discordCopyEmbed(map, job);
 			const embeds = fitEmbedBudget([embed, ...this.mapPreviews<DiscordEmbedPayload>(map)], DISCORD_LIMITS.embedTotalChars);
 			await this.discord.edit(job.targetChannelId, map.discord_message_id, {
@@ -2012,7 +2082,8 @@ export class Bridge {
 			);
 		}
 		const embeds = fitEmbedBudget([...(card ? [card] : []), ...previews], DISCORD_LIMITS.embedTotalChars);
-		if (!embeds.length) return;
+		// cópia de webhook não tem cartão: sem previews o edit vazio é o que os remove
+		if (!embeds.length && !map.webhook_copy) return;
 		await this.discord.edit(job.targetChannelId, map.discord_message_id, {
 			embeds: this.discordApiEmbeds(embeds),
 			files: this.filesForEmbedRefs(embeds)
@@ -2119,7 +2190,7 @@ export class Bridge {
 	private async refreshFooter(job: EditJob): Promise<void> {
 		const maps =
 			job.side === 'papo' ? this.store.findMapByPapo(job.sourceMessageId) : this.store.findMapByDiscord(job.sourceMessageId);
-		const targets = maps.filter((m) => m.bridge_embed && !m.deleted);
+		const targets = maps.filter((m) => (m.bridge_embed || m.webhook_copy) && !m.deleted);
 		if (!targets.length) {
 			// mensagem ponte antiga (sem snapshot) ou sem embed: nada a atualizar
 			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'embed sem snapshot: resumo de reações ignorado');
@@ -2131,6 +2202,16 @@ export class Bridge {
 		for (const map of targets) {
 			if (map.direction === 'papo_to_discord') {
 				if (!map.discord_message_id) continue;
+				if (map.webhook_copy) {
+					// cópia de webhook: o resumo de reações é anexado ao `content` (não há cartão)
+					const content = this.withReactionSummary(
+						map.rendered ?? '',
+						this.reactionSummaryForMap(map, 'discord'),
+						DISCORD_LIMITS.contentMax
+					);
+					await this.discord.edit(link.discord_channel_id, map.discord_message_id, { content });
+					continue;
+				}
 				const embed = JSON.parse(map.bridge_embed!) as DiscordEmbedPayload;
 				embed.description = this.withReactionSummary(
 					map.rendered ?? '',

@@ -56,6 +56,8 @@ export interface MessageMapRow {
 	rendered: string | null;
 	bridge_embed: string | null;
 	footer_base: string | null;
+	/** Cópia enviada pelo webhook do usuário: texto no `content`, sem cartão. */
+	webhook_copy: number;
 	/** JSON dos embeds extra de preview aplicados à cópia (atrás do cartão). */
 	link_embeds: string | null;
 	edit_revision: string | null;
@@ -338,11 +340,12 @@ export class Store {
 		bridge_embed?: unknown;
 		footer_base?: string | null;
 		link_embeds?: unknown;
+		webhook_copy?: boolean;
 	}): void {
 		this.db
 			.prepare(
-				`INSERT INTO message_map (link_id, direction, papo_message_id, discord_message_id, chunk_index, chunk_total, content_sha, rendered, bridge_embed, footer_base, link_embeds)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`INSERT INTO message_map (link_id, direction, papo_message_id, discord_message_id, chunk_index, chunk_total, content_sha, rendered, bridge_embed, footer_base, link_embeds, webhook_copy)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT DO NOTHING`
 			)
 			.run(
@@ -356,7 +359,8 @@ export class Store {
 				m.rendered ?? null,
 				m.bridge_embed === undefined ? null : JSON.stringify(m.bridge_embed),
 				m.footer_base ?? null,
-				m.link_embeds === undefined || m.link_embeds === null ? null : JSON.stringify(m.link_embeds)
+				m.link_embeds === undefined || m.link_embeds === null ? null : JSON.stringify(m.link_embeds),
+				m.webhook_copy ? 1 : 0
 			);
 	}
 

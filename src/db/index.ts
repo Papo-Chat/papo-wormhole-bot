@@ -31,6 +31,7 @@ const COLUMN_ADDITIONS: [string, string][] = [
 	['message_map', 'link_embeds TEXT'],
 	['message_map', 'edit_revision TEXT'],
 	['message_map', 'embed_revision TEXT'],
+	['message_map', 'webhook_copy INTEGER NOT NULL DEFAULT 0'],
 	['self_reactions', 'pending_echoes INTEGER NOT NULL DEFAULT 1'],
 	['outbox', 'revision TEXT'],
 	['outbox', 'remote_attempts INTEGER NOT NULL DEFAULT 0']

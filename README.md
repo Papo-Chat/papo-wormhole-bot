@@ -109,12 +109,14 @@ Papo REST/WS ──► Bridge (tradução, chunking, embeds) ──► SQLite ou
 - **Webhook por usuário**: no Discord, cada usuário Papo tem um webhook próprio por canal, com
   nick + avatar fixos no webhook (nome `nickname (@username)`, ou só o username quando o apelido
   é o próprio nome). O Discord agrupa mensagens consecutivas quando autor e username batem — num
-  webhook compartilhado as cópias de usuários diferentes nunca agrupariam. O webhook é criado sob
-  demanda e reaproveitado entre runs pela tabela `bridge_webhooks` (registro de posse, que também
-  identifica o eco sem chute por nome). Sem webhook (limite de webhooks do canal, bot sem
-  *Manage Webhooks*) o envio continua pelo cartão do bot. Webhook não responde mensagens: a
-  thread de reply se perde nesse caminho. Edição/apagamento da cópia usam o token do webhook
-  quando a mensagem é de webhook.
+  webhook compartilhado as cópias de usuários diferentes nunca agrupariam. No modo webhook o
+  bridge **não gera cartão**: `content` = conteúdo do Papo (com a linha de reações anexada quando
+  existem) e os únicos embeds são os previews que vieram do Papo; a data é o timestamp nativo do
+  Discord. O webhook é criado sob demanda e reaproveitado entre runs pela tabela
+  `bridge_webhooks` (registro de posse, que também identifica o eco sem chute por nome). Sem
+  webhook (limite de webhooks do canal, bot sem *Manage Webhooks*) o envio continua pelo cartão
+  do bot. Webhook não responde mensagens: a thread de reply se perde nesse caminho.
+  Edição/apagamento da cópia usam o token do webhook quando a mensagem é de webhook.
 
 ## Mapeamento de identidade
 

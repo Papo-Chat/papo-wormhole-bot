@@ -348,6 +348,7 @@ export class DiscordBridge {
 		channelId: string,
 		userId: string,
 		options: {
+			content?: string;
 			embeds?: APIEmbed[];
 			files?: { name: string; buffer: Buffer }[];
 		}
@@ -357,6 +358,7 @@ export class DiscordBridge {
 		if (!webhook) return null;
 		try {
 			return await webhook.send({
+				...(options.content ? { content: options.content } : {}),
 				...(options.embeds?.length ? { embeds: options.embeds } : {}),
 				...(options.files?.length ? { files: options.files.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })) } : {}),
 				allowedMentions: { parse: [] }
@@ -392,7 +394,7 @@ export class DiscordBridge {
 		channelId: string,
 		authorId: string,
 		limit = 50
-	): Promise<{ id: string; createdAt: number; footers: string[] }[]> {
+	): Promise<{ id: string; createdAt: number; footers: string[]; content: string; files: string[] }[]> {
 		const channel = await this.textChannel(channelId);
 		if (!channel) return [];
 		const messages = await channel.messages.fetch({ limit: Math.min(100, Math.max(1, limit)) }).catch(() => null);
@@ -402,7 +404,15 @@ export class DiscordBridge {
 		const webhookIds = new Set(this.opts.store?.listBridgeWebhookIds(channelId) ?? []);
 		return messages
 			.filter((m) => m.author.id === authorId || (m.webhookId !== null && webhookIds.has(m.webhookId)))
-			.map((m) => ({ id: m.id, createdAt: m.createdTimestamp, footers: m.embeds.map((e) => e.footer?.text ?? '') }));
+			.map((m) => ({
+				id: m.id,
+				createdAt: m.createdTimestamp,
+				footers: m.embeds.map((e) => e.footer?.text ?? ''),
+				// cópia de webhook não tem cartão: o reconhecimento é pelo `content` e pelos
+				// nomes de anexo
+				content: m.content,
+				files: m.attachments.map((a) => a.name ?? '')
+			}));
 	}
 
 	async edit(
