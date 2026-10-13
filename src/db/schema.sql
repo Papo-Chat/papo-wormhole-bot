@@ -158,6 +158,8 @@ CREATE TABLE IF NOT EXISTS emoji_map (
   discord_emoji_id TEXT,
   discord_emoji_name TEXT,
   discord_animated INTEGER NOT NULL DEFAULT 0,
+  -- 1 quando o id é de um emoji da aplicação (não do guild): vale em qualquer canal
+  discord_application INTEGER NOT NULL DEFAULT 0,
   image_sha        TEXT,
   created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );

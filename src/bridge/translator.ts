@@ -59,6 +59,16 @@ const UNKNOWN_LABEL = 'usuário';
 export const discordUserMentionIds = (content: string): string[] =>
 	[...content.matchAll(DISCORD_USER_RE)].flatMap((m) => (m[1] ? [m[1]] : []));
 
+/**
+ * Nomes de emoji custom no dialeto do Papo (`:nome:`), na ordem em que aparecem e sem
+ * repetição. É o que o bridge pré-resolve antes de traduzir (emoji do guild ou da aplicação).
+ */
+export const papoEmojiNames = (content: string): string[] => {
+	const seen = new Set<string>();
+	for (const m of content.matchAll(PAPO_SHORTCODE_RE)) if (m[1]) seen.add(m[1]);
+	return [...seen];
+};
+
 /** ids de menção no formato canônico do Papo. */
 export const papoMentionIds = (content: string): string[] =>
 	[...content.matchAll(PAPO_MENTION_RE)].flatMap((m) => (m[1] ? [m[1]] : []));

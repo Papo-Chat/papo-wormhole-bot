@@ -42,6 +42,8 @@ export interface EmojiMapEntry {
 	discord_emoji_id: string | null;
 	discord_emoji_name: string | null;
 	discord_animated: number;
+	/** 1 quando `discord_emoji_id` é emoji da aplicação, não do guild. */
+	discord_application: number;
 	image_sha: string | null;
 }
 
@@ -666,18 +668,21 @@ export class Store {
 		discord_emoji_id?: string | null;
 		discord_emoji_name?: string | null;
 		discord_animated?: boolean;
+		/** true quando `discord_emoji_id` é um emoji da aplicação, não do guild. */
+		discord_application?: boolean;
 		image_sha?: string | null;
 	}): void {
 		const name = e.name.toLowerCase();
 		this.db
 			.prepare(
-				`INSERT INTO emoji_map (name, papo_emoji_id, discord_emoji_id, discord_emoji_name, discord_animated, image_sha)
-				 VALUES (?, ?, ?, ?, ?, ?)
+				`INSERT INTO emoji_map (name, papo_emoji_id, discord_emoji_id, discord_emoji_name, discord_animated, discord_application, image_sha)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT(name) DO UPDATE SET
 				   papo_emoji_id = COALESCE(excluded.papo_emoji_id, emoji_map.papo_emoji_id),
 				   discord_emoji_id = COALESCE(excluded.discord_emoji_id, emoji_map.discord_emoji_id),
 				   discord_emoji_name = COALESCE(excluded.discord_emoji_name, emoji_map.discord_emoji_name),
 				   discord_animated = COALESCE(excluded.discord_animated, emoji_map.discord_animated),
+				   discord_application = COALESCE(excluded.discord_application, emoji_map.discord_application),
 				   image_sha = COALESCE(excluded.image_sha, emoji_map.image_sha)`
 			)
 			.run(
@@ -686,6 +691,7 @@ export class Store {
 				e.discord_emoji_id ?? null,
 				e.discord_emoji_name ?? null,
 				bool(e.discord_animated),
+				bool(e.discord_application),
 				e.image_sha ?? null
 			);
 	}

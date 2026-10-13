@@ -178,11 +178,17 @@ Pipeline Papo → Discord:
 1. Resolver `emoji_id` → `name` (+ imagem) via cache/`GET /emojis`.
 2. Procurar emoji de mesmo nome no guild (`client.guilds.cache.emojis`).
 3. Se existir → `<:name:id>` (ou `<a:name:id>` se animado).
-4. Se não existir → **usar markdown de imagem na description do embed**:
-   `![name](https://cdn.discordapp.com/emojis/{discord_emoji_id}.png)` a partir de
-   `GET /emojis/{emoji_id}` do Discord (emoji externo). Em embed isso renderiza para todos, sem
-   exigir Nitro nem `Use External Emojis`.
-5. Se também falhar → `:name:`.
+4. Se não existir no guild → procurar **emoji da aplicação** (`client.application.emojis`,
+   `ApplicationEmojiManager` do discord.js), carregado na conexão por
+   `GET /applications/{id}/emojis`. Achou → `<:name:id>`.
+5. Se tampoco existir → **criar um emoji da aplicação** com a imagem do emoji no Papo
+   (`POST /applications/{id}/emojis`): 2000 por app, imagem ≤ 256 KiB, não ocupa slot do
+   guild e não exige permissão nenhuma no servidor. Renderiza no cartão do bot e na cópia
+   enviada pelo webhook do bridge (o token completo `<:name:id>` é obrigatório — `:name:`
+   sozinho não resolve), e o Discord aceita reação do bot com emoji que o próprio app criou.
+6. Se a criação falhar (limite do app, imagem rejeitada, nome de 1 caractere que o Discord
+   não aceita) → `:name:`. A falha entra em cooldown: a fila não insiste na rota de criação,
+   que o Discord limita duramente.
 
 Reações: `react_update` (Papo) ↔ `messageReactionAdd/Remove` (Discord), com o mesmo `emoji_map`.
 O Papo tem 20 tipos de reação por mensagem (o Discord não tem limite duro) → o resumo mostra no
@@ -204,8 +210,10 @@ máximo 8 emojis.
 - Contagem vem **absoluta** nos dois lados (`react_update.count`; `MessageReaction.count` do Discord) e
   fica em `reaction_counts (link_id, source, source_message_id, emoji)`. `count = 0` remove o emoji do resumo.
   A forma canônica do banco é unicode literal ou `:nome:`; o dialeto do destino é aplicado na renderização.
-- Emoji custom sem equivalente no destino: **sem reação nativa** (no Discord, `react(":nome:")` é 400);
-  o registro vira só o resumo, exibido como `:nome: 2` (texto cru quando o guild não tem o emoji).
+- Emoji custom do Papo sem homônimo no guild: o bridge usa o **emoji da aplicação** com o mesmo
+  nome, ou cria um (`ApplicationEmojiManager`) a partir da imagem do emoji no Papo. Só cai para
+  `:nome:` cru (sem reação nativa — no Discord, `react(":nome:")` é 400) quando não há imagem
+  para subir ou o Discord recusa a criação.
 - Emoji do guild que o Discord recusa (10014 `Unknown Emoji` — apagado por moderação ou marcado
   `available: false`, flag que o discord.js não expõe no cache do gateway): a lista de indisponíveis é
   lida de `GET /guilds/{id}/emojis` na conexão e re-carregada quando um 10014 aparece; sem equivalente
@@ -749,7 +757,7 @@ envio com anexo responde **403** (não 413), e sem `pin_message` o pino responde
 | Autor deletado/banido | `author.name = "usuário removido"`, sem crash |
 | Autor banido no Papo | sessões revogadas → bridge continua só se o conteúdo já estiver em fila |
 | Autor sem `/link-user` | modo espelho (nome/avatar no embed) |
-| Reação com emoji que não existe no destino | Discord→Papo: importa via `POST /emojis` (exige `manage_server`); Papo→Discord: sem homônimo no guild, só o resumo `:nome: N` no `description` |
+| Reação com emoji que não existe no destino | Discord→Papo: importa via `POST /emojis` (exige `manage_server`); Papo→Discord: sem homônimo no guild, usa/cria emoji da aplicação (`ApplicationEmojiManager`); sem imagem ou com a criação recusada, só o resumo `:nome: N` no `description` |
 | Reação removida | remove nos dois lados; `count = 0` no Papo remove a reação do bot no Discord e some do resumo |
 | Reação/pino chega antes da mensagem ser bridgeada | guardado em `deferred_events` e enfileirado quando o mapeamento aparece (§10.2) |
 | Guild sem emojis no cache (reconexão, guild indisponível) | o job de reação volta para a fila com backoff; a contagem do resumo é registrada na hora |

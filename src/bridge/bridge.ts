@@ -33,6 +33,7 @@ import {
 	discordToPapoContent,
 	discordUserMentionIds,
 	formatDate,
+	papoEmojiNames,
 	papoMentionIds,
 	papoToDiscordContent,
 	type TranslateResolvers
@@ -54,7 +55,7 @@ import {
 import { prepareAttachments, sanitizeName, type SourceAttachment } from './attachments.js';
 import { mergeReactionCounts, reactionSummaryText, type ReactionDisplay } from './reactions.js';
 import { EMBED_CHUNK_CHARS, PAPO_LIMITS, PAPO_EMBED_CHUNK_CHARS, DISCORD_LIMITS, PAPO_VIDEO_MIMES, clampText } from './limits.js';
-import { EmojiBridge } from './emoji.js';
+import { EmojiBridge, type ApplicationEmojiResolver, type GuildEmojiResolver } from './emoji.js';
 import type { MediaStore } from './media.js';
 import { PapoIdentity } from './identity.js';
 import { copySignatures, signedFooter } from './signature.js';
@@ -343,9 +344,40 @@ export class Bridge {
 			discordChannelLabel: (id) => this.discord.channelName(id),
 			discordRoleLabel: (id) => this.discord.roleName(id),
 			discordEmoji: (name) => ({
-				token: this.emojis.tokenForDiscord(name, { findByName: (n) => this.discord.findGuildEmoji(n) })
+				token: this.emojis.tokenForDiscord(name, this.guildEmojis, this.appEmojis)
 			})
 		};
+	}
+
+	/** Emoji do guild: o primeiro lugar procurado (qualquer usuário do servidor pode usá-lo). */
+	private get guildEmojis(): GuildEmojiResolver {
+		return { findByName: (name) => this.discord.findGuildEmoji?.(name) };
+	}
+
+	/**
+	 * Emoji da aplicação (`ApplicationEmojiManager`): fallback quando o guild não tem o nome.
+	 * Renderiza em qualquer canal e não ocupa slot do servidor, mas só o app que o criou pode
+	 * usá-lo — e toda cópia que o bridge escreve no Discord é do app (cartão ou webhook).
+	 */
+	private get appEmojis(): ApplicationEmojiResolver {
+		return {
+			findByName: (name) => this.discord.findApplicationEmoji?.(name),
+			count: () => this.discord.applicationEmojiCount?.() ?? 0,
+			load: () => this.discord.loadApplicationEmojis?.() ?? Promise.resolve(),
+			create: async (name, image) => await this.discord.createApplicationEmoji?.(name, image)
+		};
+	}
+
+	/**
+	 * Pré-resolve os emojis custom do texto que vai para o Discord: garante o equivalente
+	 * (emoji do guild, emoji da aplicação já existente, ou emoji da aplicação criado a partir
+	 * da imagem do emoji no Papo) antes de o tradutor rodar — assim a primeira mensagem já
+	 * sai renderizada. Falha de criação não derruba a ponte: o texto segue com `:nome:`.
+	 */
+	private async warmDiscordEmojis(...texts: (string | null | undefined)[]): Promise<void> {
+		const names = new Set<string>();
+		for (const text of texts) for (const name of papoEmojiNames(text ?? '')) names.add(name);
+		for (const name of names) await this.emojis.ensureDiscordToken(name, this.guildEmojis, this.appEmojis);
 	}
 
 	private sourceRefs(msg: PapoMessage | PapoWsMessageEvent): SourceRef[] {
@@ -391,6 +423,7 @@ export class Bridge {
 		await this.warmPapoMentions(msg.content ?? '');
 		if (this.propagatesMentions(link) && /@/.test(msg.content ?? '')) await this.discord.ensureMemberIndex?.();
 		const preview = await this.papoPreview(msg);
+		await this.warmDiscordEmojis(preview.text);
 		const translated = papoToDiscordContent(preview.text, this.resolvers(link));
 		const chunks = chunkText(translated, EMBED_CHUNK_CHARS);
 		const sources = link.bridge_attachments ? this.sourceRefs(msg) : [];
@@ -533,6 +566,7 @@ export class Bridge {
 		await this.warmPapoMentions(e.content ?? '');
 		if (this.propagatesMentions(link) && /@/.test(e.content ?? '')) await this.discord.ensureMemberIndex?.();
 		const preview = await this.papoPreview(e);
+		await this.warmDiscordEmojis(preview.text);
 		const chunks = chunkText(papoToDiscordContent(preview.text, this.resolvers(link)), EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
@@ -1484,14 +1518,19 @@ export class Bridge {
 		if (dest === 'papo') return emoji;
 		const name = /^:([A-Za-z0-9_]{1,32}):$/.exec(emoji)?.[1];
 		if (!name) return emoji;
-		return this.emojis.tokenForDiscord(name, { findByName: (n) => this.discord.findGuildEmoji(n) });
+		return this.emojis.tokenForDiscord(name, this.guildEmojis, this.appEmojis);
 	}
 
-	/** Resumo de reações no dialeto de emoji do destino: `👍 3 · <:papu:123> 2`. */
-	private reactionSummaryFor(
+	/**
+	 * Resumo de reações no dialeto de emoji do destino: `👍 3 · <:papu:123> 2`.
+	 * No Discord os nomes são pré-resolvidos (guild → emoji da aplicação → criação): sem o
+	 * equivalente o resumo sai com `:nome:` cru.
+	 */
+	private async reactionSummaryFor(
 		dest: 'papo' | 'discord',
 		rows: { emoji: string; count: number }[]
-	): string {
+	): Promise<string> {
+		if (dest === 'discord') await this.warmDiscordEmojis(...rows.map((r) => r.emoji));
 		return reactionSummaryText(rows, 8, (emoji) => this.emojiTokenFor(dest, emoji));
 	}
 
@@ -1499,7 +1538,7 @@ export class Bridge {
 	 * Resumo de reações de uma mensagem já bridgeada: mescla as contagens dos dois lados do
 	 * par (o eco da nossa própria reação conta 1 e nunca supera a contagem real).
 	 */
-	private reactionSummaryForMap(map: MessageMapRow, dest: 'papo' | 'discord'): string {
+	private async reactionSummaryForMap(map: MessageMapRow, dest: 'papo' | 'discord'): Promise<string> {
 		const sides: ReactionDisplay[][] = [];
 		if (map.papo_message_id) sides.push(this.store.listReactions(map.link_id, 'papo', map.papo_message_id));
 		if (map.discord_message_id) sides.push(this.store.listReactions(map.link_id, 'discord', map.discord_message_id));
@@ -1624,7 +1663,7 @@ export class Bridge {
 		// selo determinístico por grupo: é a assinatura que permite reconhecer a cópia já
 		// criada quando o resultado de um envio anterior é incerto
 		const signatures = copySignatures('papo', job.papoMessageId, job.chunkIndex, groups.length);
-		const summary = this.reactionSummaryFor('discord', this.store.listReactions(job.linkId, 'papo', job.papoMessageId));
+		const summary = await this.reactionSummaryFor('discord', this.store.listReactions(job.linkId, 'papo', job.papoMessageId));
 
 		// modo webhook: `content` = conteúdo do Papo (com a linha de reações anexada), embeds =
 		// só os previews que vieram do Papo. Sem cartão, sem rodapé, sem embed de continuação —
@@ -1886,7 +1925,7 @@ export class Bridge {
 			if (mainEmbed) {
 				mainEmbed.description = this.withReactionSummary(
 					text,
-					this.reactionSummaryFor('papo', this.store.listReactions(job.linkId, 'discord', job.discordMessageId)),
+					await this.reactionSummaryFor('papo', this.store.listReactions(job.linkId, 'discord', job.discordMessageId)),
 					PAPO_LIMITS.embedDescriptionMax
 				);
 				mainEmbed.footer = { text: footers[g]! };
@@ -2017,14 +2056,14 @@ export class Bridge {
 				// Discord já marca a mensagem como editada. Previews e anexos ficam intactos.
 				const content = this.withReactionSummary(
 					job.text,
-					this.reactionSummaryForMap(map, 'discord'),
+					await this.reactionSummaryForMap(map, 'discord'),
 					DISCORD_LIMITS.contentMax
 				);
 				await this.discord.edit(job.targetChannelId, map.discord_message_id, { content });
 				this.store.updateMapSnapshot(map.id, { rendered: job.text, edit_revision: job.revision ?? null });
 				return;
 			}
-			const embed = this.discordCopyEmbed(map, job);
+			const embed = await this.discordCopyEmbed(map, job);
 			const embeds = fitEmbedBudget([embed, ...this.mapPreviews<DiscordEmbedPayload>(map)], DISCORD_LIMITS.embedTotalChars);
 			await this.discord.edit(job.targetChannelId, map.discord_message_id, {
 				embeds: this.discordApiEmbeds(embeds),
@@ -2041,7 +2080,7 @@ export class Bridge {
 			this.log.debug({ papoMessageId: map.papo_message_id }, 'edição ignorada: mensagem do Papo não é do bot');
 			return;
 		}
-		const embed = this.papoCopyEmbed(map, job.text);
+		const embed = await this.papoCopyEmbed(map, job.text);
 		await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
 		this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed, edit_revision: job.revision ?? null });
 	}
@@ -2077,7 +2116,7 @@ export class Bridge {
 		if (card) {
 			card.description = this.withReactionSummary(
 				map.rendered ?? '',
-				this.reactionSummaryForMap(map, 'discord'),
+				await this.reactionSummaryForMap(map, 'discord'),
 				DISCORD_LIMITS.embedDescriptionMax
 			);
 		}
@@ -2110,7 +2149,7 @@ export class Bridge {
 		if (card) {
 			card.description = this.withReactionSummary(
 				map.rendered ?? '',
-				this.reactionSummaryForMap(map, 'papo'),
+				await this.reactionSummaryForMap(map, 'papo'),
 				PAPO_LIMITS.embedDescriptionMax
 			);
 		}
@@ -2147,13 +2186,13 @@ export class Bridge {
 	 * anexo de avatar solto na mensagem — o Discord desenha como imagem quem nenhum embed
 	 * referencia, e o card virava só o avatar do autor.
 	 */
-	private discordCopyEmbed(map: MessageMapRow, job: EditJob): DiscordEmbedPayload {
+	private async discordCopyEmbed(map: MessageMapRow, job: EditJob): Promise<DiscordEmbedPayload> {
 		const embed: DiscordEmbedPayload = map.bridge_embed
 			? (JSON.parse(map.bridge_embed) as DiscordEmbedPayload)
 			: { author: { name: 'Papo' } };
 		embed.description = this.withReactionSummary(
 			job.text,
-			this.reactionSummaryForMap(map, 'discord'),
+			await this.reactionSummaryForMap(map, 'discord'),
 			DISCORD_LIMITS.embedDescriptionMax
 		);
 		const base = map.footer_base ?? `Papo${chunkLabel(job.chunkIndex, job.chunkTotal)}`;
@@ -2165,13 +2204,13 @@ export class Bridge {
 	 * Embed da cópia Papo: snapshot salvo em `message_map` com o texto novo no
 	 * `description` (a mensagem bridgeada não usa `content` no Papo).
 	 */
-	private papoCopyEmbed(map: MessageMapRow, text: string): PapoEmbedInput {
+	private async papoCopyEmbed(map: MessageMapRow, text: string): Promise<PapoEmbedInput> {
 		const embed: PapoEmbedInput = map.bridge_embed
 			? (JSON.parse(map.bridge_embed) as PapoEmbedInput)
 			: { author: { name: 'Discord' } };
 		embed.description = this.withReactionSummary(
 			text,
-			this.reactionSummaryForMap(map, 'papo'),
+			await this.reactionSummaryForMap(map, 'papo'),
 			PAPO_LIMITS.embedDescriptionMax
 		);
 		const base = map.footer_base ?? 'Discord';
@@ -2206,7 +2245,7 @@ export class Bridge {
 					// cópia de webhook: o resumo de reações é anexado ao `content` (não há cartão)
 					const content = this.withReactionSummary(
 						map.rendered ?? '',
-						this.reactionSummaryForMap(map, 'discord'),
+						await this.reactionSummaryForMap(map, 'discord'),
 						DISCORD_LIMITS.contentMax
 					);
 					await this.discord.edit(link.discord_channel_id, map.discord_message_id, { content });
@@ -2215,7 +2254,7 @@ export class Bridge {
 				const embed = JSON.parse(map.bridge_embed!) as DiscordEmbedPayload;
 				embed.description = this.withReactionSummary(
 					map.rendered ?? '',
-					this.reactionSummaryForMap(map, 'discord'),
+					await this.reactionSummaryForMap(map, 'discord'),
 					DISCORD_LIMITS.embedDescriptionMax
 				);
 				embed.footer = { text: this.footerText(map, embed, DISCORD_LIMITS.embedFooterMax) };
@@ -2233,7 +2272,7 @@ export class Bridge {
 			const embed = JSON.parse(map.bridge_embed!) as PapoEmbedInput;
 			embed.description = this.withReactionSummary(
 				map.rendered ?? '',
-				this.reactionSummaryForMap(map, 'papo'),
+				await this.reactionSummaryForMap(map, 'papo'),
 				PAPO_LIMITS.embedDescriptionMax
 			);
 			embed.footer = { text: this.footerText(map, embed, PAPO_LIMITS.embedFooterMax) };
@@ -2312,11 +2351,13 @@ export class Bridge {
 		let native = job.unicode;
 		if (!native) {
 			if (!name) return;
-			const token = this.emojis.tokenForDiscord(name, { findByName: (n) => this.discord.findGuildEmoji(n) });
+			// guild → emoji da aplicação (existente ou criado): o Discord aceita reação do app
+			// com um emoji que o próprio app criou
+			const token = await this.emojis.ensureDiscordToken(name, this.guildEmojis, this.appEmojis);
 			if (token.startsWith('<')) native = token;
 			else if (!this.discord.guildsCached()) throw new RetryableError('guilds ainda sem emojis no cache');
 			else {
-				this.log.debug({ emoji: display, messageId: job.sourceMessageId }, 'reação sem equivalente no guild: só o resumo de reações');
+				this.log.debug({ emoji: display, messageId: job.sourceMessageId }, 'reação sem equivalente no Discord: só o resumo de reações');
 				return;
 			}
 		}
@@ -2349,9 +2390,7 @@ export class Bridge {
 			// `available: false`): re-carrega a lista de indisponíveis e tenta o equivalente.
 			this.trackMirrorReaction({ ...mirror, present: false });
 			await this.discord.loadUnavailableEmojis();
-			const retry = name
-				? this.emojis.tokenForDiscord(name, { findByName: (n) => this.discord.findGuildEmoji(n) })
-				: undefined;
+			const retry = name ? this.emojis.tokenForDiscord(name, this.guildEmojis, this.appEmojis) : undefined;
 			if (!retry?.startsWith('<') || retry === native) {
 				this.log.warn(
 					{ emoji: display, messageId: job.sourceMessageId },

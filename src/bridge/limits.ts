@@ -26,6 +26,16 @@ export const PAPO_LIMITS = {
 	pinsPerChannelMax: 100
 } as const;
 
+/** Limites de emoji do Discord (developers/resources/emoji). */
+export const DISCORD_EMOJI_LIMITS = {
+	/** O Discord aceita 2–32 caracteres `[A-Za-z0-9_]`; o Papo aceita 1. */
+	emojiNameMin: 2,
+	emojiNameMax: 32,
+	emojiMaxBytes: 256 * 1024,
+	/** Teto de emojis de propriedade da aplicação (não contam nos slots do guild). */
+	applicationEmojiMax: 2000
+} as const;
+
 export const DISCORD_LIMITS = {
 	contentMax: 2000,
 	embedsPerMessage: 10,

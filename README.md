@@ -11,7 +11,7 @@ sentidos, preservando autoria (nome + avatar + data) e ordem de conversa.
 | Texto (markdown) | embed com autor/avatar/data | `content` + embed de autoria |
 | Anexos | reenviados; compactados ou particionados se não cabem | idem |
 | Previews de link | embeds do Papo → embeds do Discord | embeds do Discord → embeds do Papo |
-| Emojis custom | `:nome:` ↔ `<:nome:id>` | idem |
+| Emojis custom | `:nome:` ↔ `<:nome:id>`; sem o nome no guild, usa ou cria um emoji da aplicação | idem |
 | Reações | reação nativa + contagem no `description` do embed | idem |
 | Edições / deleções | ✅ | ✅ |
 | Pins | ✅ | opcional |
@@ -48,7 +48,9 @@ npm run dev
 
 `View Channels`, `Send Messages`, `Manage Messages` (edição/deleção/reações/pins) e
 `Manage Channels` para os comandos de configuração. Se quiser usar emojis do guild no lado
-Discord, `Manage Emojis` ajuda, mas não é obrigatório.
+Discord, `Manage Emojis` ajuda, mas não é obrigatório: o fallback do bridge é o emoji da
+aplicação, criado pela API do próprio app (`POST /applications/{id}/emojis`) — não precisa de
+permissão nenhuma no servidor.
 
 ### Permissões no Papo
 
@@ -206,8 +208,12 @@ trabalho (commite ou `git stash` antes).
 - O resumo fica no `description` e não no rodapé porque footer de embed não renderiza emoji custom
   em nenhum dos lados: no Discord o `<:nome:id>` aparece cru, e no Papo o rodapé do card é texto
   puro. No `description` o emoji renderiza como imagem nos dois lados.
-- Emoji custom do Papo sem homônimo no guild do Discord não gera reação nativa (seria 400); aparece
-  apenas como `:nome: 2` no resumo. Emoji do guild marcado `available: false` no Discord
+- Emoji custom do Papo sem homônimo no guild do Discord: o bridge procura o **emoji da aplicação**
+  com o mesmo nome (`client.application.emojis`, carregado na conexão) e, se não houver, cria um a
+  partir da imagem do emoji no Papo — 2000 por app, não ocupam slot do servidor nem exigem
+  permissão. Renderiza no cartão do bot e na cópia do webhook, e o Discord aceita reação do bot com
+  emoji do próprio app. Sem imagem para subir ou com a criação recusada, o registro aparece apenas
+  como `:nome: 2` no resumo. Emoji do guild marcado `available: false` no Discord
   (69 no guild atual) também só aparece no resumo: o Discord recusa a reação com 10014.
 - Menção só vira menção real quando o canal-link tem `mentions` ligado (`/bridge-config …`).
   Propagada, ela renderiza como chip clicável no card dos dois lados, mas não notifica: embed não

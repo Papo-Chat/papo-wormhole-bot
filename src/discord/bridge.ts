@@ -142,6 +142,11 @@ export class DiscordBridge {
 			this.log.info({ tag: this.client.user?.tag }, 'Discord conectado');
 			const id = this.client.user?.id;
 			if (id) opts.handlers.onReady?.(id);
+			// `client.application` só existe depois do READY: é aqui que o índice de emojis da
+			// aplicação (fallback da conversão Papo → Discord) pode ser carregado
+			void this.loadApplicationEmojis().then((total) => {
+				if (total) this.log.debug({ total }, 'emojis da aplicação carregados');
+			});
 		});
 		this.client.on('error', (err) => this.log.error({ err }, 'erro do gateway'));
 		this.client.on('shardError', (err) => this.log.error({ err }, 'erro de shard'));
@@ -541,7 +546,10 @@ export class DiscordBridge {
 		return this.client.guilds.cache.size > 0;
 	}
 
-	/** Emoji do guild por nome (usado na conversão Papo → Discord), ignorando os indisponíveis. */
+	/**
+	 * Emoji do guild por nome (usado na conversão Papo → Discord), ignorando os indisponíveis.
+	 * Primeiro lugar procurado: emoji do guild é o que qualquer usuário do servidor pode usar.
+	 */
 	findGuildEmoji(name: string): { id: string; name: string; animated: boolean } | undefined {
 		for (const guild of this.client.guilds.cache.values()) {
 			const blocked = this.unavailableEmojis.get(guild.id);
@@ -549,6 +557,61 @@ export class DiscordBridge {
 			if (emoji) return { id: emoji.id, name: emoji.name ?? name, animated: Boolean(emoji.animated) };
 		}
 		return undefined;
+	}
+
+	/**
+	 * Emoji da aplicação por nome (`client.application.emojis`): pertence ao app, não ao guild.
+	 * Renderiza em qualquer canal e não ocupa slot do servidor, mas só o próprio app pode usá-lo
+	 * — as cópias que o bridge escreve são do app (cartão ou webhook do app).
+	 */
+	findApplicationEmoji(name: string): { id: string; name: string; animated: boolean } | undefined {
+		const emoji = this.client.application?.emojis.cache.find((e) => e.name === name);
+		if (!emoji) return undefined;
+		return { id: emoji.id, name: emoji.name ?? name, animated: Boolean(emoji.animated) };
+	}
+
+	/** Emojis da aplicação no cache (o teto de 2000 é por aplicação). */
+	applicationEmojiCount(): number {
+		return this.client.application?.emojis.cache.size ?? 0;
+	}
+
+	/**
+	 * Preenche o cache de emojis da aplicação (`GET /applications/{id}/emojis`). Roda na
+	 * conexão e é o índice que a conversão Papo → Discord consulta quando o guild não tem
+	 * o nome. Retorna quantos emojis foram carregados.
+	 */
+	async loadApplicationEmojis(): Promise<number> {
+		const application = this.client.application;
+		if (!application) return 0;
+		try {
+			const emojis = await application.emojis.fetch();
+			return emojis.size;
+		} catch (err) {
+			this.log.debug({ err }, 'lista de emojis da aplicação não carregada');
+			return 0;
+		}
+	}
+
+	/**
+	 * Cria um emoji da aplicação (`POST /applications/{id}/emojis`): 2000 por app, imagem
+	 * ≤ 256 KiB, sem ocupar slot do guild e sem exigir permissão no servidor.
+	 * `undefined` quando o Discord recusa (limite do app, imagem rejeitada, nome em uso) —
+	 * a conversão cai para `:nome:`.
+	 */
+	async createApplicationEmoji(
+		name: string,
+		image: Buffer
+	): Promise<{ id: string; name: string; animated: boolean } | undefined> {
+		const application = this.client.application;
+		if (!application) return undefined;
+		try {
+			const created = await application.emojis.create({ name, attachment: image });
+			this.log.info({ emoji: created.name, emojiId: created.id }, 'emoji da aplicação criado para a ponte');
+			return { id: created.id, name: created.name ?? name, animated: Boolean(created.animated) };
+		} catch (err) {
+			this.log.warn({ err, name }, 'falha ao criar emoji da aplicação');
+			return undefined;
+		}
 	}
 
 	/**
