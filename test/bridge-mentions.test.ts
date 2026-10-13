@@ -46,7 +46,16 @@ interface FakeMentions {
 	members?: Map<string, { user: { id: string; username: string; displayName?: string; avatar?: string }; displayName: string }>;
 }
 
-const fixture = (opts: { propagateMentions?: boolean; profilesFail?: boolean } = {}) => {
+const fixture = (
+	opts: {
+		propagateMentions?: boolean;
+		profilesFail?: boolean;
+		/** usuários que `GET /users` devolveria (resolução por nome, item 28) */
+		papoUsers?: { id: string; username: string; nickname?: string }[];
+		/** alias → snowflake do membro do guild (resolução por nome, item 28) */
+		members?: Record<string, string>;
+	} = {}
+) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
 	const outbox = new Outbox(db, { maxAttempts: 5, baseMs: 20, maxMs: 60 });
@@ -54,6 +63,7 @@ const fixture = (opts: { propagateMentions?: boolean; profilesFail?: boolean } =
 	const papoSent: { embeds?: { description?: string }[] }[] = [];
 	const api = {
 		listAllEmojis: async () => [],
+		listAllUsers: async () => opts.papoUsers ?? [],
 		summariesBatch: async (ids: string[]) => {
 			if (opts.profilesFail) throw new Error('papo fora do ar');
 			return ids.map((id) => ({ id, username: 'ana_s', nickname: 'Ana' }));
@@ -74,7 +84,16 @@ const fixture = (opts: { propagateMentions?: boolean; profilesFail?: boolean } =
 		send: async (channelId: string, options: DiscordSend) => {
 			sends.push(options);
 			return { id: 'd1' };
-		}
+		},
+		...(opts.members
+			? {
+					ensureMemberIndex: async () => {},
+					memberByName: (name: string) => {
+						const id = opts.members![name.trim().toLowerCase()];
+						return id ? { id } : undefined;
+					}
+				}
+			: {})
 	};
 	const bridge = new Bridge(cfg, store, outbox, api as never, {} as never, discord as never, {} as never);
 	const link = store.upsertChannelLink({ papo_channel_id: 'chan-1', discord_channel_id: '111' });
@@ -252,5 +271,89 @@ describe('mencionado sem link-user: rótulo, nunca snowflake', () => {
 		const description = descriptionOf(sends[0]?.embeds);
 		expect(description).toContain('olá @usuário');
 		expect(description).not.toContain(OTHER_PAPO_USER);
+	});
+});
+
+describe('resolução de @nome no outro lado (item 28)', () => {
+	it('@nome em texto puro no Discord vira menção do Papo quando o flag está ligado', async () => {
+		const { bridge, papoSent, settle } = fixture({
+			propagateMentions: true,
+			papoUsers: [{ id: OTHER_PAPO_USER, username: 'ana_s', nickname: 'Ana' }]
+		});
+
+		await bridge.onDiscordMessage(discordMessage('fale com @ana_s') as never);
+		await settle();
+
+		expect(descriptionOf(papoSent[0]?.embeds)).toBe(`fale com @mention(<@${OTHER_PAPO_USER}>)`);
+	});
+
+	it('ping do Discord sem link de conta resolve pelo nome no Papo', async () => {
+		const { bridge, papoSent, settle } = fixture({
+			propagateMentions: true,
+			papoUsers: [{ id: OTHER_PAPO_USER, username: 'ana_s', nickname: 'Ana' }]
+		});
+
+		await bridge.onDiscordMessage(
+			discordMessage('oi <@300>', {
+				users: new Map([['300', { id: '300', username: 'ana_s', displayName: 'Ana' }]])
+			}) as never
+		);
+		await settle();
+
+		expect(descriptionOf(papoSent[0]?.embeds)).toContain(`oi @mention(<@${OTHER_PAPO_USER}>)`);
+	});
+
+	it('@nome em texto puro no Papo vira ping do Discord quando o flag está ligado', async () => {
+		const { bridge, sends, settle } = fixture({
+			propagateMentions: true,
+			members: { maria: '400' }
+		});
+
+		bridge.onPapoEvent(papoMessage('chame @maria') as never);
+		await settle();
+
+		expect(descriptionOf(sends[0]?.embeds)).toBe('chame <@400>');
+	});
+
+	it('sem o flag do link o @nome em texto puro permanece texto', async () => {
+		const { bridge, papoSent, settle } = fixture({
+			papoUsers: [{ id: OTHER_PAPO_USER, username: 'ana_s', nickname: 'Ana' }]
+		});
+
+		await bridge.onDiscordMessage(discordMessage('fale com @ana_s') as never);
+		await settle();
+
+		const description = descriptionOf(papoSent[0]?.embeds);
+		expect(description).toContain('fale com @ana_s');
+		expect(description).not.toContain('@mention(');
+	});
+
+	it('nickname ambíguo no Papo não vira link', async () => {
+		const { bridge, papoSent, settle } = fixture({
+			propagateMentions: true,
+			papoUsers: [
+				{ id: OTHER_PAPO_USER, username: 'um', nickname: 'Ana' },
+				{ id: '22222222-3333-4444-8555-666666666666', username: 'dois', nickname: 'Ana' }
+			]
+		});
+
+		await bridge.onDiscordMessage(discordMessage('oi @Ana') as never);
+		await settle();
+
+		const description = descriptionOf(papoSent[0]?.embeds);
+		expect(description).toContain('oi @Ana');
+		expect(description).not.toContain('@mention(');
+	});
+
+	it('e-mail e URL com @ não viram menção', async () => {
+		const { bridge, papoSent, settle } = fixture({
+			propagateMentions: true,
+			papoUsers: [{ id: OTHER_PAPO_USER, username: 'ana_s', nickname: 'Ana' }]
+		});
+
+		await bridge.onDiscordMessage(discordMessage('email ana_s@x.com e https://x.com/@ana_s') as never);
+		await settle();
+
+		expect(descriptionOf(papoSent[0]?.embeds)).not.toContain('@mention(');
 	});
 });

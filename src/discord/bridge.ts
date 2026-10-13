@@ -3,6 +3,8 @@ import {
 	GatewayIntentBits,
 	Partials,
 	TextChannel,
+	Webhook,
+	AttachmentBuilder,
 	type APIEmbed,
 	type APIEmoji,
 	type Guild,
@@ -17,6 +19,19 @@ import {
 } from 'discord.js';
 import type { Logger } from 'pino';
 import { scoped } from '../logger.js';
+import type { Store } from '../db/store.js';
+
+/**
+ * Nome do webhook de um usuário Papo (item 27): `nickname (@username)`, ou só o
+ * username quando o apelido é o próprio nome. O sufixo com o username torna o nome
+ * único e reaproveitável entre runs — apelidos iguais entre usuários colidiriam.
+ */
+export function bridgeWebhookName(displayName: string, username: string): string {
+	const base = displayName.trim() || username;
+	if (base === username) return username;
+	// o sufixo `(@username)` precisa sobreviver ao limite de 80: o apelido cede espaço
+	return `${base.slice(0, 76 - username.length)} (@${username})`.slice(0, 80);
+}
 
 export interface DiscordHandlers {
 	onMessage?: (message: Message) => void;
@@ -71,6 +86,7 @@ export const buildSendPayload = (
  *
  * Intents necessários:
  * - `Guilds` — cache de guilds/emojis do guild.
+ * - `GuildMembers` — cache de membros para resolver `@nome` do Papo no guild (item 28).
  * - `GuildMessages` + `MessageContent` — mensagens e conteúdo (privilegiado).
  * - `GuildMessageReactions` — sem ele `messageReactionAdd/Remove` nunca disparam.
  * - `GuildPresences` — opcional, só para `/online`.
@@ -84,14 +100,35 @@ export class DiscordBridge {
 	 * não expõe a flag, então ela é lida da rota REST de emojis do guild.
 	 */
 	private unavailableEmojis = new Map<string, Set<string>>();
+	/**
+	 * Webhooks do bridge (item 27): um por usuário Papo por canal, com a identidade
+	 * (nome + avatar) fixa no webhook — o Discord agrupa mensagens consecutivas quando
+	 * autor e username batem, e para webhook o autor é o webhook. Cache dos objetos
+	 * `Webhook`; a posse persistente fica na tabela `bridge_webhooks`.
+	 */
+	private webhooks = new Map<string, Webhook>();
+	private webhookById = new Map<string, Webhook>();
+	/** Falha de criação por canal (limite de webhooks, sem Manage Webhooks): re-tenta após o TTL. */
+	private webhookFailedAt = new Map<string, number>();
+	private static readonly WEBHOOK_RETRY_MS = 10 * 60_000;
+	/** Índice de membros por nome (item 28), recarregado com TTL. */
+	private memberIndex?: { at: number; byUsername: Map<string, string>; byNickname: Map<string, string | null> };
+	private static readonly MEMBER_INDEX_TTL_MS = 10 * 60_000;
 
 	constructor(
-		private opts: { token: string; handlers: DiscordHandlers; logger?: Logger; presences?: boolean },
+		private opts: {
+			token: string;
+			handlers: DiscordHandlers;
+			logger?: Logger;
+			presences?: boolean;
+			store?: Store;
+		},
 	) {
 		this.log = opts.logger ?? scoped('discord');
 		this.client = new Client({
 			intents: [
 				GatewayIntentBits.Guilds,
+				GatewayIntentBits.GuildMembers,
 				GatewayIntentBits.GuildMessages,
 				GatewayIntentBits.GuildMessageReactions,
 				GatewayIntentBits.MessageContent,
@@ -179,6 +216,167 @@ export class DiscordBridge {
 		return channel.send(buildSendPayload(options));
 	}
 
+	/**
+	 * Webhook do canal para o usuário Papo (item 27). Criado na primeira necessidade,
+	 * reaproveitado entre runs pela linha em `bridge_webhooks` (ou pelo nome, para
+	 * webhooks anteriores à tabela). Nome e avatar ficam no webhook — não por mensagem
+	 * — porque o Discord agrupa mensagens consecutivas quando autor e username batem:
+	 * as cópias do mesmo usuário agrupam como um usuário comum.
+	 * `null` quando o canal não aceita envio ou a criação falha (limite de webhooks do
+	 * canal, sem Manage Webhooks) — o envio continua pelo cartão do bot.
+	 */
+	async userWebhook(
+		channelId: string,
+		identity: { userId: string; displayName: string; username: string; avatarSha?: string; avatarBuffer?: Buffer }
+	): Promise<Webhook | null> {
+		const key = `${channelId}:${identity.userId}`;
+		const name = bridgeWebhookName(identity.displayName, identity.username);
+		const cached = this.webhooks.get(key);
+		if (cached) {
+			await this.applyWebhookIdentity(cached, name, identity);
+			return cached;
+		}
+		const failedAt = this.webhookFailedAt.get(channelId);
+		if (failedAt && Date.now() - failedAt < DiscordBridge.WEBHOOK_RETRY_MS) return null;
+		const channel = await this.textChannel(channelId);
+		if (!channel) return null;
+		try {
+			const row = this.opts.store?.getBridgeWebhookByUser(channelId, identity.userId);
+			const hooks = await channel.fetchWebhooks();
+			let webhook = row ? hooks.find((w) => w.id === row.webhook_id) : undefined;
+			if (!webhook) webhook = hooks.find((w) => w.name === name);
+			if (!webhook) {
+				try {
+					webhook = await channel.createWebhook({
+						name,
+						...(identity.avatarBuffer ? { avatar: identity.avatarBuffer } : {}),
+						reason: 'papo bridge'
+					});
+				} catch (err) {
+					// limite de webhooks do canal ou sem Manage Webhooks: re-tenta após o TTL
+					this.webhookFailedAt.set(channelId, Date.now());
+					this.log.debug({ err, channelId }, 'webhook do usuário indisponível: envio pelo cartão do bot');
+					return null;
+				}
+			}
+			this.webhooks.set(key, webhook);
+			this.webhookById.set(webhook.id, webhook);
+			await this.applyWebhookIdentity(webhook, name, identity);
+			return webhook;
+		} catch (err) {
+			this.log.debug({ err, channelId }, 'falha ao resolver o webhook do usuário');
+			return null;
+		}
+	}
+
+	/**
+	 * Mantém nome/avatar do webhook sincronizados com a identidade Papo (apelido ou
+	 * avatar mudados editam o webhook) e registra a posse em `bridge_webhooks`.
+	 */
+	private async applyWebhookIdentity(
+		webhook: Webhook,
+		name: string,
+		identity: { userId: string; avatarSha?: string; avatarBuffer?: Buffer }
+	): Promise<void> {
+		const row = this.opts.store?.getBridgeWebhookById(webhook.id);
+		const avatarChanged = identity.avatarBuffer !== undefined && (row?.avatar_sha ?? undefined) !== identity.avatarSha;
+		let appliedSha = row?.avatar_sha ?? null;
+		if (webhook.name !== name || avatarChanged) {
+			try {
+				await webhook.edit({
+					name,
+					...(avatarChanged && identity.avatarBuffer ? { avatar: identity.avatarBuffer } : {})
+				});
+				// o sha novo só é registrado como aplicado se o upload do avatar funcionou
+				if (avatarChanged) appliedSha = identity.avatarSha ?? null;
+			} catch (err) {
+				this.log.debug({ err, webhookId: webhook.id }, 'falha ao atualizar a identidade do webhook');
+			}
+		}
+		this.opts.store?.upsertBridgeWebhook({
+			webhook_id: webhook.id,
+			channel_id: webhook.channelId,
+			papo_user_id: identity.userId,
+			name,
+			avatar_sha: appliedSha
+		});
+	}
+
+	/** Objeto `Webhook` (token) de um webhook nosso; busca no canal quando ainda não conhecido. */
+	private async webhookObject(channelId: string, webhookId: string): Promise<Webhook | null> {
+		const hit = this.webhookById.get(webhookId);
+		if (hit) return hit;
+		const channel = await this.textChannel(channelId);
+		if (!channel) return null;
+		const hooks = await channel.fetchWebhooks().catch(() => null);
+		const webhook = hooks?.find((w) => w.id === webhookId) ?? null;
+		if (webhook) this.webhookById.set(webhook.id, webhook);
+		return webhook;
+	}
+
+	/**
+	 * O webhook observado é do bridge? A linha em `bridge_webhooks` é o registro de
+	 * posse: sem chute por nome, webhook de terceiros nunca é tratado como eco.
+	 */
+	async isBridgeWebhook(channelId: string, webhookId: string): Promise<boolean> {
+		if (this.webhookById.has(webhookId)) return true;
+		const row = this.opts.store?.getBridgeWebhookById(webhookId);
+		if (!row || row.channel_id !== channelId) return false;
+		await this.webhookObject(channelId, webhookId);
+		return true;
+	}
+
+	/**
+	 * Mensagem criada pelo bridge: pelo bot ou pelo webhook do bridge. Mensagem de webhook
+	 * não tem autor válido (o autor é o webhook) — o identificador é o `webhook_id`.
+	 */
+	async isSelfMessage(message: Message | PartialMessage): Promise<boolean> {
+		if (this.isSelf(message.author?.id)) return true;
+		const webhookId = message.webhookId;
+		if (!webhookId) return false;
+		return this.isBridgeWebhook(message.channelId, webhookId);
+	}
+
+	/**
+	 * Envio pelo webhook do usuário: a identidade já está no webhook, então a mensagem
+	 * sai sem override de nick/avatar e agrupa como usuário comum. Cartão e previews vão
+	 * como embeds na mesma call. `null` quando não há webhook para o par (canal, usuário)
+	 * — o chamador cai para o envio normal. Webhook não responde a mensagens, então a
+	 * thread de reply/continuação se perde nesse caminho (limitação do Discord).
+	 */
+	async sendAsWebhook(
+		channelId: string,
+		userId: string,
+		options: {
+			embeds?: APIEmbed[];
+			files?: { name: string; buffer: Buffer }[];
+		}
+	): Promise<Message | null> {
+		const key = `${channelId}:${userId}`;
+		const webhook = this.webhooks.get(key);
+		if (!webhook) return null;
+		try {
+			return await webhook.send({
+				...(options.embeds?.length ? { embeds: options.embeds } : {}),
+				...(options.files?.length ? { files: options.files.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })) } : {}),
+				allowedMentions: { parse: [] }
+			});
+		} catch (err) {
+			// webhook morto (apagado por fora, sem permissão): nada foi entregue — descarta
+			// o cache e o chamador cai para o cartão do bot; a próxima mensagem recria.
+			// Falha incerta (5xx/timeout) é re-lançada: o job re-tenta e a reconciliação
+			// de envio incerto evita duplicar.
+			this.webhooks.delete(key);
+			this.webhookById.delete(webhook.id);
+			const status = (err as { status?: number })?.status;
+			if (status === 401 || status === 403 || status === 404) {
+				this.log.debug({ err, channelId, webhookId: webhook.id }, 'webhook do usuário indisponível no envio');
+				return null;
+			}
+			throw err;
+		}
+	}
+
 	async fetchMessage(channelId: string, messageId: string): Promise<Message | undefined> {
 		const channel = await this.textChannel(channelId);
 		if (!channel) return undefined;
@@ -199,8 +397,11 @@ export class DiscordBridge {
 		if (!channel) return [];
 		const messages = await channel.messages.fetch({ limit: Math.min(100, Math.max(1, limit)) }).catch(() => null);
 		if (!messages) return [];
+		// cópias enviadas pelo webhook do bridge têm author = webhook (não o bot): a
+		// reconciliação também precisa enxergá-las
+		const webhookIds = new Set(this.opts.store?.listBridgeWebhookIds(channelId) ?? []);
 		return messages
-			.filter((m) => m.author.id === authorId)
+			.filter((m) => m.author.id === authorId || (m.webhookId !== null && webhookIds.has(m.webhookId)))
 			.map((m) => ({ id: m.id, createdAt: m.createdTimestamp, footers: m.embeds.map((e) => e.footer?.text ?? '') }));
 	}
 
@@ -217,18 +418,39 @@ export class DiscordBridge {
 		// mensagem tinha.
 		const resending = new Set(files.map((f) => f.name));
 		const keep = message.attachments.filter((a) => !resending.has(a.name)).map((a) => ({ id: a.id }));
-		await message.edit({
+		const payload = {
 			...(options.content !== undefined ? { content: options.content } : {}),
 			...(options.embeds ? { embeds: options.embeds } : {}),
 			// embed que referencia `attachment://` precisa do arquivo reenviado no edit
 			...(files.length ? { files: files.map((f) => ({ attachment: f.buffer, name: f.name })) } : {}),
 			...(keep.length ? { attachments: keep } : {})
-		});
+		};
+		// mensagem de webhook não pode ser editada pela API de mensagem (50005): o edit
+		// precisa do token do webhook. Só cópias mapeadas chegam aqui, e o Discord só
+		// aceita o edit quando o token é do webhook que enviou a mensagem.
+		const webhookId = message.webhookId;
+		if (webhookId) {
+			const webhook = await this.webhookObject(channelId, webhookId);
+			if (webhook) {
+				await webhook.editMessage(messageId, payload);
+				return;
+			}
+		}
+		await message.edit(payload);
 	}
 
 	async delete(channelId: string, messageId: string): Promise<void> {
 		const message = await this.fetchMessage(channelId, messageId);
 		if (!message) return;
+		// mensagem de webhook não pode ser apagada pela API de mensagem (50005)
+		const webhookId = message.webhookId;
+		if (webhookId) {
+			const webhook = await this.webhookObject(channelId, webhookId);
+			if (webhook) {
+				await webhook.deleteMessage(messageId);
+				return;
+			}
+		}
 		await message.delete();
 	}
 
@@ -260,6 +482,48 @@ export class DiscordBridge {
 	async username(userId: string): Promise<string | undefined> {
 		const user = await this.client.users.fetch(userId).catch(() => undefined);
 		return user?.username;
+	}
+
+	/**
+	 * Índice de membros do guild por username/nickname (resolução de `@nome`, item 28).
+	 * Casamento exato, sem caixa. Nickname dividido por mais de um membro é ambíguo
+	 * (`null`) e não resolve — link errado é pior que link nenhum. Username é único.
+	 */
+	async ensureMemberIndex(): Promise<void> {
+		if (this.memberIndex && Date.now() - this.memberIndex.at < DiscordBridge.MEMBER_INDEX_TTL_MS) return;
+		const guild = this.firstGuild;
+		if (!guild) return;
+		try {
+			const members = await guild.members.fetch();
+			const byUsername = new Map<string, string>();
+			const byNickname = new Map<string, string | null>();
+			for (const member of members.values()) {
+				const username = member.user.username.toLowerCase();
+				if (username) byUsername.set(username, member.id);
+				const nickname = member.nickname?.toLowerCase();
+				if (!nickname) continue;
+				if (byNickname.get(nickname) === null) continue; // já ambíguo
+				if (byNickname.has(nickname)) {
+					byNickname.set(nickname, null);
+					continue;
+				}
+				byNickname.set(nickname, member.id);
+			}
+			this.memberIndex = { at: Date.now(), byUsername, byNickname };
+		} catch (err) {
+			this.log.debug({ err }, 'falha ao carregar o índice de membros do guild');
+		}
+	}
+
+	/** Membro por username/nickname; username tem prioridade. `undefined` sem match único. */
+	memberByName(name: string): { id: string } | undefined {
+		const wanted = name.trim().toLowerCase();
+		if (!wanted) return undefined;
+		const byUsername = this.memberIndex?.byUsername.get(wanted);
+		if (byUsername) return { id: byUsername };
+		const byNickname = this.memberIndex?.byNickname.get(wanted);
+		if (byNickname) return { id: byNickname };
+		return undefined;
 	}
 
 	/** `false` quando o cache de guilds ainda não foi povoado (reconexão, guild indisponível). */

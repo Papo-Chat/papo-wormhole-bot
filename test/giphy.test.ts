@@ -61,7 +61,7 @@ describe('GiphyResolver', () => {
 			id: 'abc',
 			url: 'https://media.giphy.com/media/abc/giphy.gif',
 			pageUrl: 'https://giphy.com/gifs/abc',
-			title: 'Gato dançando'
+			title: 'GIF'
 		});
 	});
 

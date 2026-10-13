@@ -12,6 +12,43 @@
 
 const FENCE = '```';
 
+/**
+ * O Papo aceita cercas grudadas no conteúdo (ex.: ```{"ok":true}``` ou
+ * ```\nfoo```); o chunker só reconhece cercas em linha própria. Normaliza
+ * para a forma canônica antes de escanear, espelhando a normalização do
+ * frontend (normalizeFencedCodeBlocks em markdown.ts) — sem isso, um
+ * fechamento grudado é lido como fence ainda aberta e o chunk ganha um
+ * fechamento duplicado no fim.
+ */
+function normalizeAttachedFences(text: string): string {
+	return text.replace(/```([\s\S]*?)```/g, (match, rawInner: string, offset: number, source: string) => {
+		const inner = rawInner.replace(/\r\n?/g, '\n');
+		let info = '';
+		let body = inner;
+
+		if (body.startsWith('\n')) {
+			body = body.slice(1);
+		} else {
+			const firstBreak = body.indexOf('\n');
+			if (firstBreak >= 0) {
+				const possibleInfo = body.slice(0, firstBreak).trim();
+				if (/^[A-Za-z0-9_.+-]+$/.test(possibleInfo)) {
+					info = possibleInfo;
+					body = body.slice(firstBreak + 1);
+				}
+			}
+		}
+
+		if (body.endsWith('\n')) body = body.slice(0, -1);
+
+		const before = offset > 0 && source[offset - 1] !== '\n' ? '\n' : '';
+		const afterIndex = offset + match.length;
+		const after = afterIndex < source.length && source[afterIndex] !== '\n' ? '\n' : '';
+
+		return `${before}\`\`\`${info}\n${body}\n\`\`\`${after}`;
+	});
+}
+
 interface LineInfo {
 	text: string;
 	/** Cerca aberta após esta linha (undefined = fora de fence). */
@@ -50,15 +87,75 @@ const fenceLimit = (max: number, info: string | undefined): number =>
 /** Corte duro de uma linha gigante, respeitando code points. */
 function hardCut(line: LineInfo, limit: number): LineInfo[] {
 	const chars = Array.from(line.text);
+	// Fora de fence: o corte não pode cair dentro de código inline (crases
+	// simples), senão cada chunk fica com um backtick órfão (o "`" parece
+	// duplicar). Dentro de fence o conteúdo é código: corte livre.
+	const ranges = line.openAfter === undefined ? inlineCodeRanges(chars) : [];
 	const pieces: LineInfo[] = [];
 	for (let i = 0; i < chars.length; ) {
 		const remaining = chars.length - i;
-		const take = remaining <= limit ? limit : limit - 1; // espaço para a elipse
+		let take = remaining <= limit ? limit : limit - 1; // espaço para a elipse
+		const cut = i + take;
+		const inside = ranges.find(([s, e]) => s < cut && cut < e);
+		if (inside) {
+			const [start, end] = inside;
+			if (start - i >= 8) {
+				take = start - i; // corta antes do código inline
+			} else if (end - i <= limit) {
+				take = end - i; // código curto: leva o span inteiro junto
+			}
+			// span maior que o limite: corte duro inevitável
+		}
 		const slice = chars.slice(i, i + take);
 		i += take;
 		pieces.push({ text: slice.join('') + (i >= chars.length ? '' : '…'), openAfter: line.openAfter });
 	}
 	return pieces;
+}
+
+/**
+ * Intervalos [start, end) de código inline (runs de 1–2 backticks pareadas)
+ * sobre um array de code points. Runs de 3+ são cercas de fence (tratadas
+ * pelo scanLines); run sem par marca o resto da linha como código.
+ */
+function inlineCodeRanges(chars: string[]): Array<[number, number]> {
+	const ranges: Array<[number, number]> = [];
+	let i = 0;
+	while (i < chars.length) {
+		if (chars[i] !== '`') {
+			i++;
+			continue;
+		}
+		let j = i;
+		while (j < chars.length && chars[j] === '`') j++;
+		const len = j - i;
+		if (len >= 3) {
+			i = j;
+			continue;
+		}
+		let k = j;
+		let closed = false;
+		while (k < chars.length) {
+			if (chars[k] === '`') {
+				let e = k;
+				while (e < chars.length && chars[e] === '`') e++;
+				if (e - k === len) {
+					ranges.push([i, e]);
+					i = e;
+					closed = true;
+					break;
+				}
+				k = e;
+			} else {
+				k++;
+			}
+		}
+		if (!closed) {
+			ranges.push([i, chars.length]); // run sem fechamento: resto é código
+			break;
+		}
+	}
+	return ranges;
 }
 
 export function chunkText(text: string, limit: number): string[] {
@@ -70,7 +167,6 @@ export function chunkText(text: string, limit: number): string[] {
 	let len = 0;
 	/** Cerca reaberta no início do próximo chunk (quando o corte atravessou um fence). */
 	let pendingOpener: string | undefined;
-
 	const openFence = (): string | undefined => buf[buf.length - 1]?.openAfter;
 
 	const emit = (): void => {
@@ -85,7 +181,7 @@ export function chunkText(text: string, limit: number): string[] {
 		len = 0;
 	};
 
-	for (const line of scanLines(text)) {
+	for (const line of scanLines(normalizeAttachedFences(text))) {
 		const cap = fenceLimit(max, line.openAfter);
 		const pieces = Array.from(line.text).length > cap ? hardCut(line, cap) : [line];
 		for (const piece of pieces) {

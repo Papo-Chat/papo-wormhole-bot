@@ -96,4 +96,42 @@ describe('chunkText', () => {
 		for (const c of chunks) expect(c.length).toBeLessThanOrEqual(3600);
 		expect(chunks.join('\n')).toBe(text);
 	});
+
+	it('não duplica fence quando o fechamento está grudado no fim da última linha', () => {
+		// O Papo aceita ```\ncode```; o chunker não pode tratar a fence como aberta.
+		const chunks = chunkText('```js\ncode```', 2000);
+		expect(chunks).toEqual(['```js\ncode\n```']);
+	});
+
+	it('normaliza fence grudada na abertura e no fechamento', () => {
+		const chunks = chunkText('```{"ok":true}```', 2000);
+		expect(chunks).toEqual(['```\n{"ok":true}\n```']);
+	});
+
+	it('mantém o texto após uma fence grudada fora do bloco de código', () => {
+		const chunks = chunkText('antes ```x``` depois', 2000);
+		expect(chunks).toEqual(['antes \n```\nx\n```\n depois']);
+	});
+
+	it('fecha fence genuinamente aberta sem duplicar a última linha', () => {
+		const chunks = chunkText('```js\ncode', 2000);
+		expect(chunks).toEqual(['```js\ncode\n```']);
+	});
+
+	it('não deixa backtick órfão ao cortar linha gigante com código inline', () => {
+		const text = 'a'.repeat(25) + ' `inline` ' + 'b'.repeat(25);
+		const chunks = chunkText(text, 32);
+		expect(chunks.length).toBeGreaterThan(1);
+		for (const c of chunks) {
+			expect((c.match(/`/g) ?? []).length % 2, c).toBe(0);
+			expect(Array.from(c).length, c).toBeLessThanOrEqual(32);
+		}
+	});
+
+	it('mantém span inline curto inteiro quando o corte cairia dentro dele', () => {
+		const text = 'a'.repeat(25) + ' `inline code maior` ' + 'b'.repeat(25);
+		const chunks = chunkText(text, 32);
+		expect(chunks.some((c) => c.includes('`inline code maior`')), chunks.join('\n')).toBe(true);
+		for (const c of chunks) expect((c.match(/`/g) ?? []).length % 2, c).toBe(0);
+	});
 });

@@ -38,6 +38,7 @@ async function main(): Promise<void> {
 	const discord = new DiscordBridge({
 		token: cfg.discord.token,
 		presences: true,
+		store,
 		handlers: {
 			onMessage: (m) => void bridge.onDiscordMessage(m).catch((err) => log.error({ err }, 'discord message falhou')),
 			onMessageEdit: (b, a) =>

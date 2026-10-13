@@ -138,3 +138,55 @@ describe('authorLabel', () => {
 		expect(authorLabel('x'.repeat(400)).length).toBe(256);
 	});
 });
+
+describe('resolução de @nome em texto puro (item 28)', () => {
+	const resolver = { propagateMentions: true, papoUserIdForName: (n: string) => (n === 'ana_s' || n === 'ana' ? PAPO_UUID : undefined) };
+
+	it('liga a menção do Papo quando o nome resolve', () => {
+		expect(discordToPapoContent('fale com @ana_s', resolver)).toBe(`fale com @mention(<@${PAPO_UUID}>)`);
+	});
+
+	it('sem propagateMentions o texto permanece', () => {
+		expect(discordToPapoContent('fale com @ana_s', { papoUserIdForName: () => PAPO_UUID })).toBe('fale com @ana_s');
+	});
+
+	it('não casa dentro de e-mail, URL ou snowflake', () => {
+		expect(discordToPapoContent('a@b.com', resolver)).toBe('a@b.com');
+		expect(discordToPapoContent('https://x.com/@ana_s', resolver)).toBe('https://x.com/@ana_s');
+		expect(discordToPapoContent('oi <@111>', { ...resolver, discordUserLabel: () => undefined })).toBe('oi @usuário');
+	});
+
+	it('palavras reservadas não viram nome', () => {
+		expect(discordToPapoContent('chame @everyone', resolver)).toBe('chame @\u200beveryone');
+	});
+
+	it('pontuação final não some nem entra no nome', () => {
+		expect(discordToPapoContent('chame @ana.', resolver)).toBe(`chame @mention(<@${PAPO_UUID}>).`);
+	});
+
+	it('papo: @nome resolve para snowflake do Discord', () => {
+		const out = papoToDiscordContent('chame @maria', {
+			propagateMentions: true,
+			discordUserIdForName: (n) => (n === 'maria' ? '400' : undefined)
+		});
+		expect(out).toBe('chame <@400>');
+	});
+
+	it('menção canônica do Papo não é re-processada pelo caminho de texto puro', () => {
+		const out = papoToDiscordContent(`oi @mention(<@${PAPO_UUID}>) tchau`, {
+			propagateMentions: true,
+			discordUserIdForName: () => '999'
+		});
+		// sem link de conta e sem rótulo: `@usuário`; "mention" nunca é candidato a nome
+		expect(out).toBe('oi @usuário tchau');
+	});
+
+	it('ping do Discord sem link resolve pelo rótulo no Papo', () => {
+		const out = discordToPapoContent('oi <@111>', {
+			propagateMentions: true,
+			discordUserLabel: () => 'ana_s',
+			papoUserIdForName: (n) => (n === 'ana_s' ? PAPO_UUID : undefined)
+		});
+		expect(out).toBe(`oi @mention(<@${PAPO_UUID}>)`);
+	});
+});

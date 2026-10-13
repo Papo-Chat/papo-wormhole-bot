@@ -25,15 +25,18 @@ export const reactionSummaryText = (
 		.join(' · ');
 
 /**
- * Mescla as contagens observadas nos dois lados do par bridgeado.
- * O mesmo emoji vale a maior contagem: a reação-eco do bridge (1) nunca supera a contagem real.
+ * Mescla as contagens observadas nos dois lados do par bridgeado somando-as.
+ * Cada lado guarda apenas a contagem humana daquela mensagem (a reação-eco do
+ * bridge é descontada pelo registro em `mirror_reactions` antes de gravar),
+ * então as pessoas dos dois lados são conjuntos disjuntos: 3 no Discord + 2 no
+ * Papo = 5. Usar o máximo entre os lados perdia as reações do lado menor.
  */
 export const mergeReactionCounts = (sides: ReactionDisplay[][]): ReactionDisplay[] => {
 	const merged = new Map<string, number>();
 	for (const side of sides) {
 		for (const r of side) {
 			if (r.count <= 0) continue;
-			merged.set(r.emoji, Math.max(merged.get(r.emoji) ?? 0, r.count));
+			merged.set(r.emoji, (merged.get(r.emoji) ?? 0) + r.count);
 		}
 	}
 	return [...merged]

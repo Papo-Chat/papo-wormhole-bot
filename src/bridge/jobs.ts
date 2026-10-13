@@ -32,6 +32,8 @@ export interface ToDiscordMessageJob {
 	chunkIndex: number;
 	chunkTotal: number;
 	description: string;
+	/** Autor Papo (usado para a URL pública do avatar). Jobs antigos do outbox podem não ter. */
+	authorId?: string;
 	authorName: string;
 	authorIconSha?: string;
 	authorUrl?: string;

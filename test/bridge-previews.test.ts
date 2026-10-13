@@ -97,7 +97,17 @@ const fixture = (opts: {
 		},
 		urlFor: (sha: string, base?: string) => (base ? `${base}/media/${sha}.${mediaFiles.get(sha)?.ext ?? 'bin'}` : undefined),
 		readFor: (sha: string) => mediaFiles.get(sha)?.data,
-		extFor: (sha: string) => mediaFiles.get(sha)?.ext ?? 'bin'
+		extFor: (sha: string) => mediaFiles.get(sha)?.ext ?? 'bin',
+		// espelha o sniffing real do MediaStore: o identity usa para o avatar do Papo
+		sniffImage: (buf: Buffer): { ext: string; mime: string } | null => {
+			if (buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])))
+				return { ext: 'png', mime: 'image/png' };
+			if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return { ext: 'jpg', mime: 'image/jpeg' };
+			if (buf.length >= 6 && buf.subarray(0, 4).toString('ascii') === 'GIF8') return { ext: 'gif', mime: 'image/gif' };
+			if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP')
+				return { ext: 'webp', mime: 'image/webp' };
+			return null;
+		}
 	};
 
 	const api = {
@@ -108,7 +118,15 @@ const fixture = (opts: {
 				id,
 				username: 'u',
 				nickname: null,
-				...(opts.avatar ? { avatar_blob: Buffer.from('avatar-bytes').toString('base64'), avatar_format: 'png' } : {})
+				...(opts.avatar
+					? {
+							// magic de PNG: o identity cheira o formato antes de salvar o avatar
+							avatar_blob: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...Buffer.from('avatar-bytes')]).toString(
+								'base64'
+							),
+							avatar_format: 'png'
+						}
+					: {})
 			})),
 		whoami: async () => ({ id: 'bot', username: 'bot' }),
 		ensureSession: async () => true,

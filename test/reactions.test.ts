@@ -17,26 +17,29 @@ describe('reactionSummaryText', () => {
 });
 
 describe('mergeReactionCounts', () => {
-	it('mescla os dois lados do par e fica com a maior contagem', () => {
+	it('mescla os dois lados do par somando as contagens humanas', () => {
 		const merged = mergeReactionCounts([
 			[
 				{ emoji: '👍', count: 3 },
 				{ emoji: ':papu:', count: 1 }
 			],
 			[
-				{ emoji: '👍', count: 1 },
+				{ emoji: '👍', count: 2 },
 				{ emoji: '❤️', count: 2 }
 			]
 		]);
 		expect(merged).toEqual([
-			{ emoji: '👍', count: 3 },
+			{ emoji: '👍', count: 5 },
 			{ emoji: '❤️', count: 2 },
 			{ emoji: ':papu:', count: 1 }
 		]);
 	});
 
-	it('o eco do bridge (1) não cria contagem fantasma', () => {
-		expect(mergeReactionCounts([[{ emoji: '👍', count: 1 }], []])).toEqual([{ emoji: '👍', count: 1 }]);
+	it('o eco do bridge não entra na soma: o lado descontado grava zero', () => {
+		// a contagem do lado que só tem a reação do bridge chega 0 (desconto do espelho)
+		expect(mergeReactionCounts([[{ emoji: '👍', count: 3 }], [{ emoji: '👍', count: 0 }]])).toEqual([
+			{ emoji: '👍', count: 3 }
+		]);
 	});
 
 	it('descarta contagem zero', () => {

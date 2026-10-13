@@ -215,3 +215,18 @@ CREATE TABLE IF NOT EXISTS audit_log (
   payload TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log (ts DESC);
+
+-- Webhook do bridge por usuário Papo por canal (item 27). O Discord agrupa mensagens
+-- consecutivas quando autor e username batem; para webhook o autor é o webhook. Cada
+-- usuário tem seu webhook com nome e avatar fixos no webhook — as cópias agrupam como
+-- usuário comum. A linha é o registro de posse: identifica o webhook do bridge sem
+-- chute por nome e reaproveita o webhook entre runs.
+CREATE TABLE IF NOT EXISTS bridge_webhooks (
+  webhook_id   TEXT PRIMARY KEY,
+  channel_id   TEXT NOT NULL,
+  papo_user_id TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  avatar_sha   TEXT,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_bridge_webhooks_user ON bridge_webhooks (channel_id, papo_user_id);

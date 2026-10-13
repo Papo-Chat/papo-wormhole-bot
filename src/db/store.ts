@@ -176,6 +176,47 @@ export class Store {
 		)[0];
 	}
 
+	// ── webhooks do bridge (por usuário Papo, por canal) ───
+	upsertBridgeWebhook(w: {
+		webhook_id: string;
+		channel_id: string;
+		papo_user_id: string;
+		name: string;
+		avatar_sha?: string | null;
+	}): void {
+		// webhook recriado para o mesmo usuário: a linha antiga liberaria o índice único
+		this.db
+			.prepare('DELETE FROM bridge_webhooks WHERE channel_id = ? AND papo_user_id = ? AND webhook_id != ?')
+			.run(w.channel_id, w.papo_user_id, w.webhook_id);
+		this.db
+			.prepare(
+				`INSERT INTO bridge_webhooks (webhook_id, channel_id, papo_user_id, name, avatar_sha)
+				 VALUES (?, ?, ?, ?, ?)
+				 ON CONFLICT(webhook_id) DO UPDATE SET name = excluded.name, avatar_sha = excluded.avatar_sha`
+			)
+			.run(w.webhook_id, w.channel_id, w.papo_user_id, w.name, w.avatar_sha ?? null);
+	}
+	getBridgeWebhookByUser(channelId: string, papoUserId: string): { webhook_id: string; name: string; avatar_sha: string | null } | undefined {
+		return rows<{ webhook_id: string; name: string; avatar_sha: string | null }>(
+			this.db
+				.prepare('SELECT webhook_id, name, avatar_sha FROM bridge_webhooks WHERE channel_id = ? AND papo_user_id = ?')
+				.all(channelId, papoUserId)
+		)[0];
+	}
+	getBridgeWebhookById(webhookId: string): { webhook_id: string; channel_id: string; papo_user_id: string; name: string; avatar_sha: string | null } | undefined {
+		return rows<{ webhook_id: string; channel_id: string; papo_user_id: string; name: string; avatar_sha: string | null }>(
+			this.db.prepare('SELECT webhook_id, channel_id, papo_user_id, name, avatar_sha FROM bridge_webhooks WHERE webhook_id = ?').all(webhookId)
+		)[0];
+	}
+	listBridgeWebhookIds(channelId: string): string[] {
+		return rows<{ webhook_id: string }>(this.db.prepare('SELECT webhook_id FROM bridge_webhooks WHERE channel_id = ?').all(channelId)).map(
+			(r) => r.webhook_id
+		);
+	}
+	deleteBridgeWebhook(webhookId: string): void {
+		this.db.prepare('DELETE FROM bridge_webhooks WHERE webhook_id = ?').run(webhookId);
+	}
+
 	// ── server links ───────────────────────────────────────
 	upsertServerLink(papoServerId: string, discordGuildId: string): void {
 		this.db

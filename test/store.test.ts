@@ -300,3 +300,55 @@ describe('meta e audit', () => {
 		expect(JSON.parse(rows[1]?.payload ?? '{}')).toEqual({ links: 1 });
 	});
 });
+
+describe('webhooks do bridge (por usuário, por canal)', () => {
+	it('registra e recupera o webhook do par (canal, usuário)', () => {
+		const { store } = fixture();
+		store.upsertBridgeWebhook({ webhook_id: 'w1', channel_id: '111', papo_user_id: PAPO_UUID, name: 'Jenga (@jenga)', avatar_sha: 'sha1' });
+
+		const byUser = store.getBridgeWebhookByUser('111', PAPO_UUID);
+		expect(byUser?.webhook_id).toBe('w1');
+		expect(byUser?.name).toBe('Jenga (@jenga)');
+		expect(byUser?.avatar_sha).toBe('sha1');
+
+		const byId = store.getBridgeWebhookById('w1');
+		expect(byId?.channel_id).toBe('111');
+		expect(byId?.papo_user_id).toBe(PAPO_UUID);
+
+		expect(store.listBridgeWebhookIds('111')).toEqual(['w1']);
+		expect(store.listBridgeWebhookIds('outro')).toEqual([]);
+	});
+
+	it('atualiza identidade do mesmo webhook sem duplicar', () => {
+		const { store } = fixture();
+		store.upsertBridgeWebhook({ webhook_id: 'w1', channel_id: '111', papo_user_id: PAPO_UUID, name: 'Jenga (@jenga)', avatar_sha: 'sha1' });
+		store.upsertBridgeWebhook({ webhook_id: 'w1', channel_id: '111', papo_user_id: PAPO_UUID, name: 'Jotac (@jenga)', avatar_sha: 'sha2' });
+
+		const row = store.getBridgeWebhookByUser('111', PAPO_UUID);
+		expect(row?.name).toBe('Jotac (@jenga)');
+		expect(row?.avatar_sha).toBe('sha2');
+		expect(store.listBridgeWebhookIds('111')).toEqual(['w1']);
+	});
+
+	it('webhook recriado para o mesmo usuário substitui a linha (índice único)', () => {
+		const { store } = fixture();
+		store.upsertBridgeWebhook({ webhook_id: 'w1', channel_id: '111', papo_user_id: PAPO_UUID, name: 'Jenga (@jenga)' });
+		store.upsertBridgeWebhook({ webhook_id: 'w2', channel_id: '111', papo_user_id: PAPO_UUID, name: 'Jenga (@jenga)' });
+
+		expect(store.getBridgeWebhookByUser('111', PAPO_UUID)?.webhook_id).toBe('w2');
+		expect(store.getBridgeWebhookById('w1')).toBeUndefined();
+		expect(store.listBridgeWebhookIds('111')).toEqual(['w2']);
+	});
+
+	it('usuários diferentes no mesmo canal têm webhooks diferentes', () => {
+		const { store } = fixture();
+		const other = '11111111-2222-4333-8444-555555555555';
+		store.upsertBridgeWebhook({ webhook_id: 'w1', channel_id: '111', papo_user_id: PAPO_UUID, name: 'jenga' });
+		store.upsertBridgeWebhook({ webhook_id: 'w2', channel_id: '111', papo_user_id: other, name: 'ana' });
+
+		expect(store.listBridgeWebhookIds('111').sort()).toEqual(['w1', 'w2']);
+		store.deleteBridgeWebhook('w1');
+		expect(store.getBridgeWebhookById('w1')).toBeUndefined();
+		expect(store.listBridgeWebhookIds('111')).toEqual(['w2']);
+	});
+});

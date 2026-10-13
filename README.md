@@ -28,7 +28,9 @@ arquivos grandes são compactados (`gzip`/`tar.gz`) ou particionados.
 - Um usuário comum do Papo para o bot (o Papo não tem contas "bot"): o bot é autor de tudo
   que envia ao Papo, e a identidade real viaja no embed.
 - Um bot do Discord com **Message Content intent** habilitado no Developer Portal
-  (privilegiado; sem ele o conteúdo das mensagens não chega).
+  (privilegiado; sem ele o conteúdo das mensagens não chega) e **Server Members intent**
+  (necessário para resolver `@nome` do Papo em membros do guild; sem ele a resolução por
+  nome do lado Discord fica desligada).
 
 ## Instalação
 
@@ -104,6 +106,15 @@ Papo REST/WS ──► Bridge (tradução, chunking, embeds) ──► SQLite ou
   URL absoluta para `author.icon_url`, então o avatar do autor Papo é servido pelo media
   server embutido (`WORMHOLE_MEDIA_BASE_URL`); sem ele o avatar é enviado como anexo da
   mensagem e o embed referencia `attachment://avatar-<sha256>.<ext>`.
+- **Webhook por usuário**: no Discord, cada usuário Papo tem um webhook próprio por canal, com
+  nick + avatar fixos no webhook (nome `nickname (@username)`, ou só o username quando o apelido
+  é o próprio nome). O Discord agrupa mensagens consecutivas quando autor e username batem — num
+  webhook compartilhado as cópias de usuários diferentes nunca agrupariam. O webhook é criado sob
+  demanda e reaproveitado entre runs pela tabela `bridge_webhooks` (registro de posse, que também
+  identifica o eco sem chute por nome). Sem webhook (limite de webhooks do canal, bot sem
+  *Manage Webhooks*) o envio continua pelo cartão do bot. Webhook não responde mensagens: a
+  thread de reply se perde nesse caminho. Edição/apagamento da cópia usam o token do webhook
+  quando a mensagem é de webhook.
 
 ## Mapeamento de identidade
 
@@ -202,6 +213,10 @@ trabalho (commite ou `git stash` antes).
 - Menção de quem não tem link de usuário vira nome (`@Ana`), não id: o bridge resolve o mencionado
   pelo payload do Discord (apelido do guild tem prioridade sobre o nome da conta) ou pelo batch de
   perfil do Papo. Sem como resolver, aparece `@usuário` — nunca o snowflake ou o uuid cru.
+- Com `mentions` ligado, `@nome` em texto puro (digitado sem autocomplete) também tenta resolver:
+  username/nickname exato e único no outro lado vira menção real; nome ambíguo (nickname dividido)
+  permanece texto. Do lado Discord a busca usa o cache de membros do guild (Server Members intent);
+  do lado Papo, a lista de usuários do backend. E-mail/URL com `@` não são candidatos.
 - Reply é propagado por referência mapeada (`message.reference` ↔ `reply_to`): se a mensagem
   respondida não tem cópia do outro lado (anterior ao link, apagada), o reply simplesmente não vai.
 - Attachment do Papo em análise de moderação (`pending`/`processing`) é reenviado normalmente — o

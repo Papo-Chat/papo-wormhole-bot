@@ -172,6 +172,12 @@ export class Bridge {
 	private readonly gifs: GiphyResolver;
 	/** Um worker serializado por canal-link (preserva a ordem da conversa). */
 	private readonly running = new Map<number, Promise<void>>();
+	/**
+	 * Enqueue que chegou enquanto o worker do link estava ativo: o `claimNext` final do
+	 * worker pode ter rodado antes do enqueue. O flag força o worker a re-checar a fila
+	 * antes de encerrar, senão o job órfão esperaria até o próximo evento.
+	 */
+	private readonly rerun = new Set<number>();
 	/** Encerramento: para a ingestão e deixa só os jobs em voo terminarem. */
 	private stopping = false;
 	/** Refresh de resumo de reações, agrupado por mensagem de origem. */
@@ -312,10 +318,14 @@ export class Bridge {
 		return link;
 	}
 
+	/** O env é o interruptor global; o flag do link liga a propagação naquele canal. */
+	private propagatesMentions(link?: ChannelLink): boolean {
+		return this.cfg.bridge.propagateMentions || (link?.propagate_mentions ?? 0) === 1;
+	}
+
 	private resolvers(link?: ChannelLink): TranslateResolvers {
 		return {
-			// O env é o interruptor global; o flag do link liga a propagação naquele canal.
-			propagateMentions: this.cfg.bridge.propagateMentions || (link?.propagate_mentions ?? 0) === 1,
+			propagateMentions: this.propagatesMentions(link),
 			timezone: this.cfg.bridge.timezone,
 			papoUserLabel: (id) => {
 				const u = this.store.getPapoUser(id);
@@ -327,6 +337,9 @@ export class Bridge {
 				return u?.display_name ?? u?.username ?? undefined;
 			},
 			papoUserIdForDiscord: (id) => this.store.getLinkByDiscordUser(id)?.papo_user_id,
+			// resolução por nome (item 28): só tem efeito quando `propagateMentions` liga
+			papoUserIdForName: (name) => this.resolvePapoByName(name),
+			discordUserIdForName: (name) => this.discord.memberByName?.(name)?.id,
 			discordChannelLabel: (id) => this.discord.channelName(id),
 			discordRoleLabel: (id) => this.discord.roleName(id),
 			discordEmoji: (name) => ({
@@ -376,6 +389,7 @@ export class Bridge {
 
 		const author = await this.identity.author(msg.author_id);
 		await this.warmPapoMentions(msg.content ?? '');
+		if (this.propagatesMentions(link) && /@/.test(msg.content ?? '')) await this.discord.ensureMemberIndex?.();
 		const preview = await this.papoPreview(msg);
 		const translated = papoToDiscordContent(preview.text, this.resolvers(link));
 		const chunks = chunkText(translated, EMBED_CHUNK_CHARS);
@@ -394,6 +408,7 @@ export class Bridge {
 				chunkIndex: i,
 				chunkTotal: total,
 				description,
+				authorId: author.userId,
 				authorName: author.name,
 				authorIconSha: author.avatarSha,
 				colorHex: link.color ?? undefined,
@@ -468,6 +483,43 @@ export class Bridge {
 		await this.identity.warm(ids).catch((err) => this.log.debug({ err }, 'perfil de mencionado não resolvido'));
 	}
 
+	/** Índice nome→uuid dos usuários do Papo (resolução de `@nome`, item 28); TTL curto. */
+	private papoNameIndex = { at: 0, byUsername: new Map<string, string>(), byNickname: new Map<string, string | null>() };
+	private static readonly PAPO_NAME_INDEX_TTL_MS = 10 * 60_000;
+
+	private async ensurePapoNameIndex(): Promise<void> {
+		if (this.papoNameIndex.at && Date.now() - this.papoNameIndex.at < Bridge.PAPO_NAME_INDEX_TTL_MS) return;
+		try {
+			const users = await this.api.listAllUsers();
+			const byUsername = new Map<string, string>();
+			const byNickname = new Map<string, string | null>();
+			for (const u of users) {
+				const username = u.username?.trim().toLowerCase();
+				if (username) byUsername.set(username, u.id);
+				const nickname = u.nickname?.trim().toLowerCase();
+				if (!nickname) continue;
+				if (byNickname.get(nickname) === null) continue; // já ambíguo
+				if (byNickname.has(nickname)) {
+					byNickname.set(nickname, null);
+					continue;
+				}
+				byNickname.set(nickname, u.id);
+			}
+			this.papoNameIndex = { at: Date.now(), byUsername, byNickname };
+		} catch (err) {
+			this.log.debug({ err }, 'falha ao carregar o índice de usuários do Papo');
+		}
+	}
+
+	/** Usuário do Papo por username/nickname; username tem prioridade. `undefined` sem match único. */
+	private resolvePapoByName(name: string): string | undefined {
+		const wanted = name.trim().toLowerCase();
+		if (!wanted) return undefined;
+		const byUsername = this.papoNameIndex.byUsername.get(wanted);
+		if (byUsername) return byUsername;
+		return this.papoNameIndex.byNickname.get(wanted) ?? undefined;
+	}
+
 	private async onPapoEdit(e: PapoWsEditEvent): Promise<void> {
 		const link = this.linkForPapoChannel(e.channel_id);
 		if (!link || !link.bridge_edits) return;
@@ -479,6 +531,7 @@ export class Bridge {
 			return;
 		}
 		await this.warmPapoMentions(e.content ?? '');
+		if (this.propagatesMentions(link) && /@/.test(e.content ?? '')) await this.discord.ensureMemberIndex?.();
 		const preview = await this.papoPreview(e);
 		const chunks = chunkText(papoToDiscordContent(preview.text, this.resolvers(link)), EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
@@ -991,9 +1044,19 @@ export class Bridge {
 		}
 	}
 
+	/**
+	 * Mensagem do Discord criada pelo bridge: pelo bot ou pelo webhook do bridge
+	 * (mensagem de webhook tem author = webhook; o identificador é o webhook_id).
+	 * Chamada opcional: fakes de teste sem suporte a webhook caem no check do bot.
+	 */
+	private async isSelfDiscordMessage(m: DiscordMessage | PartialDiscordMessage): Promise<boolean> {
+		const viaBridge = await this.discord.isSelfMessage?.(m);
+		return viaBridge ?? this.discord.isSelf(m.author?.id);
+	}
+
 	async onDiscordMessage(m: DiscordMessage): Promise<void> {
 		if (this.stopping) return;
-		if (this.discord.isSelf(m.author.id)) return; // anti-loop
+		if (await this.isSelfDiscordMessage(m)) return; // anti-loop
 		if (m.channel.isThread()) return; // v1: threads fora do escopo
 		const link = this.linkForDiscordChannel(m.channelId);
 		if (!link) return;
@@ -1007,6 +1070,7 @@ export class Bridge {
 			avatar_hash: m.author.avatar
 		});
 		await this.cacheMentionedDiscordUsers(m);
+		if (this.propagatesMentions(link) && /@/.test(m.content ?? '')) await this.ensurePapoNameIndex();
 
 		const content = discordToPapoContent(m.content ?? '', this.resolvers(link));
 		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
@@ -1095,7 +1159,7 @@ export class Bridge {
 			this.log.debug({ messageId: after.id }, 'edição do Discord sem conteúdo acessível');
 			return;
 		}
-		if (this.discord.isSelf(fresh.author.id)) {
+		if (await this.isSelfDiscordMessage(fresh)) {
 			// eco: foi o próprio bridge que reescreveu o embed (resumo de reação).
 			this.log.debug({ messageId: fresh.id }, 'edição de embed ponte: eco ignorado');
 			return;
@@ -1107,6 +1171,7 @@ export class Bridge {
 			return;
 		}
 		await this.cacheMentionedDiscordUsers(fresh);
+		if (this.propagatesMentions(link) && /@/.test(fresh.content ?? '')) await this.ensurePapoNameIndex();
 		const chunks = chunkText(discordToPapoContent(fresh.content ?? '', this.resolvers(link)), PAPO_EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
@@ -1199,7 +1264,7 @@ export class Bridge {
 		if (this.stopping) return;
 		const link = this.store.getChannelLinkByDiscord(m.channelId);
 		if (!link || !link.bridge_deletes) return;
-		if (!m.partial && this.discord.isSelf(m.author.id)) {
+		if (!m.partial && await this.isSelfDiscordMessage(m)) {
 			// eco: o bridge apagou a própria cópia (deleção nascida no Papo).
 			this.log.debug({ messageId: m.id }, 'deleção de embed ponte: eco ignorado');
 			return;
@@ -1288,8 +1353,18 @@ export class Bridge {
 	// ── execução dos jobs ──────────────────────────────────
 
 	private scheduleLink(linkId: number): void {
-		if (this.stopping || this.running.has(linkId)) return;
-		const run = this.runLink(linkId).finally(() => this.running.delete(linkId));
+		if (this.stopping) return;
+		if (this.running.has(linkId)) {
+			// o worker encerra e re-checa a fila (ver `rerun` no finally)
+			this.rerun.add(linkId);
+			return;
+		}
+		const run = this.runLink(linkId).finally(() => {
+			this.running.delete(linkId);
+			// enqueue que chegou enquanto o worker era o ativo: o `claimNext` final dele
+			// pode ter rodado antes do enqueue; reagenda em vez de deixar o job órfão
+			if (!this.stopping && this.rerun.delete(linkId)) this.scheduleLink(linkId);
+		});
 		this.running.set(linkId, run);
 	}
 
@@ -1509,7 +1584,24 @@ export class Bridge {
 			return;
 		}
 
-		const avatar = this.avatarAttachment(job.authorIconSha, embed?.author?.icon_url);
+		// modo webhook: cada usuário Papo tem um webhook próprio no canal, com nick +
+		// avatar fixos no webhook. O Discord agrupa mensagens consecutivas por autor +
+		// username — num webhook compartilhado, cópias de usuários diferentes nunca
+		// agrupariam. Sem webhook (limite do canal, sem Manage Webhooks) o envio continua
+		// pelo cartão do bot. Webhook não responde mensagens: a thread de reply/continuação
+		// se perde nesse caminho.
+		const webhook = job.authorId
+			? await this.discord.userWebhook?.(job.discordChannelId, {
+					userId: job.authorId,
+					displayName: job.authorName,
+					username: this.store.getPapoUser(job.authorId)?.username ?? job.authorName,
+					avatarSha: job.authorIconSha,
+					avatarBuffer: job.authorIconSha ? this.media.readFor(job.authorIconSha) : undefined
+				})
+			: undefined;
+		const webhookMode = Boolean(webhook);
+
+		const avatar = webhookMode ? undefined : this.avatarAttachment(job.authorIconSha, embed?.author?.icon_url);
 		// avatar e mídia do preview ocupam anexos da mensagem de cartão: o orçamento dos
 		// anexos da origem é o que sobra
 		const reservedFiles = (avatar ? 1 : 0) + this.filesForEmbedRefs(job.linkEmbeds ?? []).length;
@@ -1554,7 +1646,10 @@ export class Bridge {
 			DISCORD_LIMITS.embedDescriptionMax
 		);
 		built.footer = { text: footerBase };
-		if (avatar && !built.author?.icon_url) {
+		if (webhookMode) {
+			// o webhook já mostra nick + avatar como autor da mensagem; o autor no cartão duplicaria
+			delete built.author;
+		} else if (avatar && !built.author?.icon_url) {
 			built.author = {
 				name: built.author?.name ?? job.authorName,
 				...(built.author?.url ? { url: built.author.url } : {}),
@@ -1593,21 +1688,30 @@ export class Bridge {
 					refs.unshift(avatar);
 				files.unshift(...refs);
 			}
+			const embeds = extra
+				? (() => {
+						const cont = buildDiscordBridgeEmbed({
+							authorName: job.authorName,
+							description: `📎 continuação de anexos (${g + 1}/${groups.length})`,
+							footerText: footers[g]!,
+							colorHex: job.colorHex
+						}) as APIEmbed;
+						if (webhookMode) delete cont.author;
+						return [cont];
+					})()
+				: this.discordApiEmbeds(cardEmbeds);
 			markAttempt();
-			const sent = await this.discord.send(job.discordChannelId, {
-				embeds: extra
-					? [
-							buildDiscordBridgeEmbed({
-								authorName: job.authorName,
-								description: `📎 continuação de anexos (${g + 1}/${groups.length})`,
-								footerText: footers[g]!,
-								colorHex: job.colorHex
-							}) as APIEmbed
-						]
-					: this.discordApiEmbeds(cardEmbeds),
-				files,
-				replyTo: extra ? lastDiscordId : this.copyForPapoMessage(job.replyRefPapoId)
-			});
+			const viaWebhook =
+				webhook && job.authorId
+					? await this.discord.sendAsWebhook?.(job.discordChannelId, job.authorId, { embeds, files })
+					: undefined;
+			const sent =
+				viaWebhook ??
+				(await this.discord.send(job.discordChannelId, {
+					embeds,
+					files,
+					replyTo: extra ? lastDiscordId : this.copyForPapoMessage(job.replyRefPapoId)
+				}));
 			lastDiscordId = sent.id;
 			this.mapDiscordCopy(job, sent.id, g, extra, description, built, footerBase);
 		}
@@ -2149,13 +2253,20 @@ export class Bridge {
 			this.log.debug({ messageId: job.sourceMessageId, emoji: display }, 'espelho do Discord já sincronizado: chamada evitada');
 			return;
 		}
-
+		// Marca ANTES de aplicar: um evento humano do Discord que chegue enquanto a chamada
+		// está em voo já desconta o espelho na contagem observada. Marcando só depois, a
+		// reação do bot era contada como humana e disparava um espelho redundante no Papo.
+		this.trackMirrorReaction({ ...mirror, present: job.add });
 		try {
 			await this.reactOnDiscord(job, link.discord_channel_id, map.discord_message_id, native);
 		} catch (err) {
-			if (!isUnknownEmoji(err)) throw err;
+			if (!isUnknownEmoji(err)) {
+				this.trackMirrorReaction({ ...mirror, present: !job.add });
+				throw err;
+			}
 			// o cache do gateway ainda traz o emoji, mas o Discord o recusa (apagado ou
 			// `available: false`): re-carrega a lista de indisponíveis e tenta o equivalente.
+			this.trackMirrorReaction({ ...mirror, present: false });
 			await this.discord.loadUnavailableEmojis();
 			const retry = name
 				? this.emojis.tokenForDiscord(name, { findByName: (n) => this.discord.findGuildEmoji(n) })
@@ -2168,7 +2279,15 @@ export class Bridge {
 				return;
 			}
 			native = retry;
-			await this.reactOnDiscord(job, link.discord_channel_id, map.discord_message_id, native);
+			const retryMirror = { ...mirror, emoji: discordMirrorKey(native) };
+			this.trackMirrorReaction({ ...retryMirror, present: job.add });
+			try {
+				await this.reactOnDiscord(job, link.discord_channel_id, map.discord_message_id, native);
+			} catch (err2) {
+				this.trackMirrorReaction({ ...retryMirror, present: !job.add });
+				throw err2;
+			}
+			return;
 		}
 		// o espelho vive no Discord: registrar é o que permite descontar a reação do bot
 		// quando uma contagem observada naquela mensagem a incluir. A chave é o emoji
@@ -2222,16 +2341,19 @@ export class Bridge {
 		}
 		// Marca ANTES de aplicar: o Papo transmite o `react_update` antes de devolver o
 		// HTTP, então o eco chega enquanto a chamada ainda está em voo. Marcando depois,
-		// o eco não era reconhecido e a reação voltava ao Discord como duplicada.
+		// o eco não era reconhecido e a reação voltava ao Discord como duplicada. O
+		// espelho entra junto pelo mesmo motivo: a contagem observada que chegar nesse
+		// intervalo já desconta a reação do bot.
 		this.store.markSelfReaction(mirror);
+		this.trackMirrorReaction({ ...mirror, present: job.add });
 		try {
 			if (job.add) await this.api.addReaction(link.papo_channel_id, map.papo_message_id, args);
 			else await this.api.removeReaction(link.papo_channel_id, map.papo_message_id, args);
 		} catch (err) {
 			this.store.clearSelfReaction(mirror);
+			this.trackMirrorReaction({ ...mirror, present: !job.add });
 			throw err;
 		}
-		this.trackMirrorReaction({ ...mirror, present: job.add });
 	}
 
 	/**
