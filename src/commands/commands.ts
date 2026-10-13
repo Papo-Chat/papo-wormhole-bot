@@ -25,14 +25,14 @@ export const commands = [
     .setDescription('Linka um canal do Papo a um canal do Discord')
     .addStringOption((o) => o.setName('papo_channel').setDescription('nome do canal do Papo (ex.: geral) ou id (uuid)').setRequired(true))
     .addChannelOption((o) =>
-      o.setName('discord_channel').setDescription('Canal do Discord').addChannelTypes(ChannelType.GuildText).setRequired(true)
+      o.setName('discord_channel').setDescription('Canal do Discord').addChannelTypes(ChannelType.GuildText,ChannelType.PublicThread).setRequired(true)
     )
     .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
   new SlashCommandBuilder()
     .setName('unlink-channel')
     .setDescription('Remove o link de um canal')
     .addChannelOption((o) =>
-      o.setName('discord_channel').setDescription('Canal do Discord').addChannelTypes(ChannelType.GuildText).setRequired(true)
+      o.setName('discord_channel').setDescription('Canal do Discord').addChannelTypes(ChannelType.GuildText,ChannelType.PublicThread).setRequired(true)
     )
     .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
   new SlashCommandBuilder()
