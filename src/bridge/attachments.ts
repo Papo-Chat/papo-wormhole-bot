@@ -1,4 +1,5 @@
 import { gzip, isCompressibleMime, partition, tarGz } from './tar.js';
+import { sniffMedia } from './media.js';
 import { PART_TARGET_BYTES } from './limits.js';
 
 /**
@@ -52,6 +53,12 @@ export function sanitizeName(name: string, max = 128): string {
 	return base.length <= max ? base : `${base.slice(0, max - 8)}${base.slice(-8)}`;
 }
 
+/** Extensão trocada pelo tipo que o arquivo realmente é (`giphy.mp4` → `giphy.gif`). */
+export function swapExtension(name: string, ext: string): string {
+	const base = /\.[a-z0-9]{1,5}$/i.test(name) ? name.replace(/\.[a-z0-9]{1,5}$/i, '') : name;
+	return `${base}.${ext}`;
+}
+
 const formatBytes = (n: number): string => {
 	if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 	if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
@@ -98,9 +105,15 @@ export async function prepareAttachments(
 			throw err;
 		}
 		const name = sanitizeName(a.name);
+		// o destino mostra o nome que recebe: se os bytes são outra mídia (o player do Discord
+		// re-serviu um GIF como mp4, ou a variante `.gif` devolveu o loop), nome e MIME
+		// acompanham o arquivo que realmente chegou
+		const sniffed = sniffMedia(data);
+		const finalName = sniffed ? swapExtension(name, sniffed.ext) : name;
+		const finalMime = sniffed?.mime ?? a.mime ?? undefined;
 
 		if (data.length <= limits.maxFileBytes) {
-			flat.push({ name, data, mime: a.mime ?? undefined });
+			flat.push({ name: finalName, data, mime: finalMime });
 			continue;
 		}
 

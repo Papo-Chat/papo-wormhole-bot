@@ -254,6 +254,13 @@ trabalho (commite ou `git stash` antes).
   `attachments/refresh-urls` antes de desistir; arquivo que realmente não existe mais vira aviso no
   texto, e a mensagem continua bridgeada. Com `attachments` desligado não há para onde re-hospedar,
   e o link continua no texto e no preview.
+- GIF do Discord (picker do Klipy, link `.gif`, GIF de favorito) chega ao Papo como **arquivo
+  animado**, nunca como vídeo do card. O player do Discord (`gifv`/`gif`) só expõe um mp4 em loop mais
+  um frame estático — o Papo desenharia isso como player de vídeo, e a animação morre ali. O bridge
+  usa o anexo `.gif` quando existe, senão a mídia `image/gif` do embed, senão a variante `.gif` do
+  mesmo caminho (`…/vTXu.mp4` → `…/vTXu.gif`, onde Klipy e Giphy servem os dois), conferindo a magic
+  antes de aceitar e caindo no mp4 se a variante não existir. O loop e o frame param de andar atrás
+  do arquivo, e o nome do anexo acompanha o tipo que os bytes realmente são.
 - Thread do Discord é linkável a um canal do Papo (`/link-channel`), que é o que a thread vira do
   outro lado: o Papo não tem thread. O bridge entra na thread (o Discord só entrega mensagens de
   uma thread a quem é membro) e as cópias entram nela; webhook de thread é o do canal pai, com a

@@ -121,6 +121,12 @@ export interface DiscordMedia {
 	mime: string;
 	width?: number;
 	height?: number;
+	/**
+	 * Variante `.gif` deduzida do mesmo arquivo (`…/vTXu.mp4` → `…/vTXu.gif`): o download tenta
+	 * ela antes da URL principal e só a aceita se vier um GIF de verdade. É o que devolve a
+	 * animação quando o player do Discord só expõe o mp4 em loop.
+	 */
+	gifVariant?: string;
 }
 
 /**
@@ -135,6 +141,44 @@ export const isDiscordHostedMedia = (media: DiscordMedia): boolean =>
 	isDiscordMediaUrl(media.url) || isDiscordMediaUrl(media.origin);
 
 const areaOf = (m: DiscordMedia): number => (m.width ?? 0) * (m.height ?? 0);
+
+/**
+ * O embed é o player de GIF do Discord: `gifv` é o tipo histórico do picker, `gif` é como a
+ * mesma mídia é indexada desde fev/2026. Os dois re-servem o GIF como mp4 em loop mais um
+ * frame estático — nenhum dos dois é o arquivo animado.
+ */
+export const isGifPlayerEmbed = (embed: DiscordEmbedPayload): boolean =>
+	embed.type === 'gifv' || embed.type === 'gif';
+
+/** Proxy de terceiros do Discord: o caminho inteiro, extensão incluída, está assinado. */
+const DISCORD_EXTERNAL_PROXY = /^images-ext-\d+\.discordapp\.net$/i;
+
+/** Extensões de mídia que um player de GIF costuma servir no lugar do GIF. */
+const GIF_STANDIN_EXTS = new Set(['mp4', 'webm', 'mov', 'ogv', 'webp', 'avif', 'jpg', 'jpeg', 'png']);
+
+/**
+ * Variante `.gif` do mesmo arquivo. Klipy e Giphy servem o GIF e o mp4 em loop pelo mesmo
+ * caminho com extensões diferentes (`…/d7ae/vTXu.mp4` → `…/d7ae/vTXu.gif`): o mp4 que o player
+ * mostra é re-encode do GIF, e o arquivo animado continua lá.
+ * A query vai embora junto — assinatura de CDN vale para o caminho que foi assinado, e o link
+ * renovado é o que o download busca em seguida.
+ * `undefined` quando o caminho já é `.gif`, quando não é arquivo reconhecível, ou quando a URL
+ * é o proxy de terceiros do Discord (mudar a extensão ali quebraria a assinatura).
+ */
+export function gifVariantUrl(url?: string | null): string | undefined {
+	const ext = pathExt(url ?? '');
+	if (!ext || ext === 'gif' || !GIF_STANDIN_EXTS.has(ext)) return undefined;
+	try {
+		const u = new URL(url!);
+		if (DISCORD_EXTERNAL_PROXY.test(u.host)) return undefined;
+		u.pathname = u.pathname.replace(/\.([a-z0-9]+)$/i, '.gif');
+		u.search = '';
+		u.hash = '';
+		return u.toString();
+	} catch {
+		return undefined;
+	}
+}
 
 /**
  * Um objeto de mídia do Discord em forma utilizável.
@@ -353,6 +397,12 @@ export interface DiscordToPapoOptions {
 	 * Quem re-hospeda é o bridge (`discordHostedMedia`), e o destino da mídia vira anexo.
 	 */
 	rehostDiscordMedia?: boolean;
+	/**
+	 * O GIF do preview viaja como **arquivo** da mensagem (o bridge baixa e reenvia). O mp4 em
+	 * loop e o frame estático que o player do Discord re-serviu do mesmo GIF saem do card: no
+	 * Papo eles desenham um player de vídeo com um frame parado, e a animação morre ali.
+	 */
+	gifAsFile?: boolean;
 }
 
 /** Embed do Discord → EmbedInput do Papo. */
@@ -386,21 +436,27 @@ export function discordEmbedsToPapo(embeds: DiscordEmbedPayload[], opts: Discord
 			images = images.filter((m) => !isDiscordHostedMedia(m));
 			videos = videos.filter((m) => !isDiscordHostedMedia(m));
 		}
-		// O Papo renderiza a imagem da thumbnail; a imagem principal vira thumbnail quando é a única.
-		// Só os formatos que o backend decodifica: um avif seria baixado e descartado (o preview
-		// chegaria sem imagem), e um vídeo fora da allowlist faz o backend recusar a mensagem inteira.
-		const image = previewImageOf({ images: images.filter((m) => PAPO_IMAGE_MIMES.includes(m.mime)), videos });
-		if (image) {
-			input.thumbnail = { url: clampText(image.url, PAPO_LIMITS.embedUrlMax) };
-			if (image.mime === 'image/gif') input.thumbnail.mime_type = 'image/gif';
+		// GIF: o player do Discord (`gifv`/`gif`) re-serviu o GIF como mp4 em loop mais um frame
+		// estático, e o Papo desenha isso como player de vídeo — a animação morre ali. Quando o
+		// bridge manda o GIF como arquivo da mensagem, o card não repete o que o arquivo já mostra.
+		const gifFile = opts.gifAsFile && (isGifPlayerEmbed(e) || images.some((m) => m.mime === 'image/gif'));
+		if (!gifFile) {
+			// O Papo renderiza a imagem da thumbnail; a imagem principal vira thumbnail quando é a única.
+			// Só os formatos que o backend decodifica: um avif seria baixado e descartado (o preview
+			// chegaria sem imagem), e um vídeo fora da allowlist faz o backend recusar a mensagem inteira.
+			const image = previewImageOf({ images: images.filter((m) => PAPO_IMAGE_MIMES.includes(m.mime)), videos });
+			if (image) {
+				input.thumbnail = { url: clampText(image.url, PAPO_LIMITS.embedUrlMax) };
+				if (image.mime === 'image/gif') input.thumbnail.mime_type = 'image/gif';
+			}
+			// Vídeo direto vira `video` no Papo: o backend re-serva pelo relay (GET /embeds/{id}/video)
+			// e o card desenha o player. Página de player (YouTube) não é arquivo: fica só o cartão.
+			const video = videos.find((v) => PAPO_VIDEO_MIMES.includes(v.mime));
+			if (video) input.video = {
+				url: clampText(video.url, PAPO_LIMITS.embedUrlMax),
+				mime_type: video.mime
+			};
 		}
-		// Vídeo direto vira `video` no Papo: o backend re-serva pelo relay (GET /embeds/{id}/video)
-		// e o card desenha o player. Página de player (YouTube) não é arquivo: fica só o cartão.
-		const video = videos.find((v) => PAPO_VIDEO_MIMES.includes(v.mime));
-		if (video) input.video = {
-			url: clampText(video.url, PAPO_LIMITS.embedUrlMax),
-			mime_type: video.mime
-		};
 		if (e.fields?.length) {
 			input.fields = e.fields.slice(0, PAPO_LIMITS.embedFieldsMax).map((f) => ({
 				name: clampText(f.name, PAPO_LIMITS.embedFieldNameMax),

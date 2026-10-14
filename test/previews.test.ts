@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { APIEmbed } from 'discord.js';
-import { discordHostedMedia, discordMediaLinksInContent, firstDiscordPreview, firstPapoPreview, giphyEmbed, stripDiscordMediaLinks } from '../src/bridge/previews.js';
-import { discordLinkIsStale, discordSignatureExpiry, isDiscordMediaUrl } from '../src/bridge/embeds.js';
+import { discordGifOf, discordHostedMedia, discordMediaLinksInContent, firstDiscordPreview, firstPapoPreview, giphyEmbed, stripDiscordMediaLinks } from '../src/bridge/previews.js';
+import { discordLinkIsStale, discordSignatureExpiry, gifVariantUrl, isDiscordMediaUrl } from '../src/bridge/embeds.js';
 import { DISCORD_LIMITS } from '../src/bridge/limits.js';
 import type { PapoEmbed } from '../src/papo/types.js';
 
@@ -216,6 +216,33 @@ describe('mídia hospedada pelo Discord (URL volátil)', () => {
 		]);
 	});
 
+	it('o GIF que vai como arquivo cobre o mp4 em loop e o frame estático do player', () => {
+		const embeds = [
+			discordEmbed({
+				type: 'gifv',
+				url: 'https://klipy.com/gifs/algo',
+				image: { url: 'https://cdn.discordapp.com/attachments/1/2/gif.gif' },
+				video: { url: 'https://cdn.discordapp.com/embed/attachments/1/2/gif-loop.mp4' },
+				thumbnail: { url: 'https://cdn.discordapp.com/embed/attachments/1/2/gif-frame.webp' }
+			})
+		] as never;
+		// sem a regra, a mesma mídia chega três vezes: o GIF, o loop e o frame parado
+		expect(discordHostedMedia(embeds).map((m) => m.url)).toEqual([
+			'https://cdn.discordapp.com/attachments/1/2/gif.gif',
+			'https://cdn.discordapp.com/embed/attachments/1/2/gif-frame.webp',
+			'https://cdn.discordapp.com/embed/attachments/1/2/gif-loop.mp4'
+		]);
+		expect(discordHostedMedia(embeds, { skipGifPlayerMedia: true }).map((m) => m.url)).toEqual([
+			'https://cdn.discordapp.com/attachments/1/2/gif.gif'
+		]);
+		// vídeo de verdade (não é player de GIF) continua re-hospedado
+		expect(
+			discordHostedMedia([discordEmbed({ type: 'video', video: { url: 'https://cdn.discordapp.com/attachments/1/2/b.mp4' } })] as never, {
+				skipGifPlayerMedia: true
+			}).map((m) => m.url)
+		).toEqual(['https://cdn.discordapp.com/attachments/1/2/b.mp4']);
+	});
+
 	it('discordMediaLinksInContent pega o link de arquivo do Discord escrito no texto', () => {
 		expect(discordMediaLinksInContent('olha https://cdn.discordapp.com/attachments/1/2/video.mp4 legal')).toEqual([
 			'https://cdn.discordapp.com/attachments/1/2/video.mp4'
@@ -225,6 +252,86 @@ describe('mídia hospedada pelo Discord (URL volátil)', () => {
 		expect(discordMediaLinksInContent('link de fora https://example.com/a.png')).toEqual([]);
 		expect(discordMediaLinksInContent('')).toEqual([]);
 		expect(discordMediaLinksInContent(undefined)).toEqual([]);
+	});
+});
+
+describe('GIF do Discord viaja como arquivo (discordGifOf)', () => {
+	/** GIF do picker Klipy: o Discord só expõe o mp4 em loop e o frame webp do mesmo GIF. */
+	const klipyGifv = () => ({
+		type: 'gifv',
+		url: 'https://klipy.com/gifs/orihime-bread-girl',
+		title: 'Orihime: The Bread Bag Girl',
+		thumbnail: {
+			url: 'https://static.klipy.com/ii/d7ae/DT0Dl1xZ.webp',
+			proxy_url: 'https://images-ext-1.discordapp.net/external/CF8k/https/static.klipy.com/ii/d7ae/DT0Dl1xZ.webp',
+			width: 498,
+			height: 498
+		},
+		video: {
+			url: 'https://static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.mp4',
+			proxy_url: 'https://images-ext-1.discordapp.net/external/P17-/https/static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.mp4',
+			width: 640,
+			height: 640
+		}
+	}) as never;
+
+	it('mp4 do player vira arquivo pela variante `.gif` do mesmo caminho', () => {
+		const gif = discordGifOf([klipyGifv()]);
+		// Klipy serve o GIF e o loop pelo mesmo caminho com extensões diferentes
+		expect(gif?.media?.gifVariant).toBe('https://static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.gif');
+		// o mp4 que o Discord garante continua sendo a URL do destino, se a variante falhar
+		expect(gif?.media?.url).toBe('https://images-ext-1.discordapp.net/external/P17-/https/static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.mp4');
+	});
+
+	it('a mídia `image/gif` do embed é o arquivo: não há variante a deduzir', () => {
+		const gif = discordGifOf([
+			discordEmbed({
+				type: 'image',
+				url: 'https://cdn.discordapp.com/attachments/1/2/animado.gif',
+				image: { url: 'https://cdn.discordapp.com/attachments/1/2/animado.gif' }
+			})
+		] as never);
+		expect(gif?.media?.url).toBe('https://cdn.discordapp.com/attachments/1/2/animado.gif');
+		expect(gif?.media?.gifVariant).toBeUndefined();
+	});
+
+	it('anexo `.gif` já é o arquivo: nada a baixar, e o mp4 do player continua sobrando', () => {
+		const gif = discordGifOf([klipyGifv()], [{ name: 'gif.gif', contentType: 'image/gif' }]);
+		expect(gif).toEqual({});
+		// o anexo pode ser o GIF pelo MIME ou pelo nome
+		expect(discordGifOf([], [{ name: 'arquivo', contentType: 'image/gif; charset=binary' }])).toEqual({});
+		expect(discordGifOf([], [{ name: 'gif.GIF', contentType: null }])).toEqual({});
+	});
+
+	it('mensagem sem GIF nenhum não produz mídia', () => {
+		expect(discordGifOf([discordEmbed({ type: 'rich', url: 'https://example.com/x', thumbnail: { url: 'https://example.com/t.png' } })] as never)).toBeUndefined();
+		expect(discordGifOf([])).toBeUndefined();
+		expect(discordGifOf(undefined)).toBeUndefined();
+		// vídeo de verdade não é GIF deduzido: só o player de GIF (`gifv`/`gif`) é
+		expect(discordGifOf([discordEmbed({ type: 'video', video: { url: 'https://example.com/a.mp4' } })] as never)).toBeUndefined();
+	});
+
+	it('gifVariantUrl: o proxy de terceiros do Discord tem o caminho assinado, extensão incluída', () => {
+		expect(gifVariantUrl('https://static.klipy.com/ii/d7ae/vTXu.mp4')).toBe('https://static.klipy.com/ii/d7ae/vTXu.gif');
+		// assinatura de CDN vale para o caminho assinado: a variante nasce limpa e é renovada
+		expect(gifVariantUrl('https://cdn.discordapp.com/embed/attachments/1/2/loop.mp4?ex=66&is=66&hm=ab')).toBe(
+			'https://cdn.discordapp.com/embed/attachments/1/2/loop.gif'
+		);
+		expect(gifVariantUrl('https://images-ext-1.discordapp.net/external/P17/https/static.klipy.com/ii/d7ae/vTXu.mp4')).toBeUndefined();
+		// já é gif, e página de player não é arquivo
+		expect(gifVariantUrl('https://media.giphy.com/media/abc/giphy.gif')).toBeUndefined();
+		expect(gifVariantUrl('https://www.youtube.com/embed/dwK9fhsOGK8')).toBeUndefined();
+		expect(gifVariantUrl(undefined)).toBeUndefined();
+	});
+
+	it('gifAsFile tira o mp4 e o frame estático do card: o arquivo animado é o GIF', () => {
+		const preview = firstDiscordPreview([klipyGifv()], [], { gifAsFile: true });
+		expect(preview?.title).toBe('Orihime: The Bread Bag Girl');
+		expect(preview?.url).toBe('https://klipy.com/gifs/orihime-bread-girl');
+		expect(preview?.video).toBeUndefined();
+		expect(preview?.thumbnail).toBeUndefined();
+		// sem a regra, o Papo desenha o loop mp4 com um frame parado
+		expect(firstDiscordPreview([klipyGifv()])?.video?.mime_type).toBe('video/mp4');
 	});
 });
 

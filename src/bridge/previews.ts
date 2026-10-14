@@ -4,8 +4,10 @@ import {
 	discordEmbedMedia,
 	discordEmbedsToPapo,
 	discordMediaSourceUrl,
+	gifVariantUrl,
 	isDiscordHostedMedia,
 	isDiscordMediaUrl,
+	isGifPlayerEmbed,
 	papoEmbedsToDiscord,
 	type DiscordEmbedPayload,
 	type DiscordMedia,
@@ -99,13 +101,22 @@ export function firstDiscordPreview(
  * Toda mídia que o Discord hospeda nos embeds da mensagem (imagem de anexo, preview de
  * imagem, vídeo do picker). O bridge baixa cada uma e reenvia como anexo da mensagem no Papo:
  * a URL do CDN expira junto com a mensagem original.
+ * `skipGifPlayerMedia`: o GIF que vai como arquivo da mensagem cobre o mp4 em loop e o frame
+ * estático que o player do Discord re-serviu dele — re-hospedar os dois é mandar a mesma mídia
+ * três vezes.
  */
-export function discordHostedMedia(embeds: readonly APIEmbed[] | undefined): DiscordMedia[] {
+export function discordHostedMedia(
+	embeds: readonly APIEmbed[] | undefined,
+	opts: { skipGifPlayerMedia?: boolean } = {}
+): DiscordMedia[] {
 	const out: DiscordMedia[] = [];
 	const seen = new Set<string>();
 	for (const e of embeds ?? []) {
-		const { images, videos } = discordEmbedMedia(e as unknown as DiscordEmbedPayload);
+		const payload = e as unknown as DiscordEmbedPayload;
+		const { images, videos } = discordEmbedMedia(payload);
+		const gifOnly = Boolean(opts.skipGifPlayerMedia) && isGifPlayerEmbed(payload);
 		for (const m of [...images, ...videos]) {
+			if (gifOnly && m.mime !== 'image/gif') continue;
 			if (!isDiscordHostedMedia(m)) continue;
 			const key = mediaKey(discordMediaSourceUrl(m));
 			if (!key || seen.has(key)) continue;
@@ -114,6 +125,47 @@ export function discordHostedMedia(embeds: readonly APIEmbed[] | undefined): Dis
 		}
 	}
 	return out;
+}
+
+/** Anexo `.gif` (o picker do Discord entrega o GIF como arquivo da mensagem). */
+export const isGifAttachment = (a: { name?: string | null; contentType?: string | null }): boolean =>
+	((a.contentType ?? '').split(';')[0]?.trim().toLowerCase() ?? '') === 'image/gif' || /\.gif$/i.test(a.name ?? '');
+
+export interface DiscordGif {
+	/** O arquivo animado que o bridge ainda precisa baixar; `undefined` quando o anexo da origem já é ele. */
+	media?: DiscordMedia;
+}
+
+/**
+ * O GIF animado que a mensagem do Discord carrega, na forma de arquivo para o bridge baixar.
+ *
+ * O player do Discord (`gifv`/`gif`) re-serviu o GIF como mp4 em loop mais um frame estático,
+ * e o backend do Papo desenha isso como player de vídeo: a animação morre no meio do caminho.
+ * Ordem de preferência: a mídia `image/gif` do embed, e por último a variante `.gif` do mp4 que
+ * o player mostra — Klipy e Giphy servem o mesmo caminho com as duas extensões.
+ * `undefined` quando a mensagem não tem GIF nenhum; `media` ausente quando o anexo da origem
+ * já é o arquivo (não há o que baixar, mas o mp4 do player continua sobrando no card).
+ */
+export function discordGifOf(
+	embeds: readonly APIEmbed[] | undefined,
+	attachments: readonly { name?: string | null; contentType?: string | null }[] = []
+): DiscordGif | undefined {
+	if (attachments.some(isGifAttachment)) return {};
+	for (const e of embeds ?? []) {
+		const payload = e as unknown as DiscordEmbedPayload;
+		const { images, videos } = discordEmbedMedia(payload);
+		const [gif] = images.filter((m) => m.mime === 'image/gif');
+		if (gif) return { media: { ...gif, url: discordMediaSourceUrl(gif) } };
+		if (!isGifPlayerEmbed(payload)) continue;
+		for (const m of [...videos, ...images]) {
+			const variant = gifVariantUrl(m.origin) ?? gifVariantUrl(m.url);
+			if (!variant) continue;
+			// o mp4 que o Discord garante continua sendo a URL do destino: a variante é
+			// tentativa, não substituta
+			return { media: { ...m, url: discordMediaSourceUrl(m), gifVariant: variant } };
+		}
+	}
+	return undefined;
 }
 
 const CONTENT_URL_RE = /https?:\/\/[^\s<>"'`)\]]+/g;

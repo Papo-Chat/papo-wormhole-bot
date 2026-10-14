@@ -716,6 +716,65 @@ describe('preview do Discord que chega depois da mensagem', () => {
 		expect(last.embeds.filter((e) => e.title === 'South America Memes')).toHaveLength(1);
 	});
 
+	it('GIF que chega tarde: o loop mp4 sai do card quando a cópia já tem o arquivo animado', async () => {
+		const { bridge, api, settle } = fixture();
+		const attachments = [{ id: 'att-1', name: 'giphy.gif', url: 'https://cdn.discordapp.com/attachments/111/222/giphy.gif', size: 12, contentType: 'image/gif' }];
+		const player = {
+			type: 'gifv',
+			url: 'https://klipy.com/gifs/algo',
+			title: 'GIF',
+			video: { url: 'https://cdn.discordapp.com/embed/attachments/111/222/giphy-loop.mp4', width: 300, height: 224, content_type: 'video/mp4' },
+			thumbnail: { url: 'https://cdn.discordapp.com/embed/attachments/111/222/giphy-frame.webp', width: 100, height: 75, content_type: 'image/webp' }
+		};
+
+		// a criação já levou o GIF como arquivo; o preview do player chega depois
+		await withFetch(
+			async () => new Response(Buffer.from('GIF89a' + 'gif-do-picker'), { status: 200, headers: { 'content-type': 'image/gif' } }),
+			async () => {
+				await bridge.onDiscordMessage(discordMessage('dm-1', 'gif', { attachments }));
+				await settle();
+			}
+		);
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'gif', { attachments, embeds: [player] }));
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		const preview = last.embeds.at(-1)!;
+		expect(preview.title).toBe('GIF');
+		// o arquivo animado já está na cópia: o loop e o frame parado seriam a mesma mídia outra vez
+		expect(preview.video).toBeUndefined();
+		expect(preview.thumbnail).toBeUndefined();
+	});
+
+	it('GIF que chega tarde sem anexo: o loop é a única mídia que sobra, e o edit não anexa', async () => {
+		const { bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'gif'));
+		await settle();
+		await bridge.onDiscordEdit(
+			{} as never,
+			discordMessage('dm-1', 'gif', {
+				embeds: [
+					{
+						type: 'gifv',
+						url: 'https://klipy.com/gifs/algo',
+						title: 'GIF',
+						video: {
+							url: 'https://static.klipy.com/ii/d7ae/vTXu.mp4',
+							proxy_url: 'https://images-ext-1.discordapp.net/external/P17/https/static.klipy.com/ii/d7ae/vTXu.mp4',
+							width: 300,
+							height: 224
+						}
+					}
+				]
+			})
+		);
+		await settle();
+
+		const preview = api.edits.at(-1)!.embeds.at(-1)!;
+		// o Papo não aceita anexo em `PUT /messages/{id}`: sem o arquivo, o loop continua no card
+		expect(preview.video?.mime_type).toBe('video/mp4');
+	});
+
 	it('preview que chega antes do mapeamento espera a cópia em vez de se perder', async () => {
 		const { store, bridge, api, outbox, settle } = fixture({ bridgeEdits: false });
 
@@ -977,6 +1036,146 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 		);
 
 		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['animado.gif']);
+	});
+
+	it('GIF do Klipy chega como loop mp4 no Discord e vai como GIF no Papo', async () => {
+		const { bridge, api, settle } = fixture();
+		const gifUrl = 'https://static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.gif';
+		const { urls } = await withFetch(
+			async (url) =>
+				url === gifUrl
+					? new Response(Buffer.from('GIF89a' + 'gif-do-klipy'), { status: 200, headers: { 'content-type': 'image/gif' } })
+					: new Response(Buffer.from('loop-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'olha o gif', {
+						embeds: [
+							{
+								type: 'gifv',
+								url: 'https://klipy.com/gifs/orihime-bread-girl',
+								title: 'Orihime: The Bread Bag Girl',
+								thumbnail: {
+									url: 'https://static.klipy.com/ii/d7ae/DT0Dl1xZ.webp',
+									proxy_url: 'https://images-ext-1.discordapp.net/external/CF8k/https/static.klipy.com/ii/d7ae/DT0Dl1xZ.webp',
+									width: 498,
+									height: 498
+								},
+								video: {
+									url: 'https://static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.mp4',
+									proxy_url: 'https://images-ext-1.discordapp.net/external/P17-/https/static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.mp4',
+									width: 640,
+									height: 640
+								}
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		// o player do Discord só expõe o loop mp4: o arquivo animado está no mesmo caminho com
+		// a extensão do GIF, e é ele que o bridge busca
+		expect(urls).toContain(gifUrl);
+		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['d7ae-vTXuDBugGeZn6Djx.gif']);
+		const preview = api.sent[0]!.embeds![1]!;
+		// o card não repete o que o arquivo já mostra: nem loop, nem frame estático
+		expect(preview.video).toBeUndefined();
+		expect(preview.thumbnail).toBeUndefined();
+		expect(preview.title).toBe('Orihime: The Bread Bag Girl');
+	});
+
+	it('variante `.gif` que não devolve um GIF não é o arquivo: o loop continua', async () => {
+		const { bridge, api, settle } = fixture();
+		const gifUrl = 'https://static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.gif';
+		const mp4Url = 'https://images-ext-1.discordapp.net/external/P17-/https/static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.mp4';
+		const { urls } = await withFetch(
+			async (url) =>
+				url === gifUrl
+					? new Response(Buffer.from('<html>player</html>'), { status: 200, headers: { 'content-type': 'text/html' } })
+					: new Response(Buffer.from('ftypisomloop-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'olha o gif', {
+						embeds: [
+							{
+								type: 'gifv',
+								url: 'https://klipy.com/gifs/orihime',
+								title: 'Orihime',
+								video: {
+									url: 'https://static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.mp4',
+									proxy_url: mp4Url,
+									width: 640,
+									height: 640
+								}
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		// uma URL terminada em `.gif` que devolve outra coisa é o player respondendo no lugar do
+		// arquivo: o destino receberia mídia com nome errado
+		expect(urls).toEqual([gifUrl, mp4Url]);
+		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['d7ae-vTXuDBugGeZn6Djx.mp4']);
+	});
+
+	it('o loop mp4 do player não vira um segundo anexo junto com o GIF do picker', async () => {
+		const { bridge, api, settle } = fixture();
+		await withFetch(
+			async () => new Response(Buffer.from('GIF89a' + 'gif-do-picker'), { status: 200, headers: { 'content-type': 'image/gif' } }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'gif', {
+						attachments: [{ id: 'att-1', name: 'giphy.gif', url: 'https://cdn.discordapp.com/attachments/111/222/giphy.gif', size: 12, contentType: 'image/gif' }],
+						embeds: [
+							{
+								type: 'gifv',
+								url: 'https://klipy.com/gifs/algo',
+								title: 'GIF',
+								image: { url: 'https://media.discordapp.net/attachments/111/222/giphy.gif', width: 300, height: 224, content_type: 'image/gif' },
+								video: { url: 'https://cdn.discordapp.com/embed/attachments/111/222/giphy-loop.mp4', width: 300, height: 224, content_type: 'video/mp4' },
+								thumbnail: { url: 'https://cdn.discordapp.com/embed/attachments/111/222/giphy-frame.webp', width: 100, height: 75, content_type: 'image/webp' }
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		// o GIF da mensagem é um só: o mp4 em loop e o frame estático são re-encode dele
+		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['giphy.gif']);
+		expect(api.sent[0]!.embeds).toHaveLength(1);
+	});
+
+	it('com anexos desligados o GIF continua como loop no card: não há para onde anexar', async () => {
+		const { store, bridge, api, link, settle } = fixture();
+		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
+		await bridge.onDiscordMessage(
+			discordMessage('dm-1', 'olha o gif', {
+				embeds: [
+					{
+						type: 'gifv',
+						url: 'https://klipy.com/gifs/orihime',
+						title: 'Orihime',
+						video: {
+							url: 'https://static.klipy.com/ii/d7ae/vTXu.mp4',
+							proxy_url: 'https://images-ext-1.discordapp.net/external/P17/https/static.klipy.com/ii/d7ae/vTXu.mp4',
+							width: 640,
+							height: 640
+						}
+					}
+				]
+			})
+		);
+		await settle();
+
+		const sent = api.sent[0]!;
+		expect(sent.attachments ?? []).toHaveLength(0);
+		expect(sent.embeds![1]!.video?.mime_type).toBe('video/mp4');
 	});
 
 	it('com anexos desligados o preview continua com a URL (não há para onde re-hospedar)', async () => {
