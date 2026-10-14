@@ -8,7 +8,7 @@ sentidos, preservando autoria (nome + avatar + data) e ordem de conversa.
 
 | Recurso | Papo → Discord | Discord → Papo |
 | --- | --- | --- |
-| Texto (markdown) | embed com autor/avatar/data | `content` + embed de autoria |
+| Texto (markdown) | embed com autor/avatar/data | com webhook: mensagem nativa com autor externo; sem webhook: card legado |
 | Anexos | reenviados; compactados ou particionados se não cabem | idem |
 | Previews de link | embeds do Papo → embeds do Discord | embeds do Discord → embeds do Papo |
 | Emojis custom | `:nome:` ↔ `<:nome:id>`; sem o nome no guild, usa ou cria um emoji da aplicação | idem |
@@ -25,8 +25,10 @@ arquivos grandes são compactados (`gzip`/`tar.gz`) ou particionados.
 ## Requisitos
 
 - Node.js **≥ 22.13** (usa `node:sqlite` embutido, sem flag — nenhuma dependência nativa).
-- Um usuário comum do Papo para o bot (o Papo não tem contas "bot"): o bot é autor de tudo
-  que envia ao Papo, e a identidade real viaja no embed.
+- Um usuário do Papo continua necessário para ler canais, acompanhar WS e sincronizar
+  Papo → Discord. Para Discord → Papo, é recomendado criar um **webhook de entrada
+  por canal**. O webhook é o autor autenticado e a pessoa do Discord aparece
+  como identidade externa, sem fingir ser uma conta do Papo.
 - Um bot do Discord com **Message Content intent** habilitado no Developer Portal
   (privilegiado; sem ele o conteúdo das mensagens não chega) e **Server Members intent**
   (necessário para resolver `@nome` do Papo em membros do guild; sem ele a resolução por
@@ -43,6 +45,35 @@ npm run build && npm start
 # ou, em desenvolvimento:
 npm run dev
 ```
+
+### Webhooks de entrada no Papo (recomendado)
+
+O administrador do servidor (ou usuário com `manage_channels`) cria uma credencial por
+canal de destino. Exemplo de criação usando uma sessão Papo autenticada:
+
+```http
+POST /webhooks
+Content-Type: application/json
+Cookie: Auth=<sessão de administrador>
+
+{"channel_id":"UUID-DO-CANAL","name":"Wormhole"}
+```
+
+A resposta contém o `id` do webhook e um `token` secreto que **só é entregue
+na criação**. Configure no `.env` (não versionado) a variável
+`PAPO_WEBHOOKS_JSON` com um objeto indexado pelo UUID de cada canal de destino,
+conforme o exemplo em `.env.example`.
+
+Com webhook configurado, o bridge envia `content`, `external_author` e
+`external_message_id` via `POST /webhooks/:id/messages`, usando `Authorization:
+Bearer <token>`. A mesma credencial pode editar e excluir somente mensagens
+enviadas por ela. O ID externo é estável por mensagem/chunk para impedir
+duplicações em retries depois de timeout.
+
+Sem credenciais para um canal, o bridge continua usando o envio legado com
+embed e a conta-bot. **Instale o backend com suporte a webhooks antes de
+configurar esta opção.** O segredo concede escrita no canal até sua revogação;
+trate-o como uma senha.
 
 ### Permissões do bot no Discord
 
