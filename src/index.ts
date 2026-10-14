@@ -50,6 +50,9 @@ async function main(): Promise<void> {
 			onReactionRemove: (messageId, channelId, name, id, count) =>
 				void bridge.onDiscordReaction(messageId, channelId, name, id, false, false, count).catch((err) => log.error({ err }, 'reaction remove')),
 			onPresence: (_guild, userId, status) => bridge.onDiscordPresence(userId, status),
+			onThreadCreate: (threadId, parentId, name) =>
+				void bridge.onDiscordThreadCreate(threadId, parentId, name).catch((err) => log.error({ err }, 'thread create falhou')),
+			onThreadUpdate: (threadId, parentId, name, archived) => bridge.onDiscordThreadUpdate(threadId, parentId, name, archived),
 			onReady: async () => {
 				try {
 					const guild = cfg.discord.guildId

@@ -76,6 +76,9 @@ CREATE TABLE IF NOT EXISTS message_map (
   -- embed extra de preview de link aplicado à cópia (JSON array). Guardado porque todo
   -- re-render do cartão (resumo de reações, edição) precisa reenviá-lo junto.
   link_embeds        TEXT,
+  -- nota de reply da cópia de webhook (`*Respondendo:[link]*`): webhook não responde mensagem,
+  -- e toda re-escrita do content precisa reescrever a nota junto.
+  reply_note         TEXT,
   -- revisão (timestamp ISO da origem) da última edição aplicada à cópia: impede que uma
   -- edição mais antiga, enfileirada depois, sobrescreva a mais recente
   edit_revision      TEXT,

@@ -3,6 +3,8 @@ import {
 	GatewayIntentBits,
 	Partials,
 	TextChannel,
+	NewsChannel,
+	ThreadChannel,
 	Webhook,
 	AttachmentBuilder,
 	type APIEmbed,
@@ -53,6 +55,13 @@ export interface DiscordHandlers {
 		count: number
 	) => void;
 	onPresence?: (guildId: string, userId: string, status: string) => void;
+	/**
+	 * Thread criada no servidor. O bot só recebe as mensagens de uma thread da qual é
+	 * membro — é aqui que o bridge entra numa thread recém-criada que já está linkada.
+	 */
+	onThreadCreate?: (threadId: string, parentId: string, name: string) => void;
+	/** Thread arquivada: ela para de receber mensagens e a ponte deixa de ter para onde ir. */
+	onThreadUpdate?: (threadId: string, parentId: string, name: string, archived: boolean) => void;
 	onReady?: (userId: string) => void;
 }
 
@@ -108,6 +117,8 @@ export class DiscordBridge {
 	 */
 	private webhooks = new Map<string, Webhook>();
 	private webhookById = new Map<string, Webhook>();
+	/** Canal linkado → canal dono do webhook (thread usa o canal pai). */
+	private webhookHostOf = new Map<string, string>();
 	/** Falha de criação por canal (limite de webhooks, sem Manage Webhooks): re-tenta após o TTL. */
 	private webhookFailedAt = new Map<string, number>();
 	private static readonly WEBHOOK_RETRY_MS = 10 * 60_000;
@@ -160,6 +171,12 @@ export class DiscordBridge {
 			if (!newPresence.userId || newPresence.userId === this.client.user?.id) return;
 			opts.handlers.onPresence?.(newPresence.guild?.id ?? '', newPresence.userId, newPresence.status ?? 'offline');
 		});
+		this.client.on('threadCreate', (thread) =>
+			opts.handlers.onThreadCreate?.(thread.id, thread.parentId ?? '', thread.name)
+		);
+		this.client.on('threadUpdate', (_oldThread, thread) =>
+			opts.handlers.onThreadUpdate?.(thread.id, thread.parentId ?? '', thread.name, Boolean(thread.archived))
+		);
 	}
 
 	private async handleReaction(
@@ -207,12 +224,73 @@ export class DiscordBridge {
 	}
 
 	/**
-	 * Canal de texto utilizável. `channels.fetch` pode devolver `PartialGroupDMChannel`,
-	 * que não tem `messages` nem `send` — usar direto estoura em TypeError.
+	 * Canal utilizável para envio/leitura: canal de texto **ou thread**. `channels.fetch` pode
+	 * devolver `PartialGroupDMChannel`, que não tem `messages` nem `send` — usar direto estoura
+	 * em TypeError.
 	 */
-	private async textChannel(channelId: string): Promise<TextChannel | null> {
+	private async textChannel(channelId: string): Promise<TextChannel | NewsChannel | ThreadChannel | null> {
 		const channel = await this.client.channels.fetch(channelId).catch(() => null);
-		return channel instanceof TextChannel ? channel : null;
+		return channel instanceof TextChannel || channel instanceof NewsChannel || channel instanceof ThreadChannel
+			? channel
+			: null;
+	}
+
+	/** O canal linkado é uma thread? */
+	isThread(channelId: string): boolean {
+		return this.client.channels.cache.get(channelId) instanceof ThreadChannel;
+	}
+
+	/** Threads cujo acesso já foi garantido neste processo (join é REST: não se repete). */
+	private threadsJoined = new Set<string>();
+
+	/**
+	 * Garante que o bot é membro da thread linkada: o Discord só entrega as mensagens de uma
+	 * thread a quem é membro dela. Pública é automático; privada e anunciada precisam do
+	 * join. `undefined` quando o canal não é thread (nada a garantir), `false` quando o
+	 * Discord recusa (arquivada, sem permissão) — a ponte continua, só não recebe o que não chega.
+	 */
+	async ensureThreadMembership(channelId: string): Promise<boolean | undefined> {
+		if (this.threadsJoined.has(channelId)) return true;
+		const channel = await this.textChannel(channelId);
+		if (!(channel instanceof ThreadChannel)) return undefined;
+		try {
+			await channel.join();
+			this.threadsJoined.add(channelId);
+			return true;
+		} catch (err) {
+			this.log.debug({ err, channelId }, 'não foi possível entrar na thread');
+			return false;
+		}
+	}
+
+	/**
+	 * Link permanente de uma mensagem no Discord. Webhook não responde mensagem (limitação da
+	 * API), então a referência de um reply precisa chegar como link no texto.
+	 */
+	messageLink(channelId: string, messageId: string): string | undefined {
+		const channel = this.client.channels.cache.get(channelId);
+		const guildId = channel && 'guildId' in channel ? channel.guildId : this.firstGuild?.id;
+		if (!guildId) return undefined;
+		return `https://discord.com/channels/${guildId}/${channelId}/${messageId}`;
+	}
+
+	/**
+	 * Canal dono dos webhooks: thread não tem webhook próprio — o webhook é do canal pai e a
+	 * mensagem entra na thread pelo `thread_id`.
+	 */
+	private webhookHostId(channelId: string): string {
+		const channel = this.client.channels.cache.get(channelId);
+		return channel instanceof ThreadChannel ? channel.parentId ?? channelId : channelId;
+	}
+
+	/** Canal onde o webhook do bridge é criado/fetchado (o pai, quando o canal é uma thread). */
+	private async webhookHostChannel(channelId: string): Promise<TextChannel | NewsChannel | null> {
+		const channel = await this.textChannel(channelId);
+		if (!channel) return null;
+		if (!(channel instanceof ThreadChannel)) return channel;
+		if (!channel.parentId) return null;
+		const parent = await this.client.channels.fetch(channel.parentId).catch(() => null);
+		return parent instanceof TextChannel || parent instanceof NewsChannel ? parent : null;
 	}
 
 	async send(channelId: string, options: SendOptions): Promise<Message> {
@@ -234,33 +312,34 @@ export class DiscordBridge {
 		channelId: string,
 		identity: { userId: string; displayName: string; username: string; avatarSha?: string; avatarBuffer?: Buffer }
 	): Promise<Webhook | null> {
-		const key = `${channelId}:${identity.userId}`;
 		const name = bridgeWebhookName(identity.displayName, identity.username);
+		const host = await this.webhookHostChannel(channelId);
+		if (!host) return null;
+		this.webhookHostOf.set(channelId, host.id);
+		const key = `${host.id}:${identity.userId}`;
 		const cached = this.webhooks.get(key);
 		if (cached) {
 			await this.applyWebhookIdentity(cached, name, identity);
 			return cached;
 		}
-		const failedAt = this.webhookFailedAt.get(channelId);
+		const failedAt = this.webhookFailedAt.get(host.id);
 		if (failedAt && Date.now() - failedAt < DiscordBridge.WEBHOOK_RETRY_MS) return null;
-		const channel = await this.textChannel(channelId);
-		if (!channel) return null;
 		try {
-			const row = this.opts.store?.getBridgeWebhookByUser(channelId, identity.userId);
-			const hooks = await channel.fetchWebhooks();
+			const row = this.opts.store?.getBridgeWebhookByUser(host.id, identity.userId);
+			const hooks = await host.fetchWebhooks();
 			let webhook = row ? hooks.find((w) => w.id === row.webhook_id) : undefined;
 			if (!webhook) webhook = hooks.find((w) => w.name === name);
 			if (!webhook) {
 				try {
-					webhook = await channel.createWebhook({
+					webhook = await host.createWebhook({
 						name,
 						...(identity.avatarBuffer ? { avatar: identity.avatarBuffer } : {}),
 						reason: 'papo bridge'
 					});
 				} catch (err) {
 					// limite de webhooks do canal ou sem Manage Webhooks: re-tenta após o TTL
-					this.webhookFailedAt.set(channelId, Date.now());
-					this.log.debug({ err, channelId }, 'webhook do usuário indisponível: envio pelo cartão do bot');
+					this.webhookFailedAt.set(host.id, Date.now());
+					this.log.debug({ err, channelId: host.id }, 'webhook do usuário indisponível: envio pelo cartão do bot');
 					return null;
 				}
 			}
@@ -311,7 +390,7 @@ export class DiscordBridge {
 	private async webhookObject(channelId: string, webhookId: string): Promise<Webhook | null> {
 		const hit = this.webhookById.get(webhookId);
 		if (hit) return hit;
-		const channel = await this.textChannel(channelId);
+		const channel = await this.webhookHostChannel(channelId);
 		if (!channel) return null;
 		const hooks = await channel.fetchWebhooks().catch(() => null);
 		const webhook = hooks?.find((w) => w.id === webhookId) ?? null;
@@ -321,14 +400,17 @@ export class DiscordBridge {
 
 	/**
 	 * O webhook observado é do bridge? A linha em `bridge_webhooks` é o registro de
-	 * posse: sem chute por nome, webhook de terceiros nunca é tratado como eco.
+	 * posse: sem chute por nome, webhook de terceiros nunca é tratado como eco. A mensagem
+	 * pode estar numa thread — o webhook que a enviou é do canal pai.
 	 */
 	async isBridgeWebhook(channelId: string, webhookId: string): Promise<boolean> {
 		if (this.webhookById.has(webhookId)) return true;
 		const row = this.opts.store?.getBridgeWebhookById(webhookId);
-		if (!row || row.channel_id !== channelId) return false;
-		await this.webhookObject(channelId, webhookId);
-		return true;
+		if (!row) return false;
+		// mensagem em thread: o webhook que a enviou é do canal pai. Canal conhecido rejeita na
+		// hora; canal parcial (não está na cache) é conferido pelo fetch do webhook
+		if (this.client.channels.cache.has(channelId) && this.webhookHostId(channelId) !== row.channel_id) return false;
+		return Boolean(await this.webhookObject(channelId, webhookId));
 	}
 
 	/**
@@ -346,8 +428,8 @@ export class DiscordBridge {
 	 * Envio pelo webhook do usuário: a identidade já está no webhook, então a mensagem
 	 * sai sem override de nick/avatar e agrupa como usuário comum. Cartão e previews vão
 	 * como embeds na mesma call. `null` quando não há webhook para o par (canal, usuário)
-	 * — o chamador cai para o envio normal. Webhook não responde a mensagens, então a
-	 * thread de reply/continuação se perde nesse caminho (limitação do Discord).
+	 * — o chamador cai para o envio normal. Webhook não responde a mensagens (limitação do
+	 * Discord), então a referência de um reply chega como link no `content`.
 	 */
 	async sendAsWebhook(
 		channelId: string,
@@ -358,14 +440,18 @@ export class DiscordBridge {
 			files?: { name: string; buffer: Buffer }[];
 		}
 	): Promise<Message | null> {
-		const key = `${channelId}:${userId}`;
+		const hostId = this.webhookHostOf.get(channelId) ?? this.webhookHostId(channelId);
+		const key = `${hostId}:${userId}`;
 		const webhook = this.webhooks.get(key);
 		if (!webhook) return null;
+		// o webhook é do canal pai; a mensagem entra na thread pelo `thread_id`
+		const threadId = hostId === channelId ? undefined : channelId;
 		try {
 			return await webhook.send({
 				...(options.content ? { content: options.content } : {}),
 				...(options.embeds?.length ? { embeds: options.embeds } : {}),
 				...(options.files?.length ? { files: options.files.map((f) => new AttachmentBuilder(f.buffer, { name: f.name })) } : {}),
+				...(threadId ? { threadId } : {}),
 				allowedMentions: { parse: [] }
 			});
 		} catch (err) {
@@ -405,8 +491,9 @@ export class DiscordBridge {
 		const messages = await channel.messages.fetch({ limit: Math.min(100, Math.max(1, limit)) }).catch(() => null);
 		if (!messages) return [];
 		// cópias enviadas pelo webhook do bridge têm author = webhook (não o bot): a
-		// reconciliação também precisa enxergá-las
-		const webhookIds = new Set(this.opts.store?.listBridgeWebhookIds(channelId) ?? []);
+		// reconciliação também precisa enxergá-las. Numa thread, os webhooks registrados são
+		// os do canal pai.
+		const webhookIds = new Set(this.opts.store?.listBridgeWebhookIds(this.webhookHostId(channelId)) ?? []);
 		return messages
 			.filter((m) => m.author.id === authorId || (m.webhookId !== null && webhookIds.has(m.webhookId)))
 			.map((m) => ({
@@ -447,7 +534,8 @@ export class DiscordBridge {
 		if (webhookId) {
 			const webhook = await this.webhookObject(channelId, webhookId);
 			if (webhook) {
-				await webhook.editMessage(messageId, payload);
+				const threadId = message.channel instanceof ThreadChannel ? message.channelId : undefined;
+				await webhook.editMessage(messageId, { ...payload, ...(threadId ? { threadId } : {}) });
 				return;
 			}
 		}
@@ -462,7 +550,8 @@ export class DiscordBridge {
 		if (webhookId) {
 			const webhook = await this.webhookObject(channelId, webhookId);
 			if (webhook) {
-				await webhook.deleteMessage(messageId);
+				const threadId = message.channel instanceof ThreadChannel ? message.channelId : undefined;
+				await webhook.deleteMessage(messageId, threadId);
 				return;
 			}
 		}

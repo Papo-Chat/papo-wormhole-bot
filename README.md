@@ -46,8 +46,10 @@ npm run dev
 
 ### Permissões do bot no Discord
 
-`View Channels`, `Send Messages`, `Manage Messages` (edição/deleção/reações/pins) e
-`Manage Channels` para os comandos de configuração. Se quiser usar emojis do guild no lado
+`View Channels`, `Send Messages`, `Send Messages in Threads`, `Manage Messages` (edição/deleção/
+reações/pins) e `Manage Channels` para os comandos de configuração. Thread privada ou anunciada
+só entrega mensagens a quem é membro: `Manage Threads` é o que permite ao bridge entrar nela
+(thread pública não exige nada). Se quiser usar emojis do guild no lado
 Discord, `Manage Emojis` ajuda, mas não é obrigatório: o fallback do bridge é o emoji da
 aplicação, criado pela API do próprio app (`POST /applications/{id}/emojis`) — não precisa de
 permissão nenhuma no servidor.
@@ -62,7 +64,7 @@ para o shortcode `:nome:` literal.
 
 ```
 /help                instruções
-/link-channel        papo_channel:<nome ou uuid>  discord_channel:#canal
+/link-channel        papo_channel:<nome ou uuid>  discord_channel:#canal | 🧵thread
 /unlink-channel      discord_channel:#canal
 /link-server         papo_server:<nome ou uuid>
 /link-user           papo_user:<nome ou uuid>  discord_user:@alguém
@@ -117,8 +119,9 @@ Papo REST/WS ──► Bridge (tradução, chunking, embeds) ──► SQLite ou
   Discord. O webhook é criado sob demanda e reaproveitado entre runs pela tabela
   `bridge_webhooks` (registro de posse, que também identifica o eco sem chute por nome). Sem
   webhook (limite de webhooks do canal, bot sem *Manage Webhooks*) o envio continua pelo cartão
-  do bot. Webhook não responde mensagens: a thread de reply se perde nesse caminho.
-  Edição/apagamento da cópia usam o token do webhook quando a mensagem é de webhook.
+  do bot. Webhook não responde mensagens: a referência do reply chega como
+  `*Respondendo:[link da mensagem]*` no topo do `content`. Edição/apagamento da cópia usam o
+  token do webhook quando a mensagem é de webhook.
 
 ## Mapeamento de identidade
 
@@ -243,7 +246,15 @@ trabalho (commite ou `git stash` antes).
   com 401 `server-access-required` sem o token temporário (30 min) que `POST /auth/login_server`
   coloca no cookie `Auth`. Configure `PAPO_SERVER_PASSWORD` — é a senha do servidor, não a senha da
   conta do bot. `npm run check-auth` confirma o fluxo de sessão antes de subir.
-- Threads do Discord não são bridgeadas na v1.
+- Mídia hospedada pelo Discord (`cdn.discordapp.com`, `media.discordapp.net`) nunca vira embed no
+  Papo: a URL expira junto com a mensagem original e o hotlink é bloqueado. O bridge baixa o
+  arquivo e re-envia como anexo da mensagem — vale para a mídia do embed/preview e para o link de
+  arquivo colado no texto (o texto não é alterado: o link continua lá, e o arquivo chega junto).
+  Com `attachments` desligado não há para onde re-hospedar, e o preview continua com a URL.
+- Thread do Discord é linkável a um canal do Papo (`/link-channel`), que é o que a thread vira do
+  outro lado: o Papo não tem thread. O bridge entra na thread (o Discord só entrega mensagens de
+  uma thread a quem é membro) e as cópias entram nela; webhook de thread é o do canal pai, com a
+  mensagem enviada pelo `thread_id`. Thread arquivada é registrada na auditoria.
 
 Detalhes completos do design (incluindo o algoritmo de chunking e o esquema SQLite) estão em
 [`BOT.md`](./BOT.md).

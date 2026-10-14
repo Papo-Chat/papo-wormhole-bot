@@ -123,6 +123,17 @@ export interface DiscordMedia {
 	height?: number;
 }
 
+/**
+ * URL de onde baixar a mídia que o Discord hospeda: o CDN é a forma canônica
+ * (`media.discordapp.net` é só o proxy do mesmo arquivo).
+ */
+export const discordMediaSourceUrl = (media: DiscordMedia): string =>
+	isDiscordMediaUrl(media.origin) ? media.origin! : media.url;
+
+/** Mídia servida pelo Discord (na URL escolhida ou na origem): volátil, não pode virar embed no Papo. */
+export const isDiscordHostedMedia = (media: DiscordMedia): boolean =>
+	isDiscordMediaUrl(media.url) || isDiscordMediaUrl(media.origin);
+
 const areaOf = (m: DiscordMedia): number => (m.width ?? 0) * (m.height ?? 0);
 
 /**
@@ -263,11 +274,51 @@ const componentColor = (embed: DiscordEmbedPayload): string | undefined => {
 	return accent === undefined ? undefined : intToHex(accent);
 };
 
+/**
+ * Hosts onde o Discord hospeda a própria mídia: anexo, embed e emoji sobem para cá.
+ * A URL é volátil — some quando a mensagem original é apagada, e o hotlink é bloqueado
+ * para quem tenta re-servir fora do Discord.
+ */
+const DISCORD_MEDIA_HOSTS = new Set([
+	'cdn.discordapp.com',
+	'media.discordapp.net',
+	'cdn.discordapp.net',
+	'media.discordapp.com'
+]);
+
+/** Caminhos do CDN que são arquivo de mensagem (avatar/banner são imagem de identidade, não mídia). */
+const DISCORD_MEDIA_PATH = /^\/(embed\/)?(attachments|embeds|emojis|stickers)\//i;
+
+/**
+ * URL de arquivo hospedado pelo Discord (`/attachments/…`, `/embeds/…`). O proxy de terceiros
+ * (`images-ext-N.discordapp.net/external/…`) fica fora de propósito: ele re-serva conteúdo
+ * de fora, não a mídia que o Discord hospeda.
+ */
+export function isDiscordMediaUrl(url?: string | null): boolean {
+	const host = hostOf(url);
+	if (!host || !DISCORD_MEDIA_HOSTS.has(host.toLowerCase())) return false;
+	try {
+		return DISCORD_MEDIA_PATH.test(new URL(url!).pathname);
+	} catch {
+		return false;
+	}
+}
+
 /** Host legível, sem o `www.` que os dois lados mostram como ruído. */
 const siteNameOf = (url?: string | null): string | undefined => hostOf(url)?.replace(/^www\./, '');
 
+/** Opções da conversão Discord → Papo. */
+export interface DiscordToPapoOptions {
+	/**
+	 * Mídia hospedada pelo Discord (`cdn.discordapp.com` / `media.discordapp.net`) sai do embed:
+	 * a URL expira com a mensagem original e o backend do Papo não consegue re-servi-la depois.
+	 * Quem re-hospeda é o bridge (`discordHostedMedia`), e o destino da mídia vira anexo.
+	 */
+	rehostDiscordMedia?: boolean;
+}
+
 /** Embed do Discord → EmbedInput do Papo. */
-export function discordEmbedsToPapo(embeds: DiscordEmbedPayload[]): PapoEmbedInput[] {
+export function discordEmbedsToPapo(embeds: DiscordEmbedPayload[], opts: DiscordToPapoOptions = {}): PapoEmbedInput[] {
 	const out: PapoEmbedInput[] = [];
 	for (const e of embeds.slice(0, PAPO_LIMITS.embedsPerMessage)) {
 		const input: PapoEmbedInput = {};
@@ -290,7 +341,13 @@ export function discordEmbedsToPapo(embeds: DiscordEmbedPayload[]): PapoEmbedInp
 		if (e.footer?.text) input.footer = { text: clampText(e.footer.text, PAPO_LIMITS.embedFooterMax) };
 		const host = siteNameOf(e.url);
 		if (host) input.site_name = clampText(host, 128);
-		const { images, videos } = discordEmbedMedia(e);
+		let { images, videos } = discordEmbedMedia(e);
+		if (opts.rehostDiscordMedia) {
+			// mídia que o Discord hospeda é volátil: o bridge baixa e reenvia como anexo, e o
+			// card fica com o texto/URL da página em vez de uma imagem que quebra
+			images = images.filter((m) => !isDiscordHostedMedia(m));
+			videos = videos.filter((m) => !isDiscordHostedMedia(m));
+		}
 		// O Papo renderiza a imagem da thumbnail; a imagem principal vira thumbnail quando é a única.
 		// Só os formatos que o backend decodifica: um avif seria baixado e descartado (o preview
 		// chegaria sem imagem), e um vídeo fora da allowlist faz o backend recusar a mensagem inteira.

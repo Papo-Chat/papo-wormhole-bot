@@ -45,11 +45,13 @@ import {
 	buildDiscordBridgeEmbed,
 	buildPapoBridgeEmbed,
 	discordApiEmbed,
+	discordMediaSourceUrl,
 	fitEmbedBudget,
 	mediaAttachmentName,
 	mimeFromUrl,
 	shaFromAttachmentRef,
 	type DiscordEmbedPayload,
+	type DiscordMedia,
 	type PreviewMedia
 } from './embeds.js';
 import { prepareAttachments, sanitizeName, type SourceAttachment } from './attachments.js';
@@ -59,7 +61,15 @@ import { EmojiBridge, type ApplicationEmojiResolver, type GuildEmojiResolver } f
 import type { MediaStore } from './media.js';
 import { PapoIdentity } from './identity.js';
 import { copySignatures, signedFooter } from './signature.js';
-import { firstDiscordPreview, firstPapoPreview, giphyEmbed, rawDiscordEmbeds } from './previews.js';
+import {
+	discordHostedMedia,
+	discordMediaLinksInContent,
+	firstDiscordPreview,
+	firstPapoPreview,
+	giphyEmbed,
+	mediaKey,
+	rawDiscordEmbeds
+} from './previews.js';
 import { GiphyResolver, giphyId } from './giphy.js';
 import { EXTRA_CHUNK_BASE, type BridgeJob, type DeleteJob, type EditJob, type PinJob, type ReactionJob, type SourceRef, type ToDiscordMessageJob, type ToPapoMessageJob } from './jobs.js';
 import { createHash } from 'node:crypto';
@@ -94,6 +104,13 @@ const EDIT_MARK = '✏️ editado · ';
 
 /** Selo da linha de reações no `description` (footer de embed não renderiza emoji custom). */
 const REACTION_MARK = '↳ ';
+
+/**
+ * Nota de reply da cópia de webhook. Webhook não responde mensagem (limitação da API do
+ * Discord), então a referência chega como link no topo do `content` — o link é o que o leitor
+ * do Discord usa para abrir a mensagem respondida.
+ */
+const replyNoteFor = (link?: string | null): string => (link ? `*Respondendo:[${link}]*` : '');
 
 /** Buscas no Discord por menção que o payload não trouxe, por mensagem. */
 const MENTION_LOOKUP_LIMIT = 10;
@@ -181,6 +198,8 @@ export class Bridge {
 	private readonly rerun = new Set<number>();
 	/** Encerramento: para a ingestão e deixa só os jobs em voo terminarem. */
 	private stopping = false;
+	/** Links cuja participação em thread já foi conferida neste processo (join é REST). */
+	private readonly threadsChecked = new Set<number>();
 	/** Refresh de resumo de reações, agrupado por mensagem de origem. */
 	private readonly footerTimers = new Map<
 		string,
@@ -246,6 +265,23 @@ export class Bridge {
 		const tombstones = this.store.pruneTombstones(24 * 3600);
 		if (tombstones) this.log.debug({ tombstones }, 'tombstones de exclusão expirados');
 		for (const link of this.store.listChannelLinks()) this.scheduleLink(link.id);
+		await this.syncThreads();
+	}
+
+	/**
+	 * Thread linkada: o Discord só entrega as mensagens de uma thread a quem é membro dela.
+	 * Cada link é conferido uma vez por processo (join é chamada REST).
+	 */
+	private async syncThreads(): Promise<void> {
+		for (const link of this.store.listChannelLinks()) {
+			if (this.threadsChecked.has(link.id)) continue;
+			this.threadsChecked.add(link.id);
+			// melhor esforço: o drain não pode parar por causa de thread
+			const joined = await this.discord.ensureThreadMembership?.(link.discord_channel_id);
+			if (joined === undefined) continue;
+			if (joined) this.log.info({ linkId: link.id, thread: link.discord_channel_id }, 'bridge entrou na thread linkada');
+			else this.log.warn({ linkId: link.id, thread: link.discord_channel_id }, 'thread linkada sem acesso: mensagens não chegam');
+		}
 	}
 
 	private async backfill(): Promise<void> {
@@ -1039,6 +1075,31 @@ export class Bridge {
 	// ── eventos Discord ────────────────────────────────────
 
 	/**
+	 * Thread criada no servidor. Se ela já está linkada a um canal do Papo, o bridge entra
+	 * nela: sem ser membro, o Discord não entrega as mensagens e a ponte fica muda.
+	 */
+	async onDiscordThreadCreate(threadId: string, parentId: string, name: string): Promise<void> {
+		if (this.stopping) return;
+		const link = this.linkForDiscordChannel(threadId);
+		if (!link) return;
+		const joined = await this.discord.ensureThreadMembership(threadId);
+		if (joined) this.log.info({ linkId: link.id, threadId, parentId, name }, 'thread linkada: bridge entrou na thread');
+		else this.log.warn({ linkId: link.id, threadId, parentId, name }, 'thread linkada sem acesso: mensagens não chegam');
+	}
+
+	/**
+	 * Thread arquivada para de receber mensagens: a cópia no Papo continua existindo, mas nada
+	 * mais chega. Registrar ajuda a explicar o silêncio.
+	 */
+	onDiscordThreadUpdate(threadId: string, parentId: string, name: string, archived: boolean): void {
+		if (!archived) return;
+		const link = this.linkForDiscordChannel(threadId);
+		if (!link) return;
+		this.store.audit('warn', 'thread-linkada-arquivada', { linkId: link.id, threadId, parentId, name });
+		this.log.warn({ linkId: link.id, threadId, name }, 'thread linkada arquivada: a ponte para de receber mensagens');
+	}
+
+	/**
 	 * Mencionados entram no cache de usuários Discord antes de traduzir. Sem rótulo a menção
 	 * atravessaria como snowflake (`<@206…>`), que o Papo não sabe renderizar — e o mencionado
 	 * costuma não estar no cache porque nunca autorou uma mensagem ponte. O payload do Discord
@@ -1091,7 +1152,6 @@ export class Bridge {
 	async onDiscordMessage(m: DiscordMessage): Promise<void> {
 		if (this.stopping) return;
 		if (await this.isSelfDiscordMessage(m)) return; // anti-loop
-		if (m.channel.isThread()) return; // v1: threads fora do escopo
 		const link = this.linkForDiscordChannel(m.channelId);
 		if (!link) return;
 		if (this.store.findMapByDiscord(m.id).length) return;
@@ -1108,7 +1168,8 @@ export class Bridge {
 
 		const content = discordToPapoContent(m.content ?? '', this.resolvers(link));
 		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
-		const sources: SourceRef[] = link.bridge_attachments
+		const bridgeFiles = Boolean(link.bridge_attachments);
+		const sources: SourceRef[] = bridgeFiles
 			? m.attachments.map((a) => ({
 					side: 'discord',
 					id: a.id,
@@ -1118,23 +1179,46 @@ export class Bridge {
 					url: a.url
 				}))
 			: [];
+		const rawEmbeds = rawDiscordEmbeds(m.embeds as APIEmbed[]);
+		const attachmentUrls = m.attachments.map((a) => a.url);
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
 		const preview = link.bridge_embeds
-			? firstDiscordPreview(rawDiscordEmbeds(m.embeds as APIEmbed[]), m.attachments.map((a) => a.url))
+			? firstDiscordPreview(rawEmbeds, attachmentUrls, { rehostDiscordMedia: bridgeFiles })
 			: undefined;
+		// mídia que o Discord hospeda (`cdn.discordapp.com`, `media.discordapp.net`) é volátil:
+		// expira junto com a mensagem original e o hotlink é bloqueado. Ela vira anexo baixado
+		// e re-enviado, nunca URL dentro de embed.
+		const hosted = new Set(attachmentUrls.map(mediaKey).filter(Boolean) as string[]);
+		if (bridgeFiles && link.bridge_embeds) {
+			this.addDiscordMediaSources(m.id, discordHostedMedia(rawEmbeds), sources, hosted);
+		}
+		if (bridgeFiles) {
+			// link colado no texto: quem manda `https://cdn.discordapp.com/attachments/…` quer a
+			// mídia, e o backend do Papo não consegue re-servir essa URL depois
+			this.addDiscordMediaSources(
+				m.id,
+				discordMediaLinksInContent(m.content).map((url) => ({ url, mime: mimeFromUrl(url) })),
+				sources,
+				hosted
+			);
+		}
 		// GIF de preview: o Papo re-encode a imagem do embed como thumbnail estática, então
 		// animação só sobrevive como arquivo da mensagem.
 		const previewGif = preview && !preview.video && preview.thumbnail?.mime_type === 'image/gif' ? preview.thumbnail.url : undefined;
-		if (preview && previewGif && link.bridge_attachments) {
-			sources.push({
-				side: 'discord',
-				id: `${m.id}:preview`,
-				name: this.previewFileName(previewGif, 'preview.gif'),
-				mime: 'image/gif',
-				sizeBytes: 0,
-				url: previewGif
-			});
+		if (preview && previewGif && bridgeFiles) {
+			const key = mediaKey(previewGif);
+			if (!key || !hosted.has(key)) {
+				if (key) hosted.add(key);
+				sources.push({
+					side: 'discord',
+					id: `${m.id}:preview`,
+					name: this.previewFileName(previewGif, 'preview.gif'),
+					mime: 'image/gif',
+					sizeBytes: 0,
+					url: previewGif
+				});
+			}
 			preview.thumbnail = undefined;
 		}
 		const linkEmbeds = preview ? [preview] : [];
@@ -1216,9 +1300,19 @@ export class Bridge {
 		const revision = fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : new Date().toISOString();
 		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
 		// e sem isso o cartão do Papo fica só com a URL escrita
+		const previewEmbeds = rawDiscordEmbeds(fresh.embeds as APIEmbed[]);
 		const preview = link.bridge_embeds
-			? firstDiscordPreview(rawDiscordEmbeds(fresh.embeds as APIEmbed[]), fresh.attachments.map((a) => a.url))
+			? firstDiscordPreview(previewEmbeds, fresh.attachments.map((a) => a.url), { rehostDiscordMedia: true })
 			: undefined;
+		if (preview && link.bridge_attachments) {
+			const attachmentKeys = new Set(fresh.attachments.map((a) => mediaKey(a.url)).filter(Boolean));
+			const stripped = discordHostedMedia(previewEmbeds).filter((m) => !attachmentKeys.has(mediaKey(discordMediaSourceUrl(m)) ?? ''));
+			if (stripped.length) {
+				// o preview chegou tarde e o Papo não aceita anexo em edição: a mídia do CDN do
+				// Discord fica fora do cartão em vez de virar um link que quebra
+				this.log.debug({ messageId: fresh.id, count: stripped.length }, 'mídia do Discord fora do preview: edição não anexa');
+			}
+		}
 		if (preview) {
 			if (maps.length) this.enqueuePapoPreview(link, maps, fresh.id, preview, revision);
 			else {
@@ -1509,6 +1603,40 @@ export class Bridge {
 	}
 
 	/**
+	 * Mídia hospedada pelo Discord (embed, preview ou link colado no texto) vira anexo da
+	 * mensagem no Papo: o bridge baixa o arquivo e re-envia, porque a URL do CDN expira junto
+	 * com a mensagem original e o hotlink é bloqueado.
+	 * `seen` carrega os caminhos já cobertos por anexo do Discord — a mesma mídia servida por
+	 * outro host (`media.discordapp.net` no embed) não é baixada duas vezes.
+	 */
+	private addDiscordMediaSources(messageId: string, media: DiscordMedia[], sources: SourceRef[], seen: Set<string>): void {
+		for (const m of media) {
+			const url = discordMediaSourceUrl(m);
+			const key = mediaKey(url);
+			if (!key || seen.has(key)) continue;
+			seen.add(key);
+			sources.push({
+				side: 'discord',
+				id: `${messageId}:media:${sources.length}`,
+				name: this.discordMediaFileName(url),
+				mime: m.mime || mimeFromUrl(url) || undefined,
+				sizeBytes: 0,
+				url
+			});
+		}
+	}
+
+	/** Nome original do arquivo: no CDN do Discord o último segmento do caminho é o nome. */
+	private discordMediaFileName(url: string): string {
+		try {
+			const name = new URL(url).pathname.split('/').filter(Boolean).pop() ?? '';
+			return sanitizeName(name) || 'midia-do-discord';
+		} catch {
+			return 'midia-do-discord';
+		}
+	}
+
+	/**
 	 * Emoji custom na forma canônica do banco (`:nome:`) → token renderizável do destino.
 	 * Custom emoji só renderiza no `description` do embed: no Discord como `<:nome:id>`,
 	 * no Papo como shortcode resolvido pelo renderizador do card. Footer de embed mostra
@@ -1555,6 +1683,18 @@ export class Bridge {
 		const room = Math.max(1, max - Array.from(line).length - 2);
 		const clamped = clampText(text, room);
 		return clamped ? `${clamped}\n\n${line}` : line;
+	}
+
+	/**
+	 * `content` da cópia de webhook: nota de reply no topo, resumo de reações no fim. O
+	 * orçamento do texto é o que sobra depois dos dois — o link que carrega a referência do
+	 * reply não pode ser cortado no meio.
+	 */
+	private webhookCopyContent(note: string, text: string, summary: string, max: number): string {
+		if (!note) return this.withReactionSummary(text, summary, max);
+		const room = Math.max(1, max - Array.from(note).length - 2);
+		const body = this.withReactionSummary(text, summary, room);
+		return body ? `${note}\n\n${body}` : note;
 	}
 
 	/** Rodapé base, preservando o selo de edição já aplicado ao embed. */
@@ -1627,8 +1767,8 @@ export class Bridge {
 		// avatar fixos no webhook. O Discord agrupa mensagens consecutivas por autor +
 		// username — num webhook compartilhado, cópias de usuários diferentes nunca
 		// agrupariam. Sem webhook (limite do canal, sem Manage Webhooks) o envio continua
-		// pelo cartão do bot. Webhook não responde mensagens: a thread de reply/continuação
-		// se perde nesse caminho.
+		// pelo cartão do bot. Webhook não responde mensagens: a referência do reply vira
+		// link no texto.
 		const webhook = job.authorId
 			? await this.discord.userWebhook?.(job.discordChannelId, {
 					userId: job.authorId,
@@ -1639,6 +1779,11 @@ export class Bridge {
 				})
 			: undefined;
 		const webhookMode = Boolean(webhook);
+		// Webhook não responde mensagem (limitação da API do Discord): a referência de um reply
+		// chega como link no topo do `content`. Guardar a nota em `message_map.reply_note` é o
+		// que permite reescrevê-la em toda reescrita do content (edição, resumo de reação).
+		const replyTarget = this.copyForPapoMessage(job.replyRefPapoId);
+		const replyNote = webhookMode ? replyNoteFor(replyTarget && this.discord.messageLink(job.discordChannelId, replyTarget)) : '';
 
 		const avatar = webhookMode ? undefined : this.avatarAttachment(job.authorIconSha, embed?.author?.icon_url);
 		// embeds **da origem Papo** (preview de link, GIF do picker): já vêm em `job.linkEmbeds`.
@@ -1665,10 +1810,10 @@ export class Bridge {
 		const signatures = copySignatures('papo', job.papoMessageId, job.chunkIndex, groups.length);
 		const summary = await this.reactionSummaryFor('discord', this.store.listReactions(job.linkId, 'papo', job.papoMessageId));
 
-		// modo webhook: `content` = conteúdo do Papo (com a linha de reações anexada), embeds =
-		// só os previews que vieram do Papo. Sem cartão, sem rodapé, sem embed de continuação —
-		// a identidade e a data já são do próprio webhook/mensagem.
-		const webhookContent = this.withReactionSummary(description, summary, DISCORD_LIMITS.contentMax);
+		// modo webhook: `content` = conteúdo do Papo (nota de reply no topo, linha de reações no
+		// fim), embeds = só os previews que vieram do Papo. Sem cartão, sem rodapé, sem embed de
+		// continuação — a identidade e a data já são do próprio webhook/mensagem.
+		const webhookContent = this.webhookCopyContent(replyNote, description, summary, DISCORD_LIMITS.contentMax);
 		const webhookPreviews = webhookMode ? fitEmbedBudget(previewEmbeds, DISCORD_LIMITS.embedTotalChars) : [];
 
 		let footerBase = '';
@@ -1735,7 +1880,7 @@ export class Bridge {
 			const already = existing.get(signatures[g]!);
 			if (already) {
 				lastDiscordId = already;
-				this.mapDiscordCopy(job, already, g, extra, description, built, footerBase, webhookMode, webhookPreviews);
+				this.mapDiscordCopy(job, already, g, extra, description, built, footerBase, webhookMode, webhookPreviews, replyNote);
 				continue;
 			}
 			const files = groups[g]!.map((f) => ({ name: f.name, buffer: f.data }));
@@ -1789,10 +1934,10 @@ export class Bridge {
 				(await this.discord.send(job.discordChannelId, {
 					embeds,
 					files,
-					replyTo: extra ? lastDiscordId : this.copyForPapoMessage(job.replyRefPapoId)
+					replyTo: extra ? lastDiscordId : replyTarget
 				}));
 			lastDiscordId = sent.id;
-			this.mapDiscordCopy(job, sent.id, g, extra, description, built, footerBase, webhookMode, webhookPreviews);
+			this.mapDiscordCopy(job, sent.id, g, extra, description, built, footerBase, webhookMode, webhookPreviews, replyNote);
 		}
 		this.flushDeferred('papo', job.papoMessageId, job.linkId);
 		// o delete chegou enquanto o envio estava em voo: a cópia recém-criada não sobrevive
@@ -1810,7 +1955,8 @@ export class Bridge {
 		built: DiscordEmbedPayload | undefined,
 		footerBase: string,
 		webhookCopy = false,
-		webhookPreviews: DiscordEmbedPayload[] = []
+		webhookPreviews: DiscordEmbedPayload[] = [],
+		replyNote = ''
 	): void {
 		this.store.mapMessage({
 			link_id: job.linkId,
@@ -1827,6 +1973,8 @@ export class Bridge {
 			footer_base: extra || webhookCopy ? null : footerBase,
 			// no modo webhook o snapshot dos embeds da cópia são os previews da origem
 			link_embeds: extra ? null : webhookCopy ? webhookPreviews : (job.linkEmbeds ?? []),
+			// só o grupo 0 tem `content`: os grupos de arquivo não repetem a nota
+			reply_note: extra ? null : replyNote || null,
 			webhook_copy: webhookCopy
 		});
 	}
@@ -2053,8 +2201,10 @@ export class Bridge {
 			if (!map.discord_message_id) throw new RetryableError('sem mensagem do Discord mapeada');
 			if (map.webhook_copy) {
 				// cópia de webhook: o texto mora no `content`; o edit reescreve o content e o
-				// Discord já marca a mensagem como editada. Previews e anexos ficam intactos.
-				const content = this.withReactionSummary(
+				// Discord já marca a mensagem como editada. Previews, anexos e a nota de reply
+				// ficam intactos.
+				const content = this.webhookCopyContent(
+					map.reply_note ?? '',
 					job.text,
 					await this.reactionSummaryForMap(map, 'discord'),
 					DISCORD_LIMITS.contentMax
@@ -2242,8 +2392,11 @@ export class Bridge {
 			if (map.direction === 'papo_to_discord') {
 				if (!map.discord_message_id) continue;
 				if (map.webhook_copy) {
-					// cópia de webhook: o resumo de reações é anexado ao `content` (não há cartão)
-					const content = this.withReactionSummary(
+					// cópia de webhook: o resumo de reações é anexado ao `content` (não há
+					// cartão), e a nota de reply continua no topo — a re-escrita substitui o
+					// content inteiro
+					const content = this.webhookCopyContent(
+						map.reply_note ?? '',
 						map.rendered ?? '',
 						await this.reactionSummaryForMap(map, 'discord'),
 						DISCORD_LIMITS.contentMax

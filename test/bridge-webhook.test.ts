@@ -53,7 +53,7 @@ interface WebhookSend {
 }
 
 interface DiscordSend {
-	embeds?: { author?: { name?: string } }[];
+	embeds?: { author?: { name?: string }; description?: string }[];
 	replyTo?: string;
 }
 
@@ -103,6 +103,7 @@ const fixture = (opts: {
 	const webhookRequests: WebhookIdentity[] = [];
 	const webhookSends: WebhookSend[] = [];
 	const sends: DiscordSend[] = [];
+	const edits: { messageId: string; content?: string }[] = [];
 	const papoSent: { replyTo?: string }[] = [];
 	api.sendMessage = async () => {
 		papoSent.push({});
@@ -113,6 +114,10 @@ const fixture = (opts: {
 		guildsCached: () => true,
 		findGuildEmoji: () => undefined,
 		channelName: () => 'geral',
+		messageLink: (channelId: string, messageId: string) => `https://discord.com/channels/999/${channelId}/${messageId}`,
+		edit: async (_channelId: string, messageId: string, options: { content?: string }) => {
+			edits.push({ messageId, ...(options.content !== undefined ? { content: options.content } : {}) });
+		},
 		send: async (_channelId: string, options: DiscordSend) => {
 			sends.push(options);
 			return { id: 'd-new' };
@@ -161,7 +166,7 @@ const fixture = (opts: {
 		sources: [],
 		...extra
 	});
-	return { store, outbox, bridge, link, enqueueJob, baseJob, webhookRequests, webhookSends, sends, papoSent, settle };
+	return { store, outbox, bridge, link, enqueueJob, baseJob, webhookRequests, webhookSends, sends, edits, papoSent, settle };
 };
 
 const papoMessage = (id: string) => ({
@@ -317,6 +322,115 @@ describe('envio via webhook do bridge', () => {
 		expect(webhookSends).toHaveLength(2);
 		expect(sends).toHaveLength(0);
 		expect(store.findMapByDiscord('w-1').length).toBe(1);
+	});
+});
+
+const REPLY_NOTE = '*Respondendo:[https://discord.com/channels/999/111/d-orig]*';
+
+describe('reply na cópia de webhook', () => {
+	/** Webhook não responde mensagem: a referência do reply chega como link no texto. */
+	it('reply vira nota `*Respondendo:[link]*` no topo do content', async () => {
+		const { store, bridge, link, enqueueJob, baseJob, webhookSends, settle } = fixture({ webhook: true });
+		store.mapMessage({
+			link_id: link.id,
+			direction: 'papo_to_discord',
+			papo_message_id: 'pm-orig',
+			discord_message_id: 'd-orig',
+			chunk_index: 0,
+			chunk_total: 1
+		});
+		enqueueJob(baseJob('pm-reply', { replyRefPapoId: 'pm-orig' }));
+		await bridge.drain();
+		await settle();
+
+		expect(webhookSends[0]?.content).toBe(`${REPLY_NOTE}\n\nolá`);
+		// guardada na cópia: toda re-escrita do content precisa reescrever a nota junto
+		expect(store.findMapByDiscord('w-1')[0]?.reply_note).toBe(REPLY_NOTE);
+	});
+
+	it('sem cópia da mensagem respondida a nota não aparece', async () => {
+		const { bridge, enqueueJob, baseJob, webhookSends, settle } = fixture({ webhook: true });
+		enqueueJob(baseJob('pm-reply', { replyRefPapoId: 'pm-antiga' }));
+		await bridge.drain();
+		await settle();
+
+		expect(webhookSends[0]?.content).toBe('olá');
+	});
+
+	it('nota sobrevive à reescrita do content pela edição', async () => {
+		const { store, outbox, bridge, link, enqueueJob, baseJob, webhookSends, edits, settle } = fixture({ webhook: true });
+		store.mapMessage({
+			link_id: link.id,
+			direction: 'papo_to_discord',
+			papo_message_id: 'pm-orig',
+			discord_message_id: 'd-orig',
+			chunk_index: 0,
+			chunk_total: 1
+		});
+		enqueueJob(baseJob('pm-reply', { replyRefPapoId: 'pm-orig' }));
+		await bridge.drain();
+		await settle();
+		expect(webhookSends[0]?.content).toBe(`${REPLY_NOTE}\n\nolá`);
+
+		outbox.enqueue({
+			linkId: link.id,
+			direction: 'to_discord',
+			kind: 'edit',
+			dedupeKey: 'papo-edit:pm-reply:0',
+			payload: {
+				job: {
+					kind: 'edit',
+					side: 'papo',
+					linkId: link.id,
+					sourceMessageId: 'pm-reply',
+					targetChannelId: '111',
+					chunkIndex: 0,
+					chunkTotal: 1,
+					text: 'olá editado',
+					revision: '2026-10-09T18:10:00Z'
+				}
+			}
+		});
+		await bridge.drain();
+		await settle();
+
+		expect(edits[0]?.content).toBe(`${REPLY_NOTE}\n\nolá editado`);
+	});
+
+	it('nota e resumo de reações convivem no content', async () => {
+		const { store, bridge, link, enqueueJob, baseJob, webhookSends, settle } = fixture({ webhook: true });
+		store.mapMessage({
+			link_id: link.id,
+			direction: 'papo_to_discord',
+			papo_message_id: 'pm-orig',
+			discord_message_id: 'd-orig',
+			chunk_index: 0,
+			chunk_total: 1
+		});
+		store.setReaction({ linkId: link.id, source: 'papo', sourceMessageId: 'pm-reply', emoji: '👍', count: 2 });
+		enqueueJob(baseJob('pm-reply', { replyRefPapoId: 'pm-orig' }));
+		await bridge.drain();
+		await settle();
+
+		expect(webhookSends[0]?.content).toBe(`${REPLY_NOTE}\n\nolá\n\n↳ 👍 2`);
+	});
+
+	it('no envio pelo cartão o reply continua sendo reply nativo do Discord', async () => {
+		const { store, bridge, link, baseJob, enqueueJob, sends, settle } = fixture({ webhook: false });
+		store.mapMessage({
+			link_id: link.id,
+			direction: 'papo_to_discord',
+			papo_message_id: 'pm-orig',
+			discord_message_id: 'd-orig',
+			chunk_index: 0,
+			chunk_total: 1
+		});
+		enqueueJob(baseJob('pm-reply', { replyRefPapoId: 'pm-orig' }));
+		await bridge.drain();
+		await settle();
+
+		expect(sends[0]?.replyTo).toBe('d-orig');
+		expect(sends[0]?.embeds?.[0]?.description).toBe('olá');
 	});
 });
 

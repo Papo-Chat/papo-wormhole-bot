@@ -250,6 +250,12 @@ Nitro 500 MB; boost L2 50 MB / L3 100 MB — usar o valor configurado, nunca ass
 | `moderation_status = sensitive` | bridgear com aviso explícito no embed (`⚠️ conteúdo sensível`) |
 | `pending` / `processing` | bridgear normalmente: o Papo também mostra e serve o arquivo durante a inferência (`GET /attachments/{id}` só recusa `blocked`, com 410). Se o veredito for `blocked`, o Papo apaga a mensagem inteira e o `message_delete` apaga a cópia do outro lado |
 
+**Mídia que o Discord hospeda** (`cdn.discordapp.com` / `media.discordapp.net` em `/attachments/…`,
+`/embeds/…`): a URL é volátil — expira junto com a mensagem original e o hotlink é bloqueado. Ela
+nunca vira embed no destino: o bridge baixa e re-envia como anexo, pelo mesmo caminho dos anexos
+(acima). Vale também para o link de arquivo colado no texto da mensagem. Com
+`bridge_attachments = 0` não há para onde re-hospedar, e o preview mantém a URL.
+
 Cache de mídia em disco (`media_cache(sha256, path, mime, size_bytes, source)`) para:
 reuso de avatar, retries sem novo download, e URLs estáveis no media server.
 
@@ -271,6 +277,17 @@ Mapeamento Discord Embed → Papo `EmbedInput`:
 | `video` | `video` | Discord raramente expõe vídeo direto; se houver, `mime_type` obrigatório |
 | `footer.text` | `footer.text` | usado também para data/origem |
 | `fields[]` | `fields[]` | 25 fields, name 256 / value 1024 nos dois |
+
+**Exceção — mídia hospedada pelo Discord.** `thumbnail`/`image`/`video` cuja URL é do CDN do Discord
+(`cdn.discordapp.com` / `media.discordapp.net` em `/attachments/…`, `/embeds/…`) não entram no embed
+do Papo: a URL expira junto com a mensagem original e o hotlink é bloqueado, e o backend do Papo
+não consegue re-servi-la depois. O bridge baixa e re-envia como **anexo** da mensagem
+(`discordHostedMedia` e `discordMediaLinksInContent`, em `previews.ts`) — inclusive o link de
+arquivo colado no texto. O preview que só existia por essa mídia sai do card. Avatar e banner
+(`author.icon_url`) ficam fora da regra: são imagem de identidade, caminho `/avatars/…`, e o
+backend do Papo já re-serva (`author_media`). Preview que chega tarde (`message_edit`) é o único
+caso em que a mídia não pode ser anexada — o Papo não aceita anexo em `PUT /messages/{id}` — então
+ela sai do card e a URL da página continua como link.
 
 Mapeamento Papo Embed → Discord Embed: espelho do acima; `source_type='link'` (preview
 automático do Papo) é recriado no Discord **deixando a URL nua no `content`** — o Discord gera o
@@ -467,11 +484,17 @@ CREATE TABLE message_map (
   discord_message_id TEXT,
   chunk_index       INTEGER NOT NULL DEFAULT 0,
   chunk_total       INTEGER NOT NULL DEFAULT 1,
-  parent_map_id     INTEGER REFERENCES message_map(id),
   content_sha       TEXT,
   rendered          TEXT,      -- corpo enviado ao destino
   bridge_embed      TEXT,      -- JSON do embed enviado (permite re-renderir o embed)
   footer_base       TEXT,      -- rodapé base (data/origem), sem o resumo de reações
+  -- cópia enviada pelo webhook do usuário: o texto mora no `content`, não em cartão
+  webhook_copy      INTEGER NOT NULL DEFAULT 0,
+  link_embeds       TEXT,      -- JSON do preview de link aplicado à cópia (atrás do cartão)
+  -- nota de reply da cópia de webhook (`*Respondendo:[link]*`): webhook não responde mensagem
+  reply_note        TEXT,
+  edit_revision     TEXT,      -- revisão da última edição aplicada (edição atrasada não reverte)
+  embed_revision    TEXT,      -- revisão da última atualização de preview aplicada
   deleted           INTEGER NOT NULL DEFAULT 0,
   created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -564,8 +587,9 @@ WS event {type:"message", id, channel_id, author_id, content, reply_to, attachme
 ```
 MESSAGE_CREATE
   → ignorar bot/webhook próprio
-  → canal-link?
+  → canal-link? (thread linkada é canal como qualquer outro)
   → traduzir conteúdo + embeds (rich/link preview) + attachments
+  → mídia hospedada pelo Discord (embed, preview ou link colado no texto) vira anexo baixado (§7, §8)
   → m.reference da origem → cópia Papo em message_map → reply_to do Papo (sem cópia: sem reply)
   → montar EmbedInput (author, thumbnail=avatar Discord, image=anexo, footer=data/origem)
   → multipart POST /messages {channel_id, content, embeds(JSON string), attachments[](binary), reply_to?}
@@ -582,6 +606,7 @@ MESSAGE_CREATE
 | `attachment_moderation_update` (`sensitive`) | adicionar aviso ao embed; `blocked` → apagar |
 | `message_pin` / `MESSAGE_PIN` | opcional (`bridge_pins`) |
 | `channel_create/update/delete` | alertar no canal de administração (não auto-criar canal) |
+| `threadCreate` / `threadUpdate` | entrar na thread linkada (join); thread arquivada → registro no audit log |
 | `avatar_update` / `GUILD_MEMBER_UPDATE` | invalidar cache de avatar |
 | `presence_sync` / `presence_update` / `PRESENCE_UPDATE` | alimentar `presence_cache` (usa `/online`) |
 
@@ -594,9 +619,11 @@ MESSAGE_CREATE
 | `channel.send({ embeds, files, allowedMentions })` | ✅ | `allowedMentions` é camelCase; `allowed_mentions` seria ignorado |
 | `reply: { messageReference, failIfNotExists }` | ✅ | `messageReference` no nível raiz **não existe** em `MessageCreateOptions` (14.x) — a lib ignora |
 | `channel.messages.fetch(id)` → `message.edit/delete/react/pin/unpin` | ✅ | `pin/unpin` exigem `Manage Messages` |
+| `ThreadChannel#join()` | ✅ | `members.add('@me')`; thread privada/anunciada não entrega mensagens a quem não é membro |
+| `webhook.send/editMessage({ threadId })`, `webhook.deleteMessage(id, threadId)` | ✅ | thread não tem webhook próprio: o webhook é do canal pai e a mensagem entra na thread pelo `thread_id` |
 | `MessageReaction#remove()` | ✅ | apaga a reação **do próprio bot** (DELETE sem user = `@me`) |
 | `ReactionManager` | ✅ | tem só `removeAll()` e o cache; **não** tem `fetch()` — contagem vem do cache ou de `reaction.count` |
-| `channels.fetch(id)` | ✅ | pode devolver `PartialGroupDMChannel`, que não tem `send`/`messages`; validar `instanceof TextChannel` |
+| `channels.fetch(id)` | ✅ | pode devolver `PartialGroupDMChannel`, que não tem `send`/`messages`; validar `instanceof TextChannel / NewsChannel / ThreadChannel` |
 | `messageUpdate` com mensagem parcial | ✅ | `after.content` vem vazio quando a mensagem não estava no cache → re-buscar antes de editar o destino |
 | `client.destroy()` | ✅ | não é deprecado (ainda não existe v15); aguardar no shutdown |
 | `guild.commands.set()` / `application.commands.set()` | ✅ | por guild é imediato; global demora até 1 h a propagar |
@@ -620,6 +647,11 @@ O reply é propagado por referência mapeada, não por texto copiado:
 - `reply_to` apontando para mensagem apagada dá 404 no Papo: o bot reenvia sem referência.
 - Não copiamos o texto respondido no corpo do embed: os dois lados já renderizam o preview nativo
   (Discord mostra a mensagem referenciada, o Papo mostra o reply do próprio Papo).
+- **Modo webhook não tem reply nativo** (o Discord não permite que webhook responda mensagem): a
+  referência chega como `*Respondendo:[link da mensagem no Discord]*` no topo do `content` da
+  cópia. A nota fica em `message_map.reply_note` porque toda re-escrita do content (edição, resumo
+  de reações) reescreve o `content` inteiro e precisa reescrevê-la junto. No envio pelo cartão o
+  reply continua sendo reply nativo do Discord.
 
 ---
 
@@ -631,7 +663,7 @@ Slash commands no Discord (registro global ou por guild), com controle de acesso
 | Comando | Efeito |
 | --- | --- |
 | `/online` | Lista quem está online na plataforma inversa (usa `presence_cache` dos dois lados) |
-| `/link-channel papo_channel:<nome\|uuid> discord_channel:<canal>` | Cria/atualiza link 1:1 (o nome é resolvido em `GET /channels`) |
+| `/link-channel papo_channel:<nome\|uuid> discord_channel:<canal\|thread>` | Cria/atualiza link 1:1 (o nome é resolvido em `GET /channels`); thread do Discord é linkável — do lado Papo ela vira canal |
 | `/unlink-channel discord_channel:<canal>` | Remove o link (mantém histórico) |
 | `/link-server papo_server:<nome\|uuid> discord_guild:<guild>` | Associa servidores (validado contra `GET /server`) |
 | `/link-user papo_user:<nome\|uuid> discord_user:<usuário>` | Mapeia identidade (username/apelido resolvido em `GET /users`) |
@@ -711,7 +743,8 @@ Discord (recomendado para v1).
 ## 16. Segurança e permissões
 
 **Discord (bot)**: `View Channels`, `Send Messages`, `Send Messages in Threads`, `Embed Links`,
-`Attach Files`, `Add Reactions`, `Use External Emojis`, `Manage Webhooks` (modo B).
+`Attach Files`, `Add Reactions`, `Use External Emojis`, `Manage Webhooks` (modo B),
+`Manage Threads` (entrar em thread privada/anunciada — sem ela o bridge só vê thread pública).
 Intents: `Guilds`, `GuildMessages`, `MessageContent`*, `GuildMessageTyping`*, `GuildPresences`*
 (*privilegiados — habilitar no developer portal; sem `MessageContent` o bridge não funciona).
 
@@ -765,7 +798,7 @@ envio com anexo responde **403** (não 413), e sem `pin_message` o pino responde
 | Mensagem deletada no destino manualmente | `message_map` marcado; edição vira recriação |
 | Reply a mensagem não bridgeada | envia sem `reply_to`, com citação textual `> <autor>: <trecho>` |
 | Reply a mensagem já deletada | idem (Papo aceita `reply_to` órfão, mas sem garantia) |
-| Thread do Discord | v1: ignora threads (só canal raiz); v2: thread ↔ canal dedicado |
+| Thread do Discord | linkável a um canal do Papo (`/link-channel`): o Papo não tem thread. O bridge entra na thread (join), envia pelo `thread_id` e o webhook é o do canal pai. Thread arquivada → registro no audit log; thread privada sem acesso → aviso |
 | Canal Papo `voice`/`category` | não bridgea texto em category; canal voice aceita mensagem → bridge opcional |
 | Canal deletado em um dos lados | marca link como `broken`, alerta admin, mantém fila até decisão |
 | Bot reinicia no meio de um chunk | `dedupe_key` evita duplicar; `in_flight` volta a `pending` |
@@ -809,8 +842,10 @@ ecossistema Discord menos maduro.
 
 ## 21. Fora de escopo (v1)
 
-Voz/WebRTC, DMs, threads do Discord, enquetes, stickers, roles sincronizadas, histórico
-retroativo massivo (só backfill curto), busca cruzada, moderação cruzada.
+Voz/WebRTC, DMs, enquetes, stickers, roles sincronizadas, histórico
+retroativo massivo (só backfill curto), busca cruzada, moderação cruzada. Thread do Discord é
+linkável a um canal do Papo, mas não vira thread do outro lado (o Papo não tem thread) e thread
+criada a partir do Papo não existe.
 
 ---
 

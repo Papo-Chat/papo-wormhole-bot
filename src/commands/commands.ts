@@ -18,6 +18,19 @@ import type { Outbox } from '../db/outbox.js';
 import type { OutboxState } from '../db/outbox.js';
 import { isUuid, matchChannel, matchServer, matchUser, type Resolved } from './resolve.js';
 
+/**
+ * Canal linkável: canal de texto e thread. O Papo não tem thread, então uma thread do
+ * Discord é linkada a um canal do Papo — cada thread precisa do seu canal.
+ */
+const LINKABLE_CHANNEL_TYPES = [
+  ChannelType.GuildText,
+  ChannelType.PublicThread,
+  ChannelType.PrivateThread,
+  ChannelType.AnnouncementThread
+] as const;
+
+const THREAD_CHANNEL_TYPES: readonly ChannelType[] = LINKABLE_CHANNEL_TYPES.slice(1);
+
 export const commands = [
   new SlashCommandBuilder().setName('online').setDescription('Quem está online na plataforma inversa'),
   new SlashCommandBuilder()
@@ -25,14 +38,14 @@ export const commands = [
     .setDescription('Linka um canal do Papo a um canal do Discord')
     .addStringOption((o) => o.setName('papo_channel').setDescription('nome do canal do Papo (ex.: geral) ou id (uuid)').setRequired(true))
     .addChannelOption((o) =>
-      o.setName('discord_channel').setDescription('Canal do Discord').addChannelTypes(ChannelType.GuildText,ChannelType.PublicThread).setRequired(true)
+      o.setName('discord_channel').setDescription('Canal ou thread do Discord').addChannelTypes(...LINKABLE_CHANNEL_TYPES).setRequired(true)
     )
     .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
   new SlashCommandBuilder()
     .setName('unlink-channel')
     .setDescription('Remove o link de um canal')
     .addChannelOption((o) =>
-      o.setName('discord_channel').setDescription('Canal do Discord').addChannelTypes(ChannelType.GuildText,ChannelType.PublicThread).setRequired(true)
+      o.setName('discord_channel').setDescription('Canal ou thread do Discord').addChannelTypes(...LINKABLE_CHANNEL_TYPES).setRequired(true)
     )
     .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
   new SlashCommandBuilder()
@@ -56,7 +69,7 @@ export const commands = [
     .setName('bridge-config')
     .setDescription('Ajusta as flags de um canal-link')
     .addChannelOption((o) =>
-      o.setName('discord_channel').setDescription('Canal do Discord').addChannelTypes(ChannelType.GuildText).setRequired(true)
+      o.setName('discord_channel').setDescription('Canal ou thread do Discord').addChannelTypes(...LINKABLE_CHANNEL_TYPES).setRequired(true)
     )
     .addStringOption((o) => o.setName('mode').setDescription('both | to_discord | to_papo').addChoices(
       { name: 'both', value: 'both' },
@@ -81,14 +94,14 @@ export const commands = [
     .setName('pause')
     .setDescription('Pausa o bridge de um canal')
     .addChannelOption((o) =>
-      o.setName('discord_channel').setDescription('Canal do Discord').addChannelTypes(ChannelType.GuildText).setRequired(true)
+      o.setName('discord_channel').setDescription('Canal ou thread do Discord').addChannelTypes(...LINKABLE_CHANNEL_TYPES).setRequired(true)
     )
     .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
   new SlashCommandBuilder()
     .setName('resume')
     .setDescription('Retoma o bridge de um canal')
     .addChannelOption((o) =>
-      o.setName('discord_channel').setDescription('Canal do Discord').addChannelTypes(ChannelType.GuildText).setRequired(true)
+      o.setName('discord_channel').setDescription('Canal ou thread do Discord').addChannelTypes(...LINKABLE_CHANNEL_TYPES).setRequired(true)
     )
     .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
   new SlashCommandBuilder().setName('help').setDescription('Como configurar o bridge')
@@ -148,6 +161,8 @@ export const MANAGE_COMMANDS: ReadonlySet<string> = new Set([
 export interface ChannelRef {
   id: string;
   name: string | null;
+  /** O canal é uma thread (o Papo não tem thread: a thread é linkada a um canal próprio). */
+  thread?: boolean;
 }
 
 export interface UserRef {
@@ -356,6 +371,9 @@ export async function execute(ctx: CommandContext, deps: CommandDeps): Promise<C
       return {
         content:
           `✅ linkado: Papo #${resolved.value.name} ↔ Discord ${ctx.fmtChannel(discordChannel)} (mode=${link.mode})` +
+          (discordChannel.thread
+            ? '\n🧵 thread linkada: as mensagens dela entram no canal do Papo como mensagens comuns (o Papo não tem thread).'
+            : '') +
           `\n\`${resolved.value.id}\``
       };
     }
@@ -409,9 +427,11 @@ export async function execute(ctx: CommandContext, deps: CommandDeps): Promise<C
       await ctx.defer();
       // nome em vez de uuid só para leitura; se o Papo estiver inacessível, mostra o id
       const names = new Map((await api.listChannels().catch(() => [])).map((c) => [c.id, c.name]));
+      // thread também vive na cache de canais: é como o `/bridges` sabe que um link é thread
+      const isThread = (id: string): boolean => THREAD_CHANNEL_TYPES.includes(ctx.client.channels.cache.get(id)?.type as ChannelType);
       const lines = links.map(
         (l) =>
-          `• ${ctx.fmtChannel({ id: l.discord_channel_id, name: null })} ↔ Papo #${names.get(l.papo_channel_id) ?? l.papo_channel_id} — ${l.mode}` +
+          `• ${ctx.fmtChannel({ id: l.discord_channel_id, name: null })}${isThread(l.discord_channel_id) ? ' 🧵' : ''} ↔ Papo #${names.get(l.papo_channel_id) ?? l.papo_channel_id} — ${l.mode}` +
           `${l.paused ? ' (pausado)' : ''} · anexos:${l.bridge_attachments ? '✅' : '⛔'} embeds:${l.bridge_embeds ? '✅' : '⛔'} reações:${l.bridge_reactions ? '✅' : '⛔'}`
       );
       return { sections: [{ title: 'Canais linkados', body: lines.join('\n') }] };
@@ -488,6 +508,7 @@ export async function execute(ctx: CommandContext, deps: CommandDeps): Promise<C
         '',
         'Em `papo_server`, `papo_channel` e `papo_user` serve o nome (`Cyber Asilo`, `#geral`, `@jonas`) ou o uuid.',
         'Nome ambíguo: o bot lista as opções e aí o uuid resolve.',
+        'Thread do Discord também é linkável: do lado do Papo ela vira canal próprio (o Papo não tem thread).',
         '',
         'Mensagens, anexos, previews de link, edições, deleções e reações viajam nos dois sentidos.'
       ];
@@ -547,7 +568,7 @@ export async function handleCommand(i: ChatInputCommandInteraction, deps: Comman
       boolean: (n) => i.options.getBoolean(n),
       channel: async (n) => {
         const c = i.options.getChannel(n);
-        return c ? { id: c.id, name: c.name ?? null } : null;
+        return c ? { id: c.id, name: c.name ?? null, thread: c.type !== ChannelType.GuildText } : null;
       },
       user: async (n) => {
         const u = i.options.getUser(n);

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { APIEmbed } from 'discord.js';
-import { firstDiscordPreview, firstPapoPreview, giphyEmbed } from '../src/bridge/previews.js';
+import { discordHostedMedia, discordMediaLinksInContent, firstDiscordPreview, firstPapoPreview, giphyEmbed } from '../src/bridge/previews.js';
+import { isDiscordMediaUrl } from '../src/bridge/embeds.js';
 import { DISCORD_LIMITS } from '../src/bridge/limits.js';
 import type { PapoEmbed } from '../src/papo/types.js';
 
@@ -18,6 +19,7 @@ const discordEmbed = (e: {
 	description?: string;
 	thumbnail?: { url: string };
 	image?: { url: string };
+	video?: { url: string };
 }): APIEmbed => e as unknown as APIEmbed;
 
 describe('firstDiscordPreview (Discord → Papo)', () => {
@@ -101,6 +103,87 @@ describe('firstDiscordPreview (Discord → Papo)', () => {
 		]);
 		expect((preview?.title ?? '').length).toBeLessThanOrEqual(256);
 		expect((preview?.description ?? '').length).toBeLessThanOrEqual(4192);
+	});
+});
+
+describe('mídia hospedada pelo Discord (URL volátil)', () => {
+	it('reconhece o arquivo que o Discord hospeda', () => {
+		expect(isDiscordMediaUrl('https://cdn.discordapp.com/attachments/1/2/video.mp4')).toBe(true);
+		// assinatura de expiração na query é o que faz a URL quebrar
+		expect(isDiscordMediaUrl('https://media.discordapp.net/attachments/1/2/video.mp4?ex=66&is=66&hm=ab')).toBe(true);
+		expect(isDiscordMediaUrl('https://cdn.discordapp.com/embed/attachments/1/2/imagem.png')).toBe(true);
+		// proxy de terceiros: re-serva conteúdo de fora, não a mídia do Discord
+		expect(isDiscordMediaUrl('https://images-ext-1.discordapp.net/external/xyz/https/example.com/a.png')).toBe(false);
+		// avatar/banner são imagem de identidade, não arquivo de mensagem
+		expect(isDiscordMediaUrl('https://cdn.discordapp.com/avatars/1/abc.png')).toBe(false);
+		// link de mensagem não é mídia
+		expect(isDiscordMediaUrl('https://discord.com/channels/1/2/3')).toBe(false);
+		expect(isDiscordMediaUrl('https://example.com/x.png')).toBe(false);
+		expect(isDiscordMediaUrl(undefined)).toBe(false);
+	});
+
+	it('re-host tira do preview a mídia do Discord, e o resto do card continua', () => {
+		const preview = firstDiscordPreview(
+			[discordEmbed({ type: 'rich', url: 'https://example.com/artigo', title: 'artigo', thumbnail: { url: 'https://cdn.discordapp.com/attachments/1/2/thumb.png' } })],
+			[],
+			{ rehostDiscordMedia: true }
+		);
+		expect(preview?.title).toBe('artigo');
+		expect(preview?.url).toBe('https://example.com/artigo');
+		expect(preview?.thumbnail).toBeUndefined();
+	});
+
+	it('preview que só existia pela mídia do CDN sai do card: o anexo carrega a mídia', () => {
+		const preview = firstDiscordPreview(
+			[discordEmbed({
+				type: 'image',
+				url: 'https://cdn.discordapp.com/attachments/1/2/imagem.png',
+				title: 'imagem.png',
+				image: { url: 'https://cdn.discordapp.com/attachments/1/2/imagem.png' }
+			})],
+			[],
+			{ rehostDiscordMedia: true }
+		);
+		expect(preview).toBeUndefined();
+	});
+
+	it('sem re-host o preview continua com a URL (link com anexos desligados)', () => {
+		const preview = firstDiscordPreview([
+			discordEmbed({
+				type: 'image',
+				url: 'https://cdn.discordapp.com/attachments/1/2/imagem.png',
+				title: 'imagem.png',
+				image: { url: 'https://cdn.discordapp.com/attachments/1/2/imagem.png' }
+			})
+		]);
+		expect(preview?.thumbnail?.url).toBe('https://cdn.discordapp.com/attachments/1/2/imagem.png');
+	});
+
+	it('discordHostedMedia coleta a mídia de todos os embeds, uma vez por arquivo', () => {
+		const media = discordHostedMedia([
+			discordEmbed({
+				type: 'image',
+				image: { url: 'https://cdn.discordapp.com/attachments/1/2/a.png' },
+				thumbnail: { url: 'https://media.discordapp.net/attachments/1/2/a.png' }
+			}),
+			discordEmbed({ type: 'rich', url: 'https://example.com/x', thumbnail: { url: 'https://example.com/thumb.png' } }),
+			discordEmbed({ type: 'video', video: { url: 'https://cdn.discordapp.com/attachments/1/2/b.mp4' } })
+		] as never);
+		expect(media.map((m) => m.url)).toEqual([
+			'https://cdn.discordapp.com/attachments/1/2/a.png',
+			'https://cdn.discordapp.com/attachments/1/2/b.mp4'
+		]);
+	});
+
+	it('discordMediaLinksInContent pega o link de arquivo do Discord escrito no texto', () => {
+		expect(discordMediaLinksInContent('olha https://cdn.discordapp.com/attachments/1/2/video.mp4 legal')).toEqual([
+			'https://cdn.discordapp.com/attachments/1/2/video.mp4'
+		]);
+		// cerca de código não é link
+		expect(discordMediaLinksInContent('```\nhttps://cdn.discordapp.com/attachments/1/2/x.png\n```')).toEqual([]);
+		expect(discordMediaLinksInContent('link de fora https://example.com/a.png')).toEqual([]);
+		expect(discordMediaLinksInContent('')).toEqual([]);
+		expect(discordMediaLinksInContent(undefined)).toEqual([]);
 	});
 });
 

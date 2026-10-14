@@ -1,4 +1,10 @@
-import { ApplicationCommandOptionType, ChannelType, type Client, type Guild } from 'discord.js';
+import {
+  ApplicationCommandOptionType,
+  ChannelType,
+  type Channel,
+  type Client,
+  type Guild
+} from 'discord.js';
 import type { Logger } from 'pino';
 import { scoped } from '../logger.js';
 import {
@@ -124,26 +130,45 @@ function pickGuild(client: Client): Guild | null {
   return client.guilds.cache.size === 1 ? (client.guilds.cache.first() ?? null) : null;
 }
 
+/** Canal linkável: canal de texto e thread (o Papo não tem thread: a thread vira canal próprio). */
+const LINKABLE_CHANNEL_TYPES: readonly ChannelType[] = [
+  ChannelType.GuildText,
+  ChannelType.PublicThread,
+  ChannelType.PrivateThread,
+  ChannelType.AnnouncementThread
+];
+
+type LinkableChannel = Extract<
+  Channel,
+  { type: ChannelType.GuildText | ChannelType.PublicThread | ChannelType.PrivateThread | ChannelType.AnnouncementThread }
+>;
+
+const isLinkableChannel = (c: Channel): c is LinkableChannel => LINKABLE_CHANNEL_TYPES.includes(c.type);
+
 async function resolveChannel(client: Client, guild: Guild | null, input: string): Promise<ChannelRef> {
   const raw = input.trim();
   const id = /^<#(\d+)>$/.exec(raw)?.[1] ?? (SNOWFLAKE.test(raw) ? raw : null);
 
   if (id) {
     const ch = client.channels.cache.get(id) ?? (await client.channels.fetch(id).catch(() => null));
-    if (!ch || ch.type !== ChannelType.GuildText) {
-      throw new ArgError(`canal do Discord não encontrado ou não é de texto: ${raw}`);
+    if (!ch || !isLinkableChannel(ch)) {
+      throw new ArgError(`canal do Discord não encontrado ou não é linkável (canal de texto ou thread): ${raw}`);
     }
-    return { id: ch.id, name: ch.name };
+    return { id: ch.id, name: ch.name, thread: ch.type !== ChannelType.GuildText };
   }
 
   if (!guild) throw new ArgError('servidor Discord não identificado; informe o canal por menção ou id (ou defina DISCORD_GUILD_ID).');
 
   const wanted = raw.replace(/^#/, '').toLowerCase();
-  const texts = [...guild.channels.cache.values()].flatMap((c) => (c.type === ChannelType.GuildText ? [c] : []));
-  const exact = texts.filter((c) => c.name.toLowerCase() === wanted);
-  const matches = exact.length ? exact : texts.filter((c) => c.name.toLowerCase().includes(wanted));
-  if (matches.length === 1) return { id: matches[0]!.id, name: matches[0]!.name };
-  if (!matches.length) throw new ArgError(`nenhum canal de texto do Discord casa com "${raw}".`);
+  // thread é canal e vive na cache de canais do client: quem linka pelo nome usa o nome da thread
+  const channels = [...client.channels.cache.values()].filter(
+    (c): c is LinkableChannel => isLinkableChannel(c) && c.guildId === guild.id
+  );
+  const exact = channels.filter((c) => c.name.toLowerCase() === wanted);
+  const matches = exact.length ? exact : channels.filter((c) => c.name.toLowerCase().includes(wanted));
+  if (matches.length === 1)
+    return { id: matches[0]!.id, name: matches[0]!.name, thread: matches[0]!.type !== ChannelType.GuildText };
+  if (!matches.length) throw new ArgError(`nenhum canal de texto ou thread do Discord casa com "${raw}".`);
   throw new ArgError(
     `"${raw}" casa com mais de um canal: ${matches.slice(0, 5).map((c) => `#${c.name}`).join(', ')}. Use a menção ou o id.`
   );

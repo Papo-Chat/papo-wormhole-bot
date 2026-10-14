@@ -860,3 +860,132 @@ describe('mídia do preview no Discord', () => {
 		expect(outbox.counts().dead).toBe(0);
 	});
 });
+
+describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
+	/**
+	 * `cdn.discordapp.com` / `media.discordapp.net` expiram junto com a mensagem original e o
+	 * hotlink é bloqueado: o bridge baixa e re-envia como arquivo da mensagem do Papo.
+	 */
+	it('embed com mídia do CDN do Discord sai como arquivo baixado, não URL no card', async () => {
+		const { bridge, api, settle } = fixture();
+		const { urls } = await withFetch(
+			async () => new Response(Buffer.from('imagem-do-discord'), { status: 200, headers: { 'content-type': 'image/png' } }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'olha a foto', {
+						embeds: [
+							{
+								type: 'image',
+								url: 'https://cdn.discordapp.com/attachments/111/222/foto.png',
+								title: 'foto.png',
+								image: {
+									url: 'https://cdn.discordapp.com/attachments/111/222/foto.png',
+									proxy_url: 'https://media.discordapp.net/attachments/111/222/foto.png?ex=66&is=66&hm=aa',
+									width: 400,
+									height: 300,
+									content_type: 'image/png'
+								}
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		const sent = api.sent[0]!;
+		expect(sent.attachments?.map((a) => a.name)).toEqual(['foto.png']);
+		// baixado do CDN, não do proxy assinado
+		expect(urls).toContain('https://cdn.discordapp.com/attachments/111/222/foto.png');
+		// o card da ponte é o único embed: o preview não acrescenta nada além de uma URL que quebra
+		expect(sent.embeds ?? []).toHaveLength(1);
+		expect(sent.embeds![0]!.description).toBe('olha a foto');
+	});
+
+	it('link de arquivo do Discord colado no texto também vira anexo', async () => {
+		const { bridge, api, settle } = fixture();
+		const { urls } = await withFetch(
+			async () => new Response(Buffer.from('video-colado'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				await bridge.onDiscordMessage(discordMessage('dm-1', 'https://cdn.discordapp.com/attachments/111/222/clipe.mp4'));
+				await settle();
+			}
+		);
+
+		const sent = api.sent[0]!;
+		expect(sent.attachments?.map((a) => a.name)).toEqual(['clipe.mp4']);
+		expect(urls).toContain('https://cdn.discordapp.com/attachments/111/222/clipe.mp4');
+	});
+
+	it('a mesma mídia servida por outro host não é baixada duas vezes', async () => {
+		const { bridge, api, settle } = fixture();
+		await withFetch(
+			async () => new Response(Buffer.from('gif-do-picker'), { status: 200, headers: { 'content-type': 'image/gif' } }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'gif', {
+						attachments: [{ id: 'att-1', name: 'gif.gif', url: 'https://cdn.discordapp.com/attachments/111/222/gif.gif', size: 12, contentType: 'image/gif' }],
+						embeds: [
+							{
+								type: 'gifv',
+								url: 'https://klipy.com/gifs/algo',
+								title: 'GIF',
+								image: { url: 'https://media.discordapp.net/attachments/111/222/gif.gif', width: 300, height: 224, content_type: 'image/gif' }
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['gif.gif']);
+	});
+
+	it('GIF que só existe como imagem do embed do Discord sobrevive animado como arquivo', async () => {
+		const { bridge, api, settle } = fixture();
+		await withFetch(
+			async () => new Response(Buffer.from('gif-animado'), { status: 200, headers: { 'content-type': 'image/gif' } }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'olha o gif', {
+						embeds: [
+							{
+								type: 'image',
+								url: 'https://cdn.discordapp.com/attachments/111/222/animado.gif',
+								title: 'animado.gif',
+								image: { url: 'https://cdn.discordapp.com/attachments/111/222/animado.gif', width: 300, height: 224, content_type: 'image/gif' }
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['animado.gif']);
+	});
+
+	it('com anexos desligados o preview continua com a URL (não há para onde re-hospedar)', async () => {
+		const { store, bridge, api, link, settle } = fixture();
+		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
+		await bridge.onDiscordMessage(
+			discordMessage('dm-1', 'olha a foto', {
+				embeds: [
+					{
+						type: 'image',
+						url: 'https://cdn.discordapp.com/attachments/111/222/foto.png',
+						title: 'foto.png',
+						image: { url: 'https://cdn.discordapp.com/attachments/111/222/foto.png', width: 400, height: 300, content_type: 'image/png' }
+					}
+				]
+			})
+		);
+		await settle();
+
+		const sent = api.sent[0]!;
+		expect(sent.attachments ?? []).toHaveLength(0);
+		expect(sent.embeds ?? []).toHaveLength(2);
+		expect(sent.embeds![1]!.thumbnail?.url).toBe('https://cdn.discordapp.com/attachments/111/222/foto.png');
+	});
+});

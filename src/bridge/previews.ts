@@ -3,8 +3,13 @@ import type { PapoEmbed, PapoEmbedInput } from '../papo/types.js';
 import {
 	discordEmbedMedia,
 	discordEmbedsToPapo,
+	discordMediaSourceUrl,
+	isDiscordHostedMedia,
+	isDiscordMediaUrl,
 	papoEmbedsToDiscord,
 	type DiscordEmbedPayload,
+	type DiscordMedia,
+	type DiscordToPapoOptions,
 	type PreviewMedia
 } from './embeds.js';
 import { DISCORD_LIMITS, clampText } from './limits.js';
@@ -34,7 +39,7 @@ const urlOf = (e: { url?: string | null }): string | undefined => (e.url ? e.url
  * `media.discordapp.net` no embed) e com assinatura de proxy na query; o caminho é o que
  * permanece igual. Picker de GIF (Klipy/Giphy) chega como anexo **e** embed da mesma mídia.
  */
-const mediaKey = (url?: string | null): string | undefined => {
+export const mediaKey = (url?: string | null): string | undefined => {
 	if (!url) return undefined;
 	try {
 		return new URL(url).pathname.toLowerCase();
@@ -57,10 +62,12 @@ export function rawDiscordEmbeds(embeds: readonly APIEmbed[] | undefined): APIEm
  * `attachmentUrls`: mídia que já sai como anexo da mensagem bridgeada. Preview que representa
  * a mesma mídia (mesmo caminho, ainda que em outro host) é descartado: o GIF ou a imagem já
  * vai no destino como arquivo, e um embed atrás dele seria a mesma coisa duplicada.
+ * `rehostDiscordMedia`: mídia hospedada pelo Discord sai do embed (vai como anexo baixado).
  */
 export function firstDiscordPreview(
 	embeds: readonly APIEmbed[] | undefined,
-	attachmentUrls: readonly string[] = []
+	attachmentUrls: readonly string[] = [],
+	opts: DiscordToPapoOptions = {}
 ): PapoEmbedInput | undefined {
 	const bridged = new Set(attachmentUrls.map(mediaKey).filter(Boolean));
 	for (const e of embeds ?? []) {
@@ -71,10 +78,60 @@ export function firstDiscordPreview(
 			.flatMap((m) => (typeof m === 'string' ? [m] : m ? [m.url, m.origin] : []))
 			.map(mediaKey);
 		if (keys.some((key) => key && bridged.has(key))) continue;
-		const [converted] = discordEmbedsToPapo([payload]);
-		if (converted && Object.keys(converted).length) return converted;
+		const [converted] = discordEmbedsToPapo([payload], opts);
+		if (!converted || !Object.keys(converted).length) continue;
+		// preview que só existia pela mídia do CDN: re-hospedada como anexo, o card não acrescenta
+		// nada além de uma URL que quebra
+		if (
+			opts.rehostDiscordMedia &&
+			!converted.thumbnail &&
+			!converted.image &&
+			!converted.video &&
+			isDiscordMediaUrl(converted.url)
+		)
+			continue;
+		return converted;
 	}
 	return undefined;
+}
+
+/**
+ * Toda mídia que o Discord hospeda nos embeds da mensagem (imagem de anexo, preview de
+ * imagem, vídeo do picker). O bridge baixa cada uma e reenvia como anexo da mensagem no Papo:
+ * a URL do CDN expira junto com a mensagem original.
+ */
+export function discordHostedMedia(embeds: readonly APIEmbed[] | undefined): DiscordMedia[] {
+	const out: DiscordMedia[] = [];
+	const seen = new Set<string>();
+	for (const e of embeds ?? []) {
+		const { images, videos } = discordEmbedMedia(e as unknown as DiscordEmbedPayload);
+		for (const m of [...images, ...videos]) {
+			if (!isDiscordHostedMedia(m)) continue;
+			const key = mediaKey(discordMediaSourceUrl(m));
+			if (!key || seen.has(key)) continue;
+			seen.add(key);
+			out.push(m);
+		}
+	}
+	return out;
+}
+
+const CONTENT_URL_RE = /https?:\/\/[^\s<>"'`)\]]+/g;
+
+/**
+ * Links de arquivo do Discord escritos no texto da mensagem. Quem cola
+ * `https://cdn.discordapp.com/attachments/…` no Discord quer a mídia, não o link: o bridge
+ * baixa e reenvia como anexo no Papo. Cerca de código não é link.
+ */
+export function discordMediaLinksInContent(content?: string | null): string[] {
+	if (!content) return [];
+	const prose = content.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]*`/g, ' ');
+	const out: string[] = [];
+	for (const m of prose.matchAll(CONTENT_URL_RE)) {
+		const url = m[0]?.replace(/[.,;:!?]+$/, '');
+		if (url && isDiscordMediaUrl(url)) out.push(url);
+	}
+	return out;
 }
 
 /**

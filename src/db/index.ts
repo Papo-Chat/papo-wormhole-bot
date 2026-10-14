@@ -29,6 +29,7 @@ const COLUMN_ADDITIONS: [string, string][] = [
 	['message_map', 'bridge_embed TEXT'],
 	['message_map', 'footer_base TEXT'],
 	['message_map', 'link_embeds TEXT'],
+	['message_map', 'reply_note TEXT'],
 	['message_map', 'edit_revision TEXT'],
 	['message_map', 'embed_revision TEXT'],
 	['message_map', 'webhook_copy INTEGER NOT NULL DEFAULT 0'],
