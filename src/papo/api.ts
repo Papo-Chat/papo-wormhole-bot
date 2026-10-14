@@ -45,6 +45,8 @@ export interface OutAttachment {
 }
 
 export interface SendMessageInput {
+    /** Trusted integration attribution; never an authenticated Papo user id. */
+    externalAuthor?: import('./types.js').PapoExternalAuthor;
 	channelId: string;
 	content?: string | null;
 	replyTo?: string | null;
@@ -347,6 +349,7 @@ export class PapoApi {
 			form.append('attachments', new Blob([new Uint8Array(a.data)], { type: a.mime ?? 'application/octet-stream' }), a.name);
 		}
 		if (input.embeds?.length) form.append('embeds', JSON.stringify(input.embeds));
+        if (input.externalAuthor) form.append('external_author', JSON.stringify(input.externalAuthor));
 		return this.request<PapoMessage>('/messages', { method: 'POST', body: form });
 	}
 

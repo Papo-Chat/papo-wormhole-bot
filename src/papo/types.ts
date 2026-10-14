@@ -99,7 +99,16 @@ export interface PapoReactionSummary {
 	count: number;
 }
 
+export interface PapoExternalAuthor {
+    source: string;
+    id: string;
+    name: string;
+    avatar_url?: string;
+    profile_url?: string;
+}
+
 export interface PapoMessage {
+    external_author?: PapoExternalAuthor | null;
 	id: string;
 	channel_id: string;
 	author_id: string;

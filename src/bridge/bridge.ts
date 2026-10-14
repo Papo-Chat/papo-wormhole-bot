@@ -1256,6 +1256,8 @@ export class Bridge {
 				chunkIndex: i,
 				chunkTotal: total,
 				authorName: displayName,
+                authorId: m.author.id,
+                authorAvatarUrl: avatarUrl,
 				content: chunkContent,
 				footerBase: `🕒 ${formatDate(m.createdAt.toISOString(), this.cfg.bridge.timezone)} · Discord${chunkLabel(i, total)}`,
 				notes: [],
@@ -2149,7 +2151,10 @@ export class Bridge {
 			const attachments = groups[g]!.map((f) => ({ name: f.name, data: f.data, mime: f.mime }));
 			const extra = g > 0;
 
-			const embeds = extra
+			const native = Boolean(job.authorId);
+            const embeds = native
+                ? (extra ? [] : (job.linkEmbeds ?? []))
+                : extra
 				? [
 						buildPapoBridgeEmbed({
 							authorName: job.authorName,
@@ -2160,7 +2165,7 @@ export class Bridge {
 					]
 				: [embed, ...(job.linkEmbeds ?? [])].filter(Boolean);
 
-			const mainEmbed = extra ? undefined : embeds[0];
+			const mainEmbed = native ? undefined : (extra ? undefined : embeds[0]);
 			if (mainEmbed) {
 				mainEmbed.description = this.withReactionSummary(
 					text,
@@ -2181,7 +2186,16 @@ export class Bridge {
 			markAttempt();
 			const created = await this.sendToPapoSafe({
 				channelId: job.papoChannelId,
-				content: undefined,
+				content: native
+                    ? this.withReactionSummary(text, await this.reactionSummaryFor('papo',
+                        this.store.listReactions(job.linkId, 'discord', job.discordMessageId)), 8192)
+                    : undefined,
+                externalAuthor: native ? {
+                    source: 'discord',
+                    id: job.authorId!,
+                    name: job.authorName,
+                    ...(job.authorAvatarUrl ? { avatar_url: job.authorAvatarUrl } : {})
+                } : undefined,
 				replyTo: extra ? lastPapoId : this.copyForDiscordMessage(job.replyRefDiscordId),
 				attachments,
 				embeds: embeds.length ? (embeds as ToPapoMessageJob['linkEmbeds']) : undefined
@@ -2323,7 +2337,14 @@ export class Bridge {
 			this.log.debug({ papoMessageId: map.papo_message_id }, 'edição ignorada: mensagem do Papo não é do bot');
 			return;
 		}
-		const embed = await this.papoCopyEmbed(map, job.text);
+		if (!map.bridge_embed) {
+            const content = this.withReactionSummary(job.text,
+                await this.reactionSummaryForMap(map, 'papo'), 8192);
+            await this.api.editMessage(map.papo_message_id, content, this.mapPreviews<PapoEmbedInput>(map));
+            this.store.updateMapSnapshot(map.id, { rendered: job.text, edit_revision: job.revision ?? null });
+            return;
+        }
+        const embed = await this.papoCopyEmbed(map, job.text);
 		await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
 		this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed, edit_revision: job.revision ?? null });
 	}
@@ -2397,8 +2418,10 @@ export class Bridge {
 			);
 		}
 		const embeds = fitEmbedBudget([...(card ? [card] : []), ...previews], PAPO_LIMITS.embedTotalChars);
-		if (!embeds.length) return;
-		await this.api.editMessage(map.papo_message_id, '', embeds);
+		if (!embeds.length && card) return;
+        const content = card ? '' : this.withReactionSummary(
+            map.rendered ?? '', await this.reactionSummaryForMap(map, 'papo'), 8192);
+		await this.api.editMessage(map.papo_message_id, content, embeds);
 		this.store.updateMapSnapshot(map.id, { link_embeds: previews, embed_revision: job.revision ?? null });
 	}
 
@@ -2472,7 +2495,7 @@ export class Bridge {
 	private async refreshFooter(job: EditJob): Promise<void> {
 		const maps =
 			job.side === 'papo' ? this.store.findMapByPapo(job.sourceMessageId) : this.store.findMapByDiscord(job.sourceMessageId);
-		const targets = maps.filter((m) => (m.bridge_embed || m.webhook_copy) && !m.deleted);
+		const targets = maps.filter((m) => (m.bridge_embed || m.webhook_copy || m.direction === 'discord_to_papo') && !m.deleted);
 		if (!targets.length) {
 			// mensagem ponte antiga (sem snapshot) ou sem embed: nada a atualizar
 			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'embed sem snapshot: resumo de reações ignorado');
@@ -2515,6 +2538,12 @@ export class Bridge {
 			}
 			// a cópia editável está no Papo: o texto mora no embed, `content` fica limpo
 			if (!map.papo_message_id) continue;
+            if (!map.bridge_embed) {
+                const content = this.withReactionSummary(map.rendered ?? '',
+                    await this.reactionSummaryForMap(map, 'papo'), 8192);
+                await this.api.editMessage(map.papo_message_id, content, this.mapPreviews<PapoEmbedInput>(map));
+                continue;
+            }
 			const embed = JSON.parse(map.bridge_embed!) as PapoEmbedInput;
 			embed.description = this.withReactionSummary(
 				map.rendered ?? '',

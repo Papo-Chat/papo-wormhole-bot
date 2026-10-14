@@ -55,6 +55,9 @@ export interface ToPapoMessageJob {
 	chunkIndex: number;
 	chunkTotal: number;
 	authorName: string;
+    /** Stable external identity captured at ingestion, not resolved on retry. */
+    authorId?: string;
+    authorAvatarUrl?: string;
 	content: string;
 	footerBase: string;
 	bridgeEmbed?: PapoEmbedInput;
