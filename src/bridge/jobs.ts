@@ -17,6 +17,11 @@ export interface SourceRef {
 	 * a animação quando o player do Discord só expõe o mp4 em loop. Só vale se vier um GIF.
 	 */
 	gifVariant?: string;
+	/**
+	 * Segunda URL do mesmo arquivo, tentada depois da principal: a origem intocada e o proxy do
+	 * Discord são planos B um do outro (`discordMediaDownloadUrls`).
+	 */
+	fallback?: string;
 	moderationStatus?: string;
 }
 

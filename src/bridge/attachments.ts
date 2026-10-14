@@ -1,5 +1,6 @@
 import { gzip, isCompressibleMime, partition, tarGz } from './tar.js';
 import { sniffMedia } from './media.js';
+import { isDiscordMediaUrl } from './embeds.js';
 import { PART_TARGET_BYTES } from './limits.js';
 
 /**
@@ -99,7 +100,10 @@ export async function prepareAttachments(
 			data = await a.download();
 		} catch (err) {
 			if (err instanceof SourceGoneError) {
-				notes.push(`⚠️ anexo "${a.name}" não está mais disponível na origem (não reenviado).`);
+				// o link do CDN não abre fora do Discord (assinatura vencida); o da origem sim, e
+				// ele é o resto que fica da mídia quando ela não pôde ser reenviada
+				const link = a.directUrl && !isDiscordMediaUrl(a.directUrl) ? `: ${a.directUrl}` : '';
+				notes.push(`⚠️ anexo "${a.name}" não está mais disponível na origem (não reenviado)${link}.`);
 				continue;
 			}
 			throw err;

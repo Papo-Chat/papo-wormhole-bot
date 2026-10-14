@@ -795,6 +795,7 @@ describe('preview do Discord que chega depois da mensagem', () => {
 
 	it('GIF que só existe como imagem do embed vai como arquivo animado', async () => {
 		const { bridge, api, settle } = fixture();
+		const origin = 'https://media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif';
 		const { urls } = await withFetch(
 			async () => new Response(Buffer.from('gif-animado'), { status: 200, headers: { 'content-type': 'image/gif' } }),
 			async () => {
@@ -806,7 +807,7 @@ describe('preview do Discord que chega depois da mensagem', () => {
 								url: 'https://giphy.com/gifs/lkdH8FmImcGoylv3t3',
 								title: 'GIF',
 								image: {
-									url: 'https://media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif',
+									url: origin,
 									proxy_url: 'https://images-ext-1.discordapp.net/external/ZgLT/https/media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif',
 									width: 300,
 									height: 224,
@@ -822,10 +823,78 @@ describe('preview do Discord que chega depois da mensagem', () => {
 
 		// o Papo re-encode a imagem do embed como thumbnail estática: animação só sobrevive como arquivo
 		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['lkdH8FmImcGoylv3t3-giphy.gif']);
-		expect(urls.some((u) => u.includes('giphy.gif'))).toBe(true);
+		// baixado da origem intocada: o proxy do Discord re-encode para caber no embed e devolve o
+		// GIF como um frame parado
+		expect(urls).toEqual([origin]);
 		const preview = api.sent[0]!.embeds![1]!;
 		expect(preview.title).toBe('GIF');
 		expect(preview.thumbnail).toBeUndefined();
+	});
+
+	it('o link do GIF sai do texto quando o arquivo animado chega: o backend não cria o preview dele', async () => {
+		const { bridge, api, settle } = fixture();
+		await withFetch(
+			async () => new Response(Buffer.from('GIF89a' + 'gif-animado'), { status: 200, headers: { 'content-type': 'image/gif' } }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'olha https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y 😂', {
+						embeds: [
+							{
+								type: 'gif',
+								url: 'https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y',
+								title: 'GIF',
+								image: {
+									url: 'https://media.giphy.com/media/okfvUCpgArv3y/giphy.gif',
+									proxy_url: 'https://images-ext-1.discordapp.net/external/ZgLT/https/media.giphy.com/media/okfvUCpgArv3y/giphy.gif',
+									width: 300,
+									height: 224,
+									content_type: 'image/gif'
+								}
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		const sent = api.sent[0]!;
+		expect(sent.attachments?.map((a) => a.name)).toEqual(['okfvUCpgArv3y-giphy.gif']);
+		// o texto continua, sem o link: embaixo do arquivo ele seria a mesma imagem duas vezes
+		expect(sent.embeds![0]!.description).toBe('olha 😂');
+		// a página não se perde: segue como link clicável do cartão de preview
+		expect(sent.embeds![1]!.url).toBe('https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y');
+	});
+
+	it('mensagem que é só o link do GIF chega com o arquivo e sem eco da URL', async () => {
+		const { bridge, api, settle } = fixture();
+		await withFetch(
+			async () => new Response(Buffer.from('GIF89a' + 'gif-animado'), { status: 200, headers: { 'content-type': 'image/gif' } }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y', {
+						embeds: [
+							{
+								type: 'gif',
+								url: 'https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y',
+								title: 'GIF',
+								image: {
+									url: 'https://media.giphy.com/media/okfvUCpgArv3y/giphy.gif',
+									width: 300,
+									height: 224,
+									content_type: 'image/gif'
+								}
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		const sent = api.sent[0]!;
+		expect(sent.attachments?.map((a) => a.name)).toEqual(['okfvUCpgArv3y-giphy.gif']);
+		expect(sent.embeds![0]!.description).toBe('');
 	});
 });
 
@@ -1088,12 +1157,15 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 	it('variante `.gif` que não devolve um GIF não é o arquivo: o loop continua', async () => {
 		const { bridge, api, settle } = fixture();
 		const gifUrl = 'https://static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.gif';
+		const originUrl = 'https://static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.mp4';
 		const mp4Url = 'https://images-ext-1.discordapp.net/external/P17-/https/static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.mp4';
 		const { urls } = await withFetch(
 			async (url) =>
 				url === gifUrl
 					? new Response(Buffer.from('<html>player</html>'), { status: 200, headers: { 'content-type': 'text/html' } })
-					: new Response(Buffer.from('ftypisomloop-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+					: url === originUrl
+						? new Response(null, { status: 404 })
+						: new Response(Buffer.from('ftypisomloop-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
 			async () => {
 				await bridge.onDiscordMessage(
 					discordMessage('dm-1', 'olha o gif', {
@@ -1103,7 +1175,7 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 								url: 'https://klipy.com/gifs/orihime',
 								title: 'Orihime',
 								video: {
-									url: 'https://static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.mp4',
+									url: originUrl,
 									proxy_url: mp4Url,
 									width: 640,
 									height: 640
@@ -1118,7 +1190,8 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 
 		// uma URL terminada em `.gif` que devolve outra coisa é o player respondendo no lugar do
 		// arquivo: o destino receberia mídia com nome errado
-		expect(urls).toEqual([gifUrl, mp4Url]);
+		// a origem intocada vem antes do proxy do Discord, que re-encode para caber no embed
+		expect(urls).toEqual([gifUrl, originUrl, mp4Url]);
 		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['d7ae-vTXuDBugGeZn6Djx.mp4']);
 	});
 
@@ -1149,6 +1222,100 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 		// o GIF da mensagem é um só: o mp4 em loop e o frame estático são re-encode dele
 		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['giphy.gif']);
 		expect(api.sent[0]!.embeds).toHaveLength(1);
+	});
+
+	it('o link do GIF sai do texto quando o arquivo animado chega: o backend não cria o preview dele', async () => {
+		const { bridge, api, settle } = fixture();
+		await withFetch(
+			async () => new Response(Buffer.from('GIF89a' + 'gif-animado'), { status: 200, headers: { 'content-type': 'image/gif' } }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'olha https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y 😂', {
+						embeds: [
+							{
+								type: 'gif',
+								url: 'https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y',
+								title: 'GIF',
+								image: {
+									url: 'https://media.giphy.com/media/okfvUCpgArv3y/giphy.gif',
+									proxy_url: 'https://images-ext-1.discordapp.net/external/ZgLT/https/media.giphy.com/media/okfvUCpgArv3y/giphy.gif',
+									width: 300,
+									height: 224,
+									content_type: 'image/gif'
+								}
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		const sent = api.sent[0]!;
+		expect(sent.attachments?.map((a) => a.name)).toEqual(['okfvUCpgArv3y-giphy.gif']);
+		// o texto continua, sem o link: embaixo do arquivo animado ele seria a mesma imagem duas vezes
+		expect(sent.embeds![0]!.description).toBe('olha 😂');
+		// a página não se perde: segue como link clicável do cartão de preview
+		expect(sent.embeds![1]!.url).toBe('https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y');
+	});
+
+	it('mensagem que é só o link do GIF chega com o arquivo e sem eco da URL', async () => {
+		const { bridge, api, settle } = fixture();
+		await withFetch(
+			async () => new Response(Buffer.from('GIF89a' + 'gif-animado'), { status: 200, headers: { 'content-type': 'image/gif' } }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y', {
+						embeds: [
+							{
+								type: 'gif',
+								url: 'https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y',
+								title: 'GIF',
+								image: {
+									url: 'https://media.giphy.com/media/okfvUCpgArv3y/giphy.gif',
+									width: 300,
+									height: 224,
+									content_type: 'image/gif'
+								}
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		// sem o link no texto e sem o eco da URL do preview: o arquivo é a mensagem
+		const sent = api.sent[0]!;
+		expect(sent.attachments?.map((a) => a.name)).toEqual(['okfvUCpgArv3y-giphy.gif']);
+		expect(sent.embeds![0]!.description).toBe('');
+	});
+
+	it('com anexos desligados o link do GIF continua no texto: é o único transporte', async () => {
+		const { store, bridge, api, link, settle } = fixture();
+		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
+		await bridge.onDiscordMessage(
+			discordMessage('dm-1', 'olha https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y', {
+				embeds: [
+					{
+						type: 'gif',
+						url: 'https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y',
+						title: 'GIF',
+						image: {
+							url: 'https://media.giphy.com/media/okfvUCpgArv3y/giphy.gif',
+							width: 300,
+							height: 224,
+							content_type: 'image/gif'
+						}
+					}
+				]
+			})
+		);
+		await settle();
+
+		const sent = api.sent[0]!;
+		expect(sent.attachments ?? []).toHaveLength(0);
+		expect(sent.embeds![0]!.description).toContain('giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y');
 	});
 
 	it('com anexos desligados o GIF continua como loop no card: não há para onde anexar', async () => {
@@ -1326,6 +1493,37 @@ describe('link de anexo do Discord com assinatura vencida', () => {
 		expect(sent.embeds![0]!.description).toContain('não está mais disponível');
 		// o job não vai para `dead`: perder um arquivo não é motivo para perder a mensagem
 		expect(outbox.counts().dead).toBe(0);
+	});
+
+	it('GIF de origem externa que some: o aviso devolve a URL da origem, já que o link saiu do texto', async () => {
+		const { bridge, api, settle } = fixture();
+		const origin = 'https://media.giphy.com/media/okfvUCpgArv3y/giphy.gif';
+		await withFetch(
+			async () => new Response(null, { status: 404 }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'olha https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y', {
+						embeds: [
+							{
+								type: 'gif',
+								url: 'https://giphy.com/gifs/funny-happy-excited-okfvUCpgArv3y',
+								title: 'GIF',
+								image: { url: origin, width: 300, height: 224, content_type: 'image/gif' }
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		const sent = api.sent[0]!;
+		expect(sent.attachments ?? []).toHaveLength(0);
+		const description = sent.embeds![0]!.description!;
+		// o link da página saiu do texto (era o preview duplicado); o que volta é o caminho do
+		// arquivo, que ainda abre fora do Discord
+		expect(description).not.toContain('giphy.com/gifs/funny');
+		expect(description).toContain(origin);
 	});
 
 	it('429 do CDN é transitório: o bridge re-tenta em vez de descartar a mídia', async () => {

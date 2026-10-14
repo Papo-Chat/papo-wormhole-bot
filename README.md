@@ -259,8 +259,12 @@ trabalho (commite ou `git stash` antes).
   um frame estático — o Papo desenharia isso como player de vídeo, e a animação morre ali. O bridge
   usa o anexo `.gif` quando existe, senão a mídia `image/gif` do embed, senão a variante `.gif` do
   mesmo caminho (`…/vTXu.mp4` → `…/vTXu.gif`, onde Klipy e Giphy servem os dois), conferindo a magic
-  antes de aceitar e caindo no mp4 se a variante não existir. O loop e o frame param de andar atrás
-  do arquivo, e o nome do anexo acompanha o tipo que os bytes realmente são.
+  antes de aceitar e caindo no mp4 se a variante não existir. O arquivo é baixado da **origem
+  intocada**, com o proxy do Discord como plano B: o proxy re-encode para caber no embed e devolve o
+  GIF como frame parado. O loop e o frame param de andar atrás do arquivo, o nome do anexo acompanha
+  o tipo que os bytes realmente são, e **o link do GIF sai do texto** — o backend do Papo cria o
+  preview dele a partir da URL escrita, o que seria a mesma imagem duas vezes; a página continua como
+  link do cartão de preview.
 - Thread do Discord é linkável a um canal do Papo (`/link-channel`), que é o que a thread vira do
   outro lado: o Papo não tem thread. O bridge entra na thread (o Discord só entrega mensagens de
   uma thread a quem é membro) e as cópias entram nela; webhook de thread é o do canal pai, com a
