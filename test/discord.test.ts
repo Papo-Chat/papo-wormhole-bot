@@ -94,3 +94,49 @@ describe('intents do bridge', () => {
 		void bridge.destroy();
 	});
 });
+
+describe('link de mensagem (reply de webhook)', () => {
+	it('compõe o link permanente a partir do guild do canal', () => {
+		const bridge = new DiscordBridge({ token: 'x', handlers: {} });
+		bridge.client.channels.cache.set('222', { guildId: '999' } as never);
+		expect(bridge.messageLink('222', '333')).toBe('https://discord.com/channels/999/222/333');
+		void bridge.destroy();
+	});
+
+	it('sem guild conhecido não inventa link', () => {
+		const bridge = new DiscordBridge({ token: 'x', handlers: {} });
+		expect(bridge.messageLink('222', '333')).toBeUndefined();
+		void bridge.destroy();
+	});
+});
+
+describe('threads', () => {
+	it('encaminha threadCreate e threadUpdate para os handlers do bridge', () => {
+		const events: unknown[][] = [];
+		const bridge = new DiscordBridge({
+			token: 'x',
+			handlers: {
+				onThreadCreate: (threadId, parentId, name) => events.push(['create', threadId, parentId, name]),
+				onThreadUpdate: (threadId, parentId, name, archived) => events.push(['update', threadId, parentId, name, archived])
+			}
+		});
+		bridge.client.emit('threadCreate', { id: '333', parentId: '111', name: 'conversa' } as never, true);
+		bridge.client.emit(
+			'threadUpdate',
+			{ id: '333', parentId: '111', name: 'conversa', archived: false } as never,
+			{ id: '333', parentId: '111', name: 'conversa', archived: true } as never
+		);
+		expect(events).toEqual([
+			['create', '333', '111', 'conversa'],
+			['update', '333', '111', 'conversa', true]
+		]);
+		void bridge.destroy();
+	});
+
+	it('thread não linkada não é conferida como thread', () => {
+		const bridge = new DiscordBridge({ token: 'x', handlers: {} });
+		bridge.client.channels.cache.set('222', { guildId: '999' } as never);
+		expect(bridge.isThread('222')).toBe(false);
+		void bridge.destroy();
+	});
+});
