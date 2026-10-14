@@ -343,6 +343,10 @@ export class PapoApi {
 	}
 
 	hasWebhook(channelId:string):boolean {return Boolean(this.opts.webhooks?.[channelId]);}
+    isOwnWebhook(channelId:string,webhookId:string|null|undefined):boolean {
+        const hook=this.opts.webhooks?.[channelId];
+        return Boolean(hook && webhookId && hook.id===webhookId);
+    }
 
     async sendMessage(input: SendMessageInput): Promise<PapoMessage> {
 		const form = new FormData();

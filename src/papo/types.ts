@@ -108,6 +108,7 @@ export interface PapoExternalAuthor {
 }
 
 export interface PapoMessage {
+    webhook_id?: string | null;
     external_author?: PapoExternalAuthor | null;
 	id: string;
 	channel_id: string;
@@ -168,6 +169,8 @@ export interface PapoWhoami {
 
 /** Evento WS outbound `message` (sem embeds/reactions). */
 export interface PapoWsMessageEvent {
+    webhook_id?: string | null;
+    external_author?: PapoExternalAuthor | null;
 	type: 'message';
 	id: string;
 	channel_id: string;

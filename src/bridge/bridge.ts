@@ -456,7 +456,10 @@ export class Bridge {
 	}
 
 	private async onPapoMessage(msg: PapoWsMessageEvent | PapoMessage): Promise<void> {
-		if (msg.author_id === this.papoUserId) return; // anti-loop
+		if (msg.author_id === this.papoUserId) return; // legacy bot anti-loop
+        // Incoming webhooks have no Papo user id: match the actual webhook
+        // credential before async map persistence can complete.
+        if (this.api.isOwnWebhook(msg.channel_id,msg.webhook_id)) return;
 		if (this.store.findMapByPapo(msg.id).length) return; // idempotência
 
 		//se for um comando ja despachamos logo
@@ -468,7 +471,14 @@ export class Bridge {
 		const link = this.linkForPapoChannel(msg.channel_id);
 		if (!link) return;
 
-		const author = await this.identity.author(msg.author_id);
+		const author = msg.author_id
+            ? await this.identity.author(msg.author_id)
+            : {
+                userId:msg.webhook_id ?? '',
+                username:msg.external_author?.name ?? 'webhook',
+                name:msg.external_author?.name ?? 'webhook',
+                avatarUrl:msg.external_author?.avatar_url,
+            };
 		await this.warmPapoMentions(msg.content ?? '');
 		if (this.propagatesMentions(link) && /@/.test(msg.content ?? '')) await this.discord.ensureMemberIndex?.();
 		const preview = await this.papoPreview(msg);
