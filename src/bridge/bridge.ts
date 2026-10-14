@@ -477,6 +477,7 @@ export class Bridge {
                 userId:msg.webhook_id ?? '',
                 username:msg.external_author?.name ?? 'webhook',
                 name:msg.external_author?.name ?? 'webhook',
+                avatarSha:undefined,
                 avatarUrl:msg.external_author?.avatar_url,
             };
 		await this.warmPapoMentions(msg.content ?? '');
