@@ -155,43 +155,17 @@ export function discordGifOf(
 		const payload = e as unknown as DiscordEmbedPayload;
 		const { images, videos } = discordEmbedMedia(payload);
 		const [gif] = images.filter((m) => m.mime === 'image/gif');
-		if (gif) return { media: gif };
+		if (gif) return { media: { ...gif, url: discordMediaSourceUrl(gif) } };
 		if (!isGifPlayerEmbed(payload)) continue;
 		for (const m of [...videos, ...images]) {
 			const variant = gifVariantUrl(m.origin) ?? gifVariantUrl(m.url);
 			if (!variant) continue;
-			// o mp4 que o Discord garante continua sendo a URL de destino: a variante é
+			// o mp4 que o Discord garante continua sendo a URL do destino: a variante é
 			// tentativa, não substituta
-			return { media: { ...m, gifVariant: variant } };
+			return { media: { ...m, url: discordMediaSourceUrl(m), gifVariant: variant } };
 		}
 	}
 	return undefined;
-}
-
-/** Embed que carrega um GIF: o player do Discord ou uma mídia `image/gif` de preview. */
-const carriesGif = (payload: DiscordEmbedPayload): boolean => {
-	if (isGifPlayerEmbed(payload)) return true;
-	return discordEmbedMedia(payload).images.some((m) => m.mime === 'image/gif');
-};
-
-/**
- * URLs que o arquivo do GIF já cobre: a página do preview e os caminhos da mídia do player.
- * Elas saem do texto bridgeado — o backend do Papo cria o preview dele a partir da URL escrita, e
- * embaixo do arquivo animado que chegou isso é a mesma imagem duas vezes.
- */
-export function discordGifLinks(embeds: readonly APIEmbed[] | undefined): string[] {
-	const out: string[] = [];
-	for (const e of embeds ?? []) {
-		const payload = e as unknown as DiscordEmbedPayload;
-		if (!carriesGif(payload)) continue;
-		if (payload.url) out.push(payload.url);
-		const { images, videos } = discordEmbedMedia(payload);
-		for (const m of [...images, ...videos]) {
-			if (m.url) out.push(m.url);
-			if (m.origin) out.push(m.origin);
-		}
-	}
-	return out;
 }
 
 const CONTENT_URL_RE = /https?:\/\/[^\s<>"'`)\]]+/g;
@@ -214,38 +188,23 @@ export function discordMediaLinksInContent(content?: string | null): string[] {
 
 const MARKDOWN_LINK_RE = /\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g;
 
-/** Identidade de um link escrito no texto: host + caminho, sem query nem barra final. */
-const linkKey = (url?: string | null): string | undefined => {
-	if (!url) return undefined;
-	try {
-		const u = new URL(url);
-		return `${u.host}${u.pathname}`.toLowerCase().replace(/\/+$/, '');
-	} catch {
-		return undefined;
-	}
-};
-
 /**
- * Tira do texto os links que o bridge já reenvia como arquivo da mensagem: os de arquivo do
- * Discord (`cdn.discordapp.com/attachments/…`) e os `bridgedUrls` — a página e a mídia do GIF que
- * chegou animado. Quem cola um link desses quer a mídia, não o link: no texto ele só acrescenta um
- * preview que o backend do Papo cria a partir da URL escrita, e embaixo do arquivo é a mesma imagem
- * duas vezes (a URL do CDN, além disso, não abre fora do Discord). `[rótulo](link)` conserva o
- * rótulo; `<link>` some junto com os colchetes. Cerca de código não é link — é o texto que a pessoa
- * escreveu, e não virou anexo (`discordMediaLinksInContent`).
+ * Tira do texto os links de arquivo do Discord que o bridge re-hospeda como anexo da mensagem.
+ * Quem cola `https://cdn.discordapp.com/attachments/…` quer a mídia, e a URL não funciona fora do
+ * Discord (assinatura vencida): manter as duas é mostrar um link quebrado embaixo do arquivo que
+ * chegou. `[rótulo](link)` conserva o rótulo; `<link>` some junto com os colchetes. Cerca de código
+ * não é link — é o texto que a pessoa escreveu, e não virou anexo (`discordMediaLinksInContent`).
  */
-export function stripDiscordMediaLinks(content: string, bridgedUrls: readonly string[] = []): string {
+export function stripDiscordMediaLinks(content: string): string {
 	if (!content) return content;
-	const bridged = new Set(bridgedUrls.map(linkKey).filter(Boolean));
-	const isBridged = (url: string): boolean => isDiscordMediaUrl(url) || bridged.has(linkKey(url) ?? '');
 	const code: string[] = [];
 	const guarded = content.replace(/```[\s\S]*?```|`[^`\n]*`/g, (block) => {
 		code.push(block);
 		return `\u0000${code.length - 1}\u0000`;
 	});
 	const withoutLinks = guarded
-		.replace(MARKDOWN_LINK_RE, (raw, label: string, url: string) => (isBridged(url) ? label.trim() : raw))
-		.replace(CONTENT_URL_RE, (url) => (isBridged(url) ? '' : url));
+		.replace(MARKDOWN_LINK_RE, (raw, label: string, url: string) => (isDiscordMediaUrl(url) ? label.trim() : raw))
+		.replace(CONTENT_URL_RE, (url) => (isDiscordMediaUrl(url) ? '' : url));
 	// limpeza antes de devolver o código: o que a pessoa escreveu dentro do cerca não é tocado,
 	// e a indentação de lista também não
 	const cleaned = withoutLinks

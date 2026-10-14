@@ -255,9 +255,8 @@ Nitro 500 MB; boost L2 50 MB / L3 100 MB — usar o valor configurado, nunca ass
 baixa e re-envia como anexo, pelo mesmo caminho dos anexos (acima). Vale também para o link de
 arquivo colado no texto — e nesse caso o link **sai do texto** (`stripDiscordMediaLinks`): embaixo
 do arquivo que chegou ele seria só uma URL que não abre fora do Discord. `[rótulo](link)` conserva o
-rótulo, `<link>` some inteiro, e cerca de código não é tocado (não virou anexo). O link do GIF que
-viaja como arquivo sai do texto pela mesma razão (§8). Com `bridge_attachments = 0` não há para onde
-re-hospedar, e o link continua no texto e no preview.
+rótulo, `<link>` some inteiro, e cerca de código não é tocado (não virou anexo). Com
+`bridge_attachments = 0` não há para onde re-hospedar, e o link continua no texto e no preview.
 
 **O link de anexo é assinado.** Desde dez/2023 o CDN só serve `/attachments/` e `/embed/attachments/`
 com `?ex=&is=&hm=` válidos — `ex` é o epoch de expiração em hexadecimal, ~24h. Sem parâmetro, ou com
@@ -276,9 +275,7 @@ payload expirou. Por isso 404 nunca é tratado como "arquivo morto" na primeira 
    tempo, paga uma chamada só.
 3. Persistiu o 404 depois da renovação: `SourceGoneError` — o anexo é omitido com aviso no texto
    (`⚠️ anexo "…" não está mais disponível na origem`) e **a mensagem continua bridgeada**. Perder um
-   arquivo não é motivo para perder a cópia inteira; o job não vai para `dead`. Quando a origem não é
-   o CDN do Discord o aviso traz a URL do arquivo: o link da página saiu do texto (§8), e o caminho
-   original ainda abre fora do Discord.
+   arquivo não é motivo para perder a cópia inteira; o job não vai para `dead`.
 4. 429/5xx e erro de rede continuam `RetryableError`: volta para a fila, a mídia não é descartada.
 
 Os outros caminhos do CDN (`/emojis/`, `/stickers/`, `/embeds/`, avatares) não são assinados e não
@@ -335,20 +332,9 @@ player de vídeo: a animação morre ali. O GIF viaja como **arquivo da mensagem
    devolver outra coisa (`isGifBytes` confere a magic antes de aceitar), e `prepareAttachments`
    renomeia pelo tipo que os bytes realmente são (`sniffMedia`) — o anexo chega com o nome do arquivo
    que chegou.
-5. **De onde baixar** (`discordMediaDownloadUrls`): a origem intocada primeiro
-   (`media.giphy.com/media/…/giphy.gif`), o proxy do Discord depois. O proxy re-encode a mídia para
-   caber no embed (`?width=400&format=webp`), e um GIF que passa por ele chega como um frame parado —
-   a animação morre no download. Ele continua sendo o plano B porque existe justamente para re-servir
-   origem que bloqueia hotlink, e o CDN é a forma canônica quando é ele quem hospeda o arquivo.
-6. Com o GIF indo como arquivo, o card não repete o que o arquivo já mostra: `gifAsFile` tira
+5. Com o GIF indo como arquivo, o card não repete o que o arquivo já mostra: `gifAsFile` tira
    `video` e `thumbnail` do preview. Com `bridge_attachments = 0` não há para onde anexar, e o loop
    continua no card. Preview que chega tarde só perde o loop quando a cópia já carrega o `.gif`.
-7. **O link do GIF sai do texto** (`discordGifLinks` + `stripDiscordMediaLinks`, §7): a página do
-   preview e os caminhos da mídia do embed que carrega o GIF. O backend do Papo cria o preview a
-   partir da URL escrita, e embaixo do arquivo animado isso é a mesma imagem duas vezes. A página
-   continua como link clicável do cartão de preview, e o eco da URL — que a mensagem de link sozinho
-   costumava escrever no texto — fica desligado quando o GIF viaja como arquivo. Com
-   `bridge_attachments = 0` o link continua no texto: é o único transporte.
 
 Mapeamento Papo Embed → Discord Embed: espelho do acima; `source_type='link'` (preview
 automático do Papo) é recriado no Discord **deixando a URL nua no `content`** — o Discord gera o
@@ -653,7 +639,7 @@ MESSAGE_CREATE
   → canal-link? (thread linkada é canal como qualquer outro)
   → traduzir conteúdo + embeds (rich/link preview) + attachments
   → mídia hospedada pelo Discord (embed, preview ou link colado no texto) vira anexo baixado; o link sai do texto (§7, §8)
-  → GIF (anexo `.gif`, mídia `image/gif` ou variante `.gif` do loop do player) vira arquivo baixado da origem intocada; o mp4/frame do player e o link do GIF saem do card e do texto (§8)
+  → GIF (anexo `.gif`, mídia `image/gif` ou variante `.gif` do loop do player) vira arquivo; o mp4/frame do player sai do card (§8)
   → m.reference da origem → cópia Papo em message_map → reply_to do Papo (sem cópia: sem reply)
   → montar EmbedInput (author, thumbnail=avatar Discord, image=anexo, footer=data/origem)
   → multipart POST /messages {channel_id, content, embeds(JSON string), attachments[](binary), reply_to?}

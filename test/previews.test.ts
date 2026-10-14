@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { APIEmbed } from 'discord.js';
-import { discordGifLinks, discordGifOf, discordHostedMedia, discordMediaLinksInContent, firstDiscordPreview, firstPapoPreview, giphyEmbed, stripDiscordMediaLinks } from '../src/bridge/previews.js';
-import { discordLinkIsStale, discordMediaDownloadUrls, discordSignatureExpiry, gifVariantUrl, isDiscordMediaUrl } from '../src/bridge/embeds.js';
+import { discordGifOf, discordHostedMedia, discordMediaLinksInContent, firstDiscordPreview, firstPapoPreview, giphyEmbed, stripDiscordMediaLinks } from '../src/bridge/previews.js';
+import { discordLinkIsStale, discordSignatureExpiry, gifVariantUrl, isDiscordMediaUrl } from '../src/bridge/embeds.js';
 import { DISCORD_LIMITS } from '../src/bridge/limits.js';
 import type { PapoEmbed } from '../src/papo/types.js';
 
@@ -332,44 +332,6 @@ describe('GIF do Discord viaja como arquivo (discordGifOf)', () => {
 		expect(preview?.thumbnail).toBeUndefined();
 		// sem a regra, o Papo desenha o loop mp4 com um frame parado
 		expect(firstDiscordPreview([klipyGifv()])?.video?.mime_type).toBe('video/mp4');
-	});
-
-	it('o download busca a origem intocada antes do proxy do Discord', () => {
-		// o proxy re-encode para caber no embed: um GIF que passa por ele chega como frame parado
-		const giphy = {
-			url: 'https://images-ext-1.discordapp.net/external/ZgLT/https/media.giphy.com/media/abc/giphy.gif',
-			origin: 'https://media.giphy.com/media/abc/giphy.gif',
-			mime: 'image/gif'
-		};
-		expect(discordMediaDownloadUrls(giphy)).toEqual(['https://media.giphy.com/media/abc/giphy.gif', giphy.url]);
-		// o CDN é a forma canônica do que o Discord hospeda; o proxy do mesmo arquivo é o plano B
-		const cdn = { url: 'https://media.discordapp.net/attachments/1/2/foto.png', origin: 'https://cdn.discordapp.com/attachments/1/2/foto.png', mime: 'image/png' };
-		expect(discordMediaDownloadUrls(cdn)).toEqual(['https://cdn.discordapp.com/attachments/1/2/foto.png', cdn.url]);
-		// origem que é página, não arquivo, não é candidata a download
-		const page = { url: 'https://images-ext-1.discordapp.net/external/Zg/https/example.com/x', origin: 'https://example.com/x', mime: 'image/png' };
-		expect(discordMediaDownloadUrls(page)).toEqual([page.url]);
-	});
-
-	it('discordGifLinks: a página e a mídia do embed que carrega o GIF', () => {
-		const links = discordGifLinks([klipyGifv()]);
-		expect(links).toContain('https://klipy.com/gifs/orihime-bread-girl');
-		expect(links).toContain('https://static.klipy.com/ii/d7ae/vTXuDBugGeZn6Djx.mp4');
-		// embed sem GIF nenhum não empresta link: o resto da mensagem continua no texto
-		expect(discordGifLinks([discordEmbed({ type: 'rich', url: 'https://example.com/a', thumbnail: { url: 'https://example.com/t.png' } }) as never])).toEqual([]);
-	});
-
-	it('o link do GIF sai do texto: embaixo do arquivo ele seria o preview duplicado', () => {
-		const page = 'https://giphy.com/gifs/funny-happy-excited-okfv';
-		const media = 'https://media.giphy.com/media/okfv/giphy.gif';
-		expect(stripDiscordMediaLinks(`olha ${page} 😂`, [page, media])).toBe('olha 😂');
-		// `[rótulo](link)` conserva o rótulo
-		expect(stripDiscordMediaLinks(`[o gif](${page})`, [page])).toBe('o gif');
-		// só o link que virou arquivo sai: o resto da mensagem é o que a pessoa escreveu
-		expect(stripDiscordMediaLinks(`veja https://example.com/a e ${page}`, [page])).toBe('veja https://example.com/a e');
-		// cerca de código não é tocada
-		expect(stripDiscordMediaLinks(`\`\`\`\n${page}\n\`\`\``, [page])).toBe(`\`\`\`\n${page}\n\`\`\``);
-		// sem URLs extras, o comportamento é o de sempre
-		expect(stripDiscordMediaLinks('olha https://example.com/a')).toBe('olha https://example.com/a');
 	});
 });
 

@@ -140,23 +140,6 @@ export const discordMediaSourceUrl = (media: DiscordMedia): string =>
 export const isDiscordHostedMedia = (media: DiscordMedia): boolean =>
 	isDiscordMediaUrl(media.url) || isDiscordMediaUrl(media.origin);
 
-/**
- * URLs de onde baixar o arquivo, na ordem em que tentar.
- *
- * A origem intocada vem primeiro: o proxy do Discord re-encode a mídia para caber no embed
- * (`?width=400&format=webp`), e um GIF que passa por ele chega como um frame parado — a animação
- * morre no download. O proxy continua sendo o plano B porque existe justamente para re-servir
- * origem que bloqueia hotlink, e o CDN é a forma canônica quando é ele quem hospeda o arquivo.
- */
-export function discordMediaDownloadUrls(media: DiscordMedia): [string, ...string[]] {
-	const primary = discordMediaSourceUrl(media);
-	const out: string[] = [primary];
-	const origin = media.origin;
-	if (origin && !isDiscordExternalProxyUrl(origin) && mimeFromUrl(origin) && !out.includes(origin)) out.unshift(origin);
-	if (!out.includes(media.url)) out.push(media.url);
-	return out as [string, ...string[]];
-}
-
 const areaOf = (m: DiscordMedia): number => (m.width ?? 0) * (m.height ?? 0);
 
 /**
@@ -169,12 +152,6 @@ export const isGifPlayerEmbed = (embed: DiscordEmbedPayload): boolean =>
 
 /** Proxy de terceiros do Discord: o caminho inteiro, extensão incluída, está assinado. */
 const DISCORD_EXTERNAL_PROXY = /^images-ext-\d+\.discordapp\.net$/i;
-
-/** O proxy de terceiros só re-serva o que a origem já serviu: mudar a extensão ali quebra a assinatura. */
-const isDiscordExternalProxyUrl = (url?: string | null): boolean => {
-	const host = hostOf(url);
-	return Boolean(host && DISCORD_EXTERNAL_PROXY.test(host));
-};
 
 /** Extensões de mídia que um player de GIF costuma servir no lugar do GIF. */
 const GIF_STANDIN_EXTS = new Set(['mp4', 'webm', 'mov', 'ogv', 'webp', 'avif', 'jpg', 'jpeg', 'png']);

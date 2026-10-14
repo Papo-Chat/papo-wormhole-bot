@@ -46,7 +46,6 @@ import {
 	buildPapoBridgeEmbed,
 	discordApiEmbed,
 	discordLinkIsStale,
-	discordMediaDownloadUrls,
 	discordMediaSourceUrl,
 	discordSignatureExpiry,
 	fitEmbedBudget,
@@ -67,7 +66,6 @@ import { isGifBytes } from './media.js';
 import { PapoIdentity } from './identity.js';
 import { copySignatures, signedFooter } from './signature.js';
 import {
-	discordGifLinks,
 	discordGifOf,
 	discordHostedMedia,
 	discordMediaLinksInContent,
@@ -1185,19 +1183,10 @@ export class Bridge {
 		if (this.propagatesMentions(link) && /@/.test(m.content ?? '')) await this.ensurePapoNameIndex();
 
 		const bridgeFiles = Boolean(link.bridge_attachments);
-		const rawEmbeds = rawDiscordEmbeds(m.embeds as APIEmbed[]);
-		const attachments = Array.from(m.attachments.values());
-		const attachmentUrls = attachments.map((a) => a.url);
-		// GIF: o player do Discord (`gifv`/`gif`) re-serviu o GIF como mp4 em loop mais um frame
-		// estático, e o backend do Papo desenha isso como player de vídeo — a animação morre ali.
-		// O arquivo animado é o que viaja.
-		const gif = bridgeFiles ? discordGifOf(rawEmbeds, attachments) : undefined;
-		const gifLinks = gif ? discordGifLinks(rawEmbeds) : [];
+		// o link do CDN vira anexo da mensagem: no texto ele só acrescenta uma URL que não abre
+		// fora do Discord
 		const translated = discordToPapoContent(m.content ?? '', this.resolvers(link));
-		// o link do CDN e o do GIF saem do texto: o bridge já reenvia a mídia como arquivo da
-		// mensagem, e a URL escrita só acrescenta um preview que o backend cria do zero — a mesma
-		// imagem duas vezes, além de um link do CDN que não abre fora do Discord
-		const content = bridgeFiles ? stripDiscordMediaLinks(translated, gifLinks) : translated;
+		const content = bridgeFiles ? stripDiscordMediaLinks(translated) : translated;
 		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
 		const sources: SourceRef[] = bridgeFiles
 			? m.attachments.map((a) => ({
@@ -1209,6 +1198,13 @@ export class Bridge {
 					url: a.url
 				}))
 			: [];
+		const rawEmbeds = rawDiscordEmbeds(m.embeds as APIEmbed[]);
+		const attachments = Array.from(m.attachments.values());
+		const attachmentUrls = attachments.map((a) => a.url);
+		// GIF: o player do Discord (`gifv`/`gif`) re-serviu o GIF como mp4 em loop mais um frame
+		// estático, e o backend do Papo desenha isso como player de vídeo — a animação morre ali.
+		// O arquivo animado é o que viaja.
+		const gif = bridgeFiles ? discordGifOf(rawEmbeds, attachments) : undefined;
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
 		const preview = link.bridge_embeds
@@ -1238,10 +1234,6 @@ export class Bridge {
 		}
 		if (gif?.media) this.addGifSource(m.id, gif.media, sources, hosted);
 		const linkEmbeds = preview ? [preview] : [];
-		// URL que ecoa no texto quando a mensagem é só um link. Com o GIF viajando como arquivo o
-		// eco está fora: ele é justamente o link que saiu do texto, e o backend do Papo cria o
-		// preview dele — a mesma imagem duas vezes embaixo do arquivo animado.
-		const textUrlEcho = gif ? undefined : linkEmbeds[0]?.url;
 
 		if (!chunks.length && !sources.length && !linkEmbeds.length) return;
 		const total = Math.max(chunks.length, 1);
@@ -1250,7 +1242,7 @@ export class Bridge {
 		for (let i = 0; i < total; i++) {
 			// sem texto mas com anexo/embed o card já mostra a mídia: não precisa de marcador
 			const fallback = sources.length || linkEmbeds.length ? '' : '[mensagem sem texto]';
-			const chunkContent = chunks[i] ?? (i === 0 ? (textUrlEcho ?? fallback) : '');
+			const chunkContent = chunks[i] ?? (i === 0 ? (linkEmbeds[0]?.url ?? fallback) : '');
 			const job: ToPapoMessageJob = {
 				kind: 'message',
 				linkId: link.id,
@@ -1310,21 +1302,8 @@ export class Bridge {
 		}
 		await this.cacheMentionedDiscordUsers(fresh);
 		if (this.propagatesMentions(link) && /@/.test(fresh.content ?? '')) await this.ensurePapoNameIndex();
-		const previewEmbeds = rawDiscordEmbeds(fresh.embeds as APIEmbed[]);
-		// GIF que chega tarde: o Papo não aceita anexo em `PUT /messages/{id}`, então o mp4 em
-		// loop do player só sai do card quando a cópia já carrega o arquivo animado — é o anexo
-		// `.gif` da origem, que entrou na criação. Sem ele, o loop é a única mídia que sobra.
-		const gif = link.bridge_attachments ? discordGifOf(previewEmbeds, Array.from(fresh.attachments.values())) : undefined;
-		const gifIsFile = Boolean(gif && !gif.media);
 		const edited = discordToPapoContent(fresh.content ?? '', this.resolvers(link));
-		// o link do GIF só sai do texto quando o arquivo animado está na cópia: sem ele a edição
-		// não consegue anexar nada, e a URL é o único resto da mídia
-		const chunks = chunkText(
-			link.bridge_attachments
-				? stripDiscordMediaLinks(edited, gifIsFile ? discordGifLinks(previewEmbeds) : [])
-				: edited,
-			PAPO_EMBED_CHUNK_CHARS
-		);
+		const chunks = chunkText(link.bridge_attachments ? stripDiscordMediaLinks(edited) : edited, PAPO_EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
 			? maps
@@ -1334,6 +1313,12 @@ export class Bridge {
 		const revision = fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : new Date().toISOString();
 		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
 		// e sem isso o cartão do Papo fica só com a URL escrita
+		const previewEmbeds = rawDiscordEmbeds(fresh.embeds as APIEmbed[]);
+		// GIF que chega tarde: o Papo não aceita anexo em `PUT /messages/{id}`, então o mp4 em
+		// loop do player só sai do card quando a cópia já carrega o arquivo animado — é o anexo
+		// `.gif` da origem, que entrou na criação. Sem ele, o loop é a única mídia que sobra.
+		const gif = link.bridge_attachments ? discordGifOf(previewEmbeds, Array.from(fresh.attachments.values())) : undefined;
+		const gifIsFile = Boolean(gif && !gif.media);
 		const preview = link.bridge_embeds
 			? firstDiscordPreview(previewEmbeds, fresh.attachments.map((a) => a.url), {
 					rehostDiscordMedia: true,
@@ -1624,11 +1609,10 @@ export class Bridge {
 	 * renova a assinatura e tenta de novo antes de declarar a mídia perdida. Link já vencido é
 	 * renovado antes da primeira tentativa — bater no 404 certo seria só desperdiçar uma ida à rede.
 	 * `gifVariant` vem antes da URL principal: é a variante `.gif` deduzida do mp4 que o player
-	 * do Discord re-serviu, e só vale se devolver um GIF. `fallback` vem depois: é a outra URL do
-	 * mesmo arquivo (origem e proxy do Discord são planos B um do outro).
+	 * do Discord re-serviu, e só vale se devolver um GIF.
 	 */
 	private async downloadDiscordFile(source: SourceRef): Promise<Buffer> {
-		const urls = [source.gifVariant, source.url, source.fallback].filter((u): u is string => Boolean(u));
+		const urls = [source.gifVariant, source.url].filter((u): u is string => Boolean(u));
 		if (!urls.length) throw new PermanentError(`attachment ${source.id} sem URL de origem`);
 		for (const url of urls) {
 			const data = await this.downloadDiscordUrl(url, url === source.gifVariant);
@@ -1727,7 +1711,7 @@ export class Bridge {
 	 */
 	private addDiscordMediaSources(messageId: string, media: DiscordMedia[], sources: SourceRef[], seen: Set<string>): void {
 		for (const m of media) {
-			const [url, fallback] = discordMediaDownloadUrls(m);
+			const url = discordMediaSourceUrl(m);
 			const key = mediaKey(url);
 			if (!key || seen.has(key)) continue;
 			seen.add(key);
@@ -1738,8 +1722,7 @@ export class Bridge {
 				mime: m.mime || mimeFromUrl(url) || undefined,
 				sizeBytes: 0,
 				url,
-				gifVariant: m.gifVariant,
-				fallback
+				gifVariant: m.gifVariant
 			});
 		}
 	}
@@ -1750,7 +1733,7 @@ export class Bridge {
 	 * só `giphy.gif`, que não diz nada na lista de anexos).
 	 */
 	private addGifSource(messageId: string, gif: DiscordMedia, sources: SourceRef[], seen: Set<string>): void {
-		const [url, fallback] = discordMediaDownloadUrls(gif);
+		const url = discordMediaSourceUrl(gif);
 		const key = mediaKey(url);
 		if (!key || seen.has(key)) return;
 		seen.add(key);
@@ -1761,8 +1744,7 @@ export class Bridge {
 			mime: gif.mime || 'image/gif',
 			sizeBytes: 0,
 			url,
-			gifVariant: gif.gifVariant,
-			fallback
+			gifVariant: gif.gifVariant
 		});
 	}
 
