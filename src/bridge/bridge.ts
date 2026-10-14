@@ -2139,9 +2139,12 @@ export class Bridge {
 				? signedBase
 				: signedFooter(`${job.footerBase} · 📎 ${g + 1}/${groups.length}`, signatures[g]!, PAPO_LIMITS.embedFooterMax)
 		);
-		const existing = uncertain
-			? await this.findPapoCopies(job.papoChannelId, signatures, job.timestamp)
-			: new Map<string, string>();
+		const native = Boolean(job.authorId) && this.api.hasWebhook(job.papoChannelId);
+        // Webhook posts are idempotent by external_message_id: never try to
+        // rediscover them from legacy signed embed footers.
+        const existing = uncertain && !native
+            ? await this.findPapoCopies(job.papoChannelId, signatures, job.timestamp)
+            : new Map<string, string>();
 		if (existing.size) {
 			this.log.warn({ discordMessageId: job.discordMessageId, found: existing.size }, 'cópia já criada no Papo: envio não repetido');
 		}
@@ -2151,8 +2154,7 @@ export class Bridge {
 			const attachments = groups[g]!.map((f) => ({ name: f.name, data: f.data, mime: f.mime }));
 			const extra = g > 0;
 
-			const native = Boolean(job.authorId);
-            const embeds = native
+			const embeds = native
                 ? (extra ? [] : (job.linkEmbeds ?? []))
                 : extra
 				? [
@@ -2189,6 +2191,9 @@ export class Bridge {
 				content: native
                     ? this.withReactionSummary(text, await this.reactionSummaryFor('papo',
                         this.store.listReactions(job.linkId, 'discord', job.discordMessageId)), 8192)
+                    : undefined,
+                externalMessageId: native
+                    ? `discord:${job.linkId}:${job.discordMessageId}:${job.chunkIndex}:${g}`
                     : undefined,
                 externalAuthor: native ? {
                     source: 'discord',
@@ -2340,12 +2345,12 @@ export class Bridge {
 		if (!map.bridge_embed) {
             const content = this.withReactionSummary(job.text,
                 await this.reactionSummaryForMap(map, 'papo'), 8192);
-            await this.api.editMessage(map.papo_message_id, content, this.mapPreviews<PapoEmbedInput>(map));
+            await this.api.editMessage(map.papo_message_id, content, this.mapPreviews<PapoEmbedInput>(map), job.targetChannelId);
             this.store.updateMapSnapshot(map.id, { rendered: job.text, edit_revision: job.revision ?? null });
             return;
         }
         const embed = await this.papoCopyEmbed(map, job.text);
-		await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
+		await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)], job.targetChannelId);
 		this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed, edit_revision: job.revision ?? null });
 	}
 
@@ -2421,7 +2426,7 @@ export class Bridge {
 		if (!embeds.length && card) return;
         const content = card ? '' : this.withReactionSummary(
             map.rendered ?? '', await this.reactionSummaryForMap(map, 'papo'), 8192);
-		await this.api.editMessage(map.papo_message_id, content, embeds);
+		await this.api.editMessage(map.papo_message_id, content, embeds, job.targetChannelId);
 		this.store.updateMapSnapshot(map.id, { link_embeds: previews, embed_revision: job.revision ?? null });
 	}
 
@@ -2541,7 +2546,7 @@ export class Bridge {
             if (!map.bridge_embed) {
                 const content = this.withReactionSummary(map.rendered ?? '',
                     await this.reactionSummaryForMap(map, 'papo'), 8192);
-                await this.api.editMessage(map.papo_message_id, content, this.mapPreviews<PapoEmbedInput>(map));
+                await this.api.editMessage(map.papo_message_id, content, this.mapPreviews<PapoEmbedInput>(map), job.targetChannelId);
                 continue;
             }
 			const embed = JSON.parse(map.bridge_embed!) as PapoEmbedInput;
@@ -2551,7 +2556,7 @@ export class Bridge {
 				PAPO_LIMITS.embedDescriptionMax
 			);
 			embed.footer = { text: this.footerText(map, embed, PAPO_LIMITS.embedFooterMax) };
-			await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
+			await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)], job.targetChannelId);
 		}
 	}
 
@@ -2580,7 +2585,7 @@ export class Bridge {
 					// bridge papo→discord: a mensagem do Papo é a original, de outro autor
 					// (o backend recusa: 403). A cópia do Discord já sumiu por si só.
 					if (map.direction !== 'discord_to_papo') continue;
-					await this.api.deleteMessage(map.papo_message_id);
+					await this.api.deleteMessage(map.papo_message_id,link.papo_channel_id);
 				}
 			} catch (err) {
 				const status = (err as { status?: number }).status;

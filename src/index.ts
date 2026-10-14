@@ -25,6 +25,7 @@ async function main(): Promise<void> {
 
 	const api = new PapoApi({
 		baseUrl: cfg.papo.baseUrl,
+        webhooks: cfg.papo.webhooks,
 		username: cfg.papo.username,
 		password: cfg.papo.password,
 		serverPassword: cfg.papo.serverPassword,

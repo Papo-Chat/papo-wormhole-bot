@@ -18,6 +18,9 @@ const EnvSchema = z.object({
 	// ── Papo ──────────────────────────────────────────────
 	PAPO_BASE_URL: z.url({ message: 'PAPO_BASE_URL deve ser uma URL absoluta' }),
 	PAPO_WS_URL: z.string().optional(),
+    // Papo channel UUID -> independently scoped incoming webhook credentials.
+    // Example: {"channel-uuid":{"id":"webhook-uuid","token":"secret"}}
+    PAPO_WEBHOOKS_JSON: z.string().optional(),
 	PAPO_USERNAME: z.string().min(1),
 	PAPO_PASSWORD: z.string().min(1),
 	/**
@@ -69,6 +72,7 @@ export interface Config {
 	papo: {
 		baseUrl: string;
 		wsUrl: string;
+        webhooks: Record<string,{id:string;token:string}>;
 		username: string;
 		password: string;
 		/** Senha do servidor (obrigatória quando `GET /server` → `public: false`). */
@@ -120,6 +124,7 @@ export function loadConfig(): Config {
 		papo: {
 			baseUrl: e.PAPO_BASE_URL.replace(/\/+$/, ''),
 			wsUrl: e.PAPO_WS_URL ?? toWsUrl(e.PAPO_BASE_URL),
+            webhooks: parseWebhookCredentials(e.PAPO_WEBHOOKS_JSON),
 			username: e.PAPO_USERNAME,
 			password: e.PAPO_PASSWORD,
 			serverPassword: e.PAPO_SERVER_PASSWORD,
@@ -149,4 +154,21 @@ export function loadConfig(): Config {
 			giphyApiKey: e.GIPHY_API_KEY
 		}
 	};
+}
+
+function parseWebhookCredentials(raw?:string):Record<string,{id:string;token:string}> {
+    if (!raw) return {};
+    let value:unknown;
+    try {value=JSON.parse(raw)} catch {throw new Error("PAPO_WEBHOOKS_JSON deve ser JSON válido")}
+    if (!value || typeof value!=="object" || Array.isArray(value)) throw new Error("PAPO_WEBHOOKS_JSON deve ser um objeto");
+    const result:Record<string,{id:string;token:string}>={};
+    for (const [channel,credential] of Object.entries(value)) {
+        if (!credential || typeof credential!=="object" || Array.isArray(credential)) throw new Error("webhook inválido: "+channel);
+        const data=credential as Record<string,unknown>;
+        if (typeof data.id!=="string" || !/^[0-9a-f-]{36}$/i.test(data.id) || typeof data.token!=="string" || !/^[0-9a-f]{64}$/i.test(data.token)) {
+            throw new Error("webhook id ou token inválido: "+channel);
+        }
+        result[channel]={id:data.id,token:data.token};
+    }
+    return result;
 }

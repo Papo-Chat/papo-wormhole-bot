@@ -17,6 +17,7 @@ import { PapoApiError } from './types.js';
 
 export interface PapoApiOptions {
 	baseUrl: string;
+    webhooks?: Record<string,{id:string;token:string}>;
 	username: string;
 	password: string;
 	/**
@@ -47,6 +48,7 @@ export interface OutAttachment {
 export interface SendMessageInput {
     /** Trusted integration attribution; never an authenticated Papo user id. */
     externalAuthor?: import('./types.js').PapoExternalAuthor;
+    externalMessageId?: string;
 	channelId: string;
 	content?: string | null;
 	replyTo?: string | null;
@@ -340,7 +342,9 @@ export class PapoApi {
 		return out;
 	}
 
-	async sendMessage(input: SendMessageInput): Promise<PapoMessage> {
+	hasWebhook(channelId:string):boolean {return Boolean(this.opts.webhooks?.[channelId]);}
+
+    async sendMessage(input: SendMessageInput): Promise<PapoMessage> {
 		const form = new FormData();
 		form.append('channel_id', input.channelId);
 		if (input.content != null) form.append('content', input.content);
@@ -349,18 +353,32 @@ export class PapoApi {
 			form.append('attachments', new Blob([new Uint8Array(a.data)], { type: a.mime ?? 'application/octet-stream' }), a.name);
 		}
 		if (input.embeds?.length) form.append('embeds', JSON.stringify(input.embeds));
-        if (input.externalAuthor) form.append('external_author', JSON.stringify(input.externalAuthor));
-		return this.request<PapoMessage>('/messages', { method: 'POST', body: form });
+        if (input.externalAuthor) {
+            const hook=this.opts.webhooks?.[input.channelId];
+            if (!hook) throw new PapoApiError('webhook não configurado para canal '+input.channelId,400);
+            if (!input.externalMessageId) throw new PapoApiError('externalMessageId obrigatório',400);
+            form.append('external_author',JSON.stringify(input.externalAuthor));
+            form.append('external_message_id',input.externalMessageId);
+            return this.webhookRequest<PapoMessage>(hook,'/webhooks/'+hook.id+'/messages',{method:'POST',body:form});
+        }
+        return this.request<PapoMessage>('/messages',{method:'POST',body:form});
 	}
 
-	async editMessage(messageId: string, content: string, embeds?: PapoEmbedInput[]): Promise<PapoMessage> {
+	async editMessage(messageId: string, content: string, embeds?: PapoEmbedInput[], channelId?:string): Promise<PapoMessage> {
 		const body: { content: string; embeds?: PapoEmbedInput[] } = { content };
 		if (embeds) body.embeds = embeds;
-		return this.request<PapoMessage>(`/messages/${messageId}`, { method: 'PUT', body: JSON.stringify(body) });
+		const hook=channelId ? this.opts.webhooks?.[channelId] : undefined;
+        if(hook) return this.webhookRequest<PapoMessage>(hook,`/webhooks/${hook.id}/messages/${messageId}`,{method:'PUT',body:JSON.stringify(body)});
+        return this.request<PapoMessage>(`/messages/${messageId}`,{method:'PUT',body:JSON.stringify(body)});
 	}
 
-	async deleteMessage(messageId: string): Promise<void> {
-		await this.request<void>(`/messages/${messageId}`, { method: 'DELETE' });
+	async deleteMessage(messageId: string,channelId?:string): Promise<void> {
+        const hook=channelId ? this.opts.webhooks?.[channelId] : undefined;
+        if(hook) {
+            await this.webhookRequest<void>(hook,`/webhooks/${hook.id}/messages/${messageId}`,{method:'DELETE'});
+            return;
+        }
+        await this.request<void>(`/messages/${messageId}`,{method:'DELETE'});
 	}
 
 	// ── reactions / pins ───────────────────────────────────
@@ -520,7 +538,7 @@ export class PapoApi {
 		const headers = new Headers(init.headers ?? {});
 		headers.set('X-Request-ID', randomUUID());
 		if (!headers.has('Accept')) headers.set('Accept', 'application/problem+json, application/json');
-		if (this.cookie && !headers.has('Cookie')) headers.set('Cookie', this.cookie);
+		if (this.cookie && !headers.has('Cookie') && !headers.has('Authorization')) headers.set('Cookie', this.cookie);
 		if (init.body && typeof init.body === 'string' && !headers.has('Content-Type')) {
 			headers.set('Content-Type', 'application/json');
 		}
@@ -553,7 +571,16 @@ export class PapoApi {
 		throw new PapoApiError(`${res.status} em ${path}: ${detail}`, res.status, problem, res.headers.get('x-request-id') ?? undefined);
 	}
 
-	private async request<T>(path: string, init: RequestInit = {}, allowRecovery = true): Promise<T> {
+	private async webhookRequest<T>(hook:{id:string;token:string},path:string,init:RequestInit):Promise<T> {
+        const headers=new Headers(init.headers);
+        headers.set('Authorization','Bearer '+hook.token);
+        const res=await this.raw(path,{...init,headers});
+        if (res.status>=400) await this.problem(res,path);
+        if (res.status===204) return undefined as T;
+        return (await res.json()) as T;
+    }
+
+    private async request<T>(path: string, init: RequestInit = {}, allowRecovery = true): Promise<T> {
 		const res = await this.raw(path, init);
 		if (res.status === 401 && allowRecovery) {
 			// uma única recuperação por onda de 401; o retry é feito com a sessão renovada
