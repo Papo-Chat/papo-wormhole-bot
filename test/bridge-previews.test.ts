@@ -904,7 +904,7 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 		expect(sent.embeds![0]!.description).toBe('olha a foto');
 	});
 
-	it('link de arquivo do Discord colado no texto também vira anexo', async () => {
+	it('link de arquivo do Discord colado no texto também vira anexo, e sai do texto', async () => {
 		const { bridge, api, settle } = fixture();
 		const { urls } = await withFetch(
 			async () => new Response(Buffer.from('video-colado'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
@@ -917,6 +917,17 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 		const sent = api.sent[0]!;
 		expect(sent.attachments?.map((a) => a.name)).toEqual(['clipe.mp4']);
 		expect(urls).toContain('https://cdn.discordapp.com/attachments/111/222/clipe.mp4');
+		// o arquivo chegou: repetir embaixo uma URL que não abre fora do Discord é ruído
+		expect(sent.embeds![0]!.description).not.toContain('cdn.discordapp.com');
+	});
+
+	it('com anexos desligados o link colado continua no texto: é o único transporte', async () => {
+		const { store, bridge, api, link, settle } = fixture();
+		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://cdn.discordapp.com/attachments/111/222/clipe.mp4'));
+		await settle();
+
+		expect(api.sent[0]!.embeds![0]!.description).toBe('https://cdn.discordapp.com/attachments/111/222/clipe.mp4');
 	});
 
 	it('a mesma mídia servida por outro host não é baixada duas vezes', async () => {
@@ -1016,7 +1027,7 @@ describe('link de anexo do Discord com assinatura vencida', () => {
 					: new Response('This content is no longer available.', { status: 404 }),
 			async () => {
 				await bridge.onDiscordMessage(
-					discordMessage('dm-1', 'olha o gif', {
+					discordMessage('dm-1', unsigned, {
 						embeds: [
 							{
 								type: 'gifv',
@@ -1034,6 +1045,8 @@ describe('link de anexo do Discord com assinatura vencida', () => {
 		expect(api.sent[0]?.attachments?.map((a) => a.name)).toEqual(['image0-6.gif']);
 		// o link sem assinatura seria 404 certo: a renovação vem antes da primeira tentativa
 		expect(urls).toEqual([renewed]);
+		// e o texto não repete a URL quebrada embaixo do arquivo que chegou
+		expect(api.sent[0]?.embeds?.[0]?.description).toBe('');
 		expect(outbox.counts().dead).toBe(0);
 	});
 

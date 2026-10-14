@@ -70,7 +70,8 @@ import {
 	firstPapoPreview,
 	giphyEmbed,
 	mediaKey,
-	rawDiscordEmbeds
+	rawDiscordEmbeds,
+	stripDiscordMediaLinks
 } from './previews.js';
 import { GiphyResolver, giphyId } from './giphy.js';
 import { EXTRA_CHUNK_BASE, type BridgeJob, type DeleteJob, type EditJob, type PinJob, type ReactionJob, type SourceRef, type ToDiscordMessageJob, type ToPapoMessageJob } from './jobs.js';
@@ -1178,9 +1179,12 @@ export class Bridge {
 		await this.cacheMentionedDiscordUsers(m);
 		if (this.propagatesMentions(link) && /@/.test(m.content ?? '')) await this.ensurePapoNameIndex();
 
-		const content = discordToPapoContent(m.content ?? '', this.resolvers(link));
-		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
 		const bridgeFiles = Boolean(link.bridge_attachments);
+		// o link do CDN vira anexo da mensagem: no texto ele só acrescenta uma URL que não abre
+		// fora do Discord
+		const translated = discordToPapoContent(m.content ?? '', this.resolvers(link));
+		const content = bridgeFiles ? stripDiscordMediaLinks(translated) : translated;
+		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
 		const sources: SourceRef[] = bridgeFiles
 			? m.attachments.map((a) => ({
 					side: 'discord',
@@ -1302,7 +1306,8 @@ export class Bridge {
 		}
 		await this.cacheMentionedDiscordUsers(fresh);
 		if (this.propagatesMentions(link) && /@/.test(fresh.content ?? '')) await this.ensurePapoNameIndex();
-		const chunks = chunkText(discordToPapoContent(fresh.content ?? '', this.resolvers(link)), PAPO_EMBED_CHUNK_CHARS);
+		const edited = discordToPapoContent(fresh.content ?? '', this.resolvers(link));
+		const chunks = chunkText(link.bridge_attachments ? stripDiscordMediaLinks(edited) : edited, PAPO_EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
 			? maps

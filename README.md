@@ -249,10 +249,11 @@ trabalho (commite ou `git stash` antes).
 - Mídia hospedada pelo Discord (`cdn.discordapp.com`, `media.discordapp.net`) nunca vira embed no
   Papo: o link de anexo é assinado (`?ex=&is=&hm=`) e vence em ~24h, e o hotlink é bloqueado. O
   bridge baixa o arquivo e re-envia como anexo da mensagem — vale para a mídia do embed/preview e
-  para o link de arquivo colado no texto (o texto não é alterado: o link continua lá, e o arquivo
-  chega junto). Link vencido é renovado em `attachments/refresh-urls` antes de desistir; arquivo
-  que realmente não existe mais vira aviso no texto, e a mensagem continua bridgeada. Com
-  `attachments` desligado não há para onde re-hospedar, e o preview continua com a URL.
+  para o link de arquivo colado no texto — e nesse caso **o link sai do texto**: embaixo do arquivo
+  que chegou ele seria só uma URL que não abre fora do Discord. Link vencido é renovado em
+  `attachments/refresh-urls` antes de desistir; arquivo que realmente não existe mais vira aviso no
+  texto, e a mensagem continua bridgeada. Com `attachments` desligado não há para onde re-hospedar,
+  e o link continua no texto e no preview.
 - Thread do Discord é linkável a um canal do Papo (`/link-channel`), que é o que a thread vira do
   outro lado: o Papo não tem thread. O bridge entra na thread (o Discord só entrega mensagens de
   uma thread a quem é membro) e as cópias entram nela; webhook de thread é o do canal pai, com a

@@ -134,6 +134,36 @@ export function discordMediaLinksInContent(content?: string | null): string[] {
 	return out;
 }
 
+const MARKDOWN_LINK_RE = /\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g;
+
+/**
+ * Tira do texto os links de arquivo do Discord que o bridge re-hospeda como anexo da mensagem.
+ * Quem cola `https://cdn.discordapp.com/attachments/…` quer a mídia, e a URL não funciona fora do
+ * Discord (assinatura vencida): manter as duas é mostrar um link quebrado embaixo do arquivo que
+ * chegou. `[rótulo](link)` conserva o rótulo; `<link>` some junto com os colchetes. Cerca de código
+ * não é link — é o texto que a pessoa escreveu, e não virou anexo (`discordMediaLinksInContent`).
+ */
+export function stripDiscordMediaLinks(content: string): string {
+	if (!content) return content;
+	const code: string[] = [];
+	const guarded = content.replace(/```[\s\S]*?```|`[^`\n]*`/g, (block) => {
+		code.push(block);
+		return `\u0000${code.length - 1}\u0000`;
+	});
+	const withoutLinks = guarded
+		.replace(MARKDOWN_LINK_RE, (raw, label: string, url: string) => (isDiscordMediaUrl(url) ? label.trim() : raw))
+		.replace(CONTENT_URL_RE, (url) => (isDiscordMediaUrl(url) ? '' : url));
+	// limpeza antes de devolver o código: o que a pessoa escreveu dentro do cerca não é tocado,
+	// e a indentação de lista também não
+	const cleaned = withoutLinks
+		.replace(/<\s*>/g, '')
+		.replace(/(?<=\S)[ \t]{2,}/g, ' ')
+		.replace(/[ \t]+$/gm, '')
+		.replace(/\n{3,}/g, '\n\n');
+	const restored = cleaned.replace(/\u0000(\d+)\u0000/g, (_m, index: string) => code[Number(index)] ?? '');
+	return restored.trim();
+}
+
 /**
  * Primeiro preview do Papo convertível para o Discord.
  * `thumbnailUrlFor`: o Papo não expõe a imagem do embed por URL; quem tem os bytes é

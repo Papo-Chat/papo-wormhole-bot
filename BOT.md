@@ -253,8 +253,10 @@ Nitro 500 MB; boost L2 50 MB / L3 100 MB — usar o valor configurado, nunca ass
 **Mídia que o Discord hospeda** (`cdn.discordapp.com` / `media.discordapp.net` em `/attachments/…`,
 `/embeds/…`): a URL é volátil e o hotlink é bloqueado. Ela nunca vira embed no destino: o bridge
 baixa e re-envia como anexo, pelo mesmo caminho dos anexos (acima). Vale também para o link de
-arquivo colado no texto da mensagem. Com `bridge_attachments = 0` não há para onde re-hospedar, e
-o preview mantém a URL.
+arquivo colado no texto — e nesse caso o link **sai do texto** (`stripDiscordMediaLinks`): embaixo
+do arquivo que chegou ele seria só uma URL que não abre fora do Discord. `[rótulo](link)` conserva o
+rótulo, `<link>` some inteiro, e cerca de código não é tocado (não virou anexo). Com
+`bridge_attachments = 0` não há para onde re-hospedar, e o link continua no texto e no preview.
 
 **O link de anexo é assinado.** Desde dez/2023 o CDN só serve `/attachments/` e `/embed/attachments/`
 com `?ex=&is=&hm=` válidos — `ex` é o epoch de expiração em hexadecimal, ~24h. Sem parâmetro, ou com
@@ -306,7 +308,8 @@ Mapeamento Discord Embed → Papo `EmbedInput`:
 do Papo: a URL expira junto com a mensagem original e o hotlink é bloqueado, e o backend do Papo
 não consegue re-servi-la depois. O bridge baixa e re-envia como **anexo** da mensagem
 (`discordHostedMedia` e `discordMediaLinksInContent`, em `previews.ts`) — inclusive o link de
-arquivo colado no texto. O preview que só existia por essa mídia sai do card. Avatar e banner
+arquivo colado no texto, que é removido do texto nesse caso (`stripDiscordMediaLinks`, §7). O
+preview que só existia por essa mídia sai do card. Avatar e banner
 (`author.icon_url`) ficam fora da regra: são imagem de identidade, caminho `/avatars/…`, e o
 backend do Papo já re-serva (`author_media`). Preview que chega tarde (`message_edit`) é o único
 caso em que a mídia não pode ser anexada — o Papo não aceita anexo em `PUT /messages/{id}` — então
@@ -614,7 +617,7 @@ MESSAGE_CREATE
   → ignorar bot/webhook próprio
   → canal-link? (thread linkada é canal como qualquer outro)
   → traduzir conteúdo + embeds (rich/link preview) + attachments
-  → mídia hospedada pelo Discord (embed, preview ou link colado no texto) vira anexo baixado (§7, §8)
+  → mídia hospedada pelo Discord (embed, preview ou link colado no texto) vira anexo baixado; o link sai do texto (§7, §8)
   → m.reference da origem → cópia Papo em message_map → reply_to do Papo (sem cópia: sem reply)
   → montar EmbedInput (author, thumbnail=avatar Discord, image=anexo, footer=data/origem)
   → multipart POST /messages {channel_id, content, embeds(JSON string), attachments[](binary), reply_to?}

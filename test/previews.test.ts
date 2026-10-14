@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { APIEmbed } from 'discord.js';
-import { discordHostedMedia, discordMediaLinksInContent, firstDiscordPreview, firstPapoPreview, giphyEmbed } from '../src/bridge/previews.js';
+import { discordHostedMedia, discordMediaLinksInContent, firstDiscordPreview, firstPapoPreview, giphyEmbed, stripDiscordMediaLinks } from '../src/bridge/previews.js';
 import { discordLinkIsStale, discordSignatureExpiry, isDiscordMediaUrl } from '../src/bridge/embeds.js';
 import { DISCORD_LIMITS } from '../src/bridge/limits.js';
 import type { PapoEmbed } from '../src/papo/types.js';
@@ -141,11 +141,26 @@ describe('mídia hospedada pelo Discord (URL volátil)', () => {
 		expect(discordLinkIsStale(undefined)).toBe(false);
 	});
 
-	it('lê a expiração da assinatura: `ex` é o epoch em hexadecimal', () => {
-		const seconds = Math.floor(Date.now() / 1000) + 60;
+	it('lê a expiração da assinatura: `ex` é o epoch em hexadecimal', () => {		const seconds = Math.floor(Date.now() / 1000) + 60;
 		expect(discordSignatureExpiry(`https://cdn.discordapp.com/attachments/1/2/a.png?ex=${seconds.toString(16)}&is=1&hm=ab`)).toBe(seconds);
 		expect(discordSignatureExpiry('https://cdn.discordapp.com/attachments/1/2/a.png')).toBeUndefined();
 		expect(discordSignatureExpiry('https://cdn.discordapp.com/attachments/1/2/a.png?ex=zz')).toBeUndefined();
+	});
+
+	it('o link que virou anexo sai do texto: a URL do CDN não abre fora do Discord', () => {
+		expect(stripDiscordMediaLinks('https://cdn.discordapp.com/attachments/1/2/a.gif')).toBe('');
+		expect(stripDiscordMediaLinks('olha o gif https://media.discordapp.net/attachments/1/2/a.gif 👍')).toBe('olha o gif 👍');
+		// o rótulo do link markdown fica; o alvo quebrado sai
+		expect(stripDiscordMediaLinks('[o gif](https://cdn.discordapp.com/attachments/1/2/a.gif)')).toBe('o gif');
+		// `<link>` é o jeito do Discord de suprimir o preview: some inteiro
+		expect(stripDiscordMediaLinks('olá <https://cdn.discordapp.com/attachments/1/2/a.gif>')).toBe('olá');
+		// linha que era só o link não deixa quebra extra
+		expect(stripDiscordMediaLinks('a\nhttps://cdn.discordapp.com/attachments/1/2/a.gif\nb')).toBe('a\n\nb');
+		// cerca de código é texto escrito, não link: não virou anexo
+		expect(stripDiscordMediaLinks('veja `https://cdn.discordapp.com/attachments/1/2/a.gif` aqui')).toBe('veja `https://cdn.discordapp.com/attachments/1/2/a.gif` aqui');
+		// link de fora e link de mensagem não são mídia re-hospedada
+		expect(stripDiscordMediaLinks('https://example.com/a.png')).toBe('https://example.com/a.png');
+		expect(stripDiscordMediaLinks('https://discord.com/channels/1/2/3')).toBe('https://discord.com/channels/1/2/3');
 	});
 
 	it('re-host tira do preview a mídia do Discord, e o resto do card continua', () => {
