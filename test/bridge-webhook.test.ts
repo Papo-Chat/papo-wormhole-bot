@@ -325,20 +325,25 @@ describe('envio via webhook do bridge', () => {
 	});
 });
 
-const REPLY_NOTE = '*Respondendo:[https://discord.com/channels/999/111/d-orig]*';
+const REPLY_NOTE = '*Respondendo:[https://discord.com/channels/999/111/d-orig] de @Jenga*';
 
 describe('reply na cópia de webhook', () => {
-	/** Webhook não responde mensagem: a referência do reply chega como link no texto. */
-	it('reply vira nota `*Respondendo:[link]*` no topo do content', async () => {
-		const { store, bridge, link, enqueueJob, baseJob, webhookSends, settle } = fixture({ webhook: true });
+	/** Cópia da mensagem respondida: é dela que saem o link e o `de @autor` da nota. */
+	const mapReplied = (store: Store, link: { id: number }, authorLabel: string | null = 'Jenga') =>
 		store.mapMessage({
 			link_id: link.id,
 			direction: 'papo_to_discord',
 			papo_message_id: 'pm-orig',
 			discord_message_id: 'd-orig',
 			chunk_index: 0,
-			chunk_total: 1
+			chunk_total: 1,
+			author_label: authorLabel
 		});
+
+	/** Webhook não responde mensagem: a referência do reply chega como link no texto. */
+	it('reply vira nota `*Respondendo:[link] de @autor*` no topo do content', async () => {
+		const { store, bridge, link, enqueueJob, baseJob, webhookSends, settle } = fixture({ webhook: true });
+		mapReplied(store, link);
 		enqueueJob(baseJob('pm-reply', { replyRefPapoId: 'pm-orig' }));
 		await bridge.drain();
 		await settle();
@@ -346,6 +351,37 @@ describe('reply na cópia de webhook', () => {
 		expect(webhookSends[0]?.content).toBe(`${REPLY_NOTE}\n\nolá`);
 		// guardada na cópia: toda re-escrita do content precisa reescrever a nota junto
 		expect(store.findMapByDiscord('w-1')[0]?.reply_note).toBe(REPLY_NOTE);
+		// o autor da origem fica no mapeamento: é ele que a nota de um reply futuro vai citar
+		expect(store.findMapByDiscord('w-1')[0]?.author_label).toBe('Jenga');
+	});
+
+	it('reply a uma cópia bridgeada do Discord cita o autor Discord', async () => {
+		const { store, bridge, link, enqueueJob, baseJob, webhookSends, settle } = fixture({ webhook: true });
+		// a mensagem respondida é a cópia do Papo de uma mensagem do Discord
+		store.mapMessage({
+			link_id: link.id,
+			direction: 'discord_to_papo',
+			papo_message_id: 'pm-copia',
+			discord_message_id: 'd-origem',
+			chunk_index: 0,
+			chunk_total: 1,
+			author_label: 'Jonas'
+		});
+		enqueueJob(baseJob('pm-reply', { replyRefPapoId: 'pm-copia' }));
+		await bridge.drain();
+		await settle();
+
+		expect(webhookSends[0]?.content).toBe('*Respondendo:[https://discord.com/channels/999/111/d-origem] de @Jonas*\n\nolá');
+	});
+
+	it('cópia registrada antes da coluna do autor: nota só com o link', async () => {
+		const { store, bridge, link, enqueueJob, baseJob, webhookSends, settle } = fixture({ webhook: true });
+		mapReplied(store, link, null);
+		enqueueJob(baseJob('pm-reply', { replyRefPapoId: 'pm-orig' }));
+		await bridge.drain();
+		await settle();
+
+		expect(webhookSends[0]?.content).toBe('*Respondendo:[https://discord.com/channels/999/111/d-orig]*\n\nolá');
 	});
 
 	it('sem cópia da mensagem respondida a nota não aparece', async () => {
@@ -359,14 +395,7 @@ describe('reply na cópia de webhook', () => {
 
 	it('nota sobrevive à reescrita do content pela edição', async () => {
 		const { store, outbox, bridge, link, enqueueJob, baseJob, webhookSends, edits, settle } = fixture({ webhook: true });
-		store.mapMessage({
-			link_id: link.id,
-			direction: 'papo_to_discord',
-			papo_message_id: 'pm-orig',
-			discord_message_id: 'd-orig',
-			chunk_index: 0,
-			chunk_total: 1
-		});
+		mapReplied(store, link);
 		enqueueJob(baseJob('pm-reply', { replyRefPapoId: 'pm-orig' }));
 		await bridge.drain();
 		await settle();
@@ -399,14 +428,7 @@ describe('reply na cópia de webhook', () => {
 
 	it('nota e resumo de reações convivem no content', async () => {
 		const { store, bridge, link, enqueueJob, baseJob, webhookSends, settle } = fixture({ webhook: true });
-		store.mapMessage({
-			link_id: link.id,
-			direction: 'papo_to_discord',
-			papo_message_id: 'pm-orig',
-			discord_message_id: 'd-orig',
-			chunk_index: 0,
-			chunk_total: 1
-		});
+		mapReplied(store, link);
 		store.setReaction({ linkId: link.id, source: 'papo', sourceMessageId: 'pm-reply', emoji: '👍', count: 2 });
 		enqueueJob(baseJob('pm-reply', { replyRefPapoId: 'pm-orig' }));
 		await bridge.drain();
@@ -417,14 +439,7 @@ describe('reply na cópia de webhook', () => {
 
 	it('no envio pelo cartão o reply continua sendo reply nativo do Discord', async () => {
 		const { store, bridge, link, baseJob, enqueueJob, sends, settle } = fixture({ webhook: false });
-		store.mapMessage({
-			link_id: link.id,
-			direction: 'papo_to_discord',
-			papo_message_id: 'pm-orig',
-			discord_message_id: 'd-orig',
-			chunk_index: 0,
-			chunk_total: 1
-		});
+		mapReplied(store, link);
 		enqueueJob(baseJob('pm-reply', { replyRefPapoId: 'pm-orig' }));
 		await bridge.drain();
 		await settle();

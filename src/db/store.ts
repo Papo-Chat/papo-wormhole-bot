@@ -64,6 +64,8 @@ export interface MessageMapRow {
 	link_embeds: string | null;
 	/** Nota de reply da cópia de webhook: webhook não responde mensagem, a referência vira texto. */
 	reply_note: string | null;
+	/** Rótulo do autor da mensagem de origem (o "de @autor" da nota de reply). */
+	author_label: string | null;
 	edit_revision: string | null;
 	/** Revisão da última atualização de preview aplicada à cópia. */
 	embed_revision: string | null;
@@ -345,12 +347,13 @@ export class Store {
 		footer_base?: string | null;
 		link_embeds?: unknown;
 		reply_note?: string | null;
+		author_label?: string | null;
 		webhook_copy?: boolean;
 	}): void {
 		this.db
 			.prepare(
-				`INSERT INTO message_map (link_id, direction, papo_message_id, discord_message_id, chunk_index, chunk_total, content_sha, rendered, bridge_embed, footer_base, link_embeds, reply_note, webhook_copy)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`INSERT INTO message_map (link_id, direction, papo_message_id, discord_message_id, chunk_index, chunk_total, content_sha, rendered, bridge_embed, footer_base, link_embeds, reply_note, author_label, webhook_copy)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT DO NOTHING`
 			)
 			.run(
@@ -366,6 +369,7 @@ export class Store {
 				m.footer_base ?? null,
 				m.link_embeds === undefined || m.link_embeds === null ? null : JSON.stringify(m.link_embeds),
 				m.reply_note ?? null,
+				m.author_label ?? null,
 				m.webhook_copy ? 1 : 0
 			);
 	}

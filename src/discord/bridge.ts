@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
 	Client,
 	GatewayIntentBits,
@@ -33,6 +34,43 @@ export function bridgeWebhookName(displayName: string, username: string): string
 	if (base === username) return username;
 	// o sufixo `(@username)` precisa sobreviver ao limite de 80: o apelido cede espaço
 	return `${base.slice(0, 76 - username.length)} (@${username})`.slice(0, 80);
+}
+
+const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
+
+const pathOf = (url: string): string => {
+	try {
+		return new URL(url).pathname;
+	} catch {
+		return url;
+	}
+};
+
+/**
+ * Leitura da resposta de `attachments/refresh-urls`. O endpoint já respondeu das duas formas
+ * (`refreshed_urls` com par original→refreshed, e `asset_lookup` indexado pelo sha256 do
+ * caminho), e aceitar as duas evita que uma mudança de formato converta mídia viva em 404.
+ */
+function refreshedUrlFrom(payload: unknown, url: string): string | undefined {
+	const data = payload as {
+		refreshed_urls?: { original?: string; refreshed?: string }[];
+		asset_lookup?: Record<string, { updated?: string } | string>;
+	};
+	for (const entry of data?.refreshed_urls ?? []) {
+		if (entry?.refreshed && (!entry.original || entry.original === url)) return entry.refreshed;
+	}
+	const lookup = data?.asset_lookup;
+	if (!lookup) return undefined;
+	const keys = new Set([sha256(pathOf(url)), sha256(url.split('?')[0] ?? url)]);
+	const values = Object.entries(lookup);
+	const updated = (value: { updated?: string } | string): string | undefined =>
+		typeof value === 'string' ? value : value?.updated;
+	for (const [key, value] of values) {
+		if (keys.has(key) && updated(value)) return updated(value);
+	}
+	// um resultado só e nenhuma chave reconhecível: é o link que pedimos
+	const only = values.length === 1 ? values[0]?.[1] : undefined;
+	return only ? updated(only) : undefined;
 }
 
 export interface DiscordHandlers {
@@ -272,6 +310,41 @@ export class DiscordBridge {
 		const guildId = channel && 'guildId' in channel ? channel.guildId : this.firstGuild?.id;
 		if (!guildId) return undefined;
 		return `https://discord.com/channels/${guildId}/${channelId}/${messageId}`;
+	}
+
+	/**
+	 * Link de anexo do Discord é assinado (`?ex=&is=&hm=`) e vence em ~24h: um 404 quase nunca
+	 * significa que o arquivo morreu — significa que o link venceu. `POST /attachments/refresh-urls`
+	 * devolve uma assinatura nova para o mesmo arquivo (o token do bot é aceito).
+	 * Falhou, devolve `undefined`: quem decide o destino da mídia é o chamador, a API de refresh
+	 * é só uma segunda chance.
+	 */
+	async refreshMediaUrl(url: string): Promise<string | undefined> {
+		const token = this.opts.token;
+		if (!token) return undefined;
+		// o endpoint é do cliente; com token de bot a aceitação varia entre `Bot <token>` e o
+		// token cru, então o primeiro 401/403 troca a forma de enviar antes de desistir
+		for (const authorization of [`Bot ${token}`, token]) {
+			let res: Response;
+			try {
+				res = await fetch('https://discord.com/api/v9/attachments/refresh-urls', {
+					method: 'POST',
+					headers: { authorization, 'content-type': 'application/json' },
+					body: JSON.stringify({ attachment_urls: [url] }),
+					signal: AbortSignal.timeout(15_000)
+				});
+			} catch (err) {
+				this.log.warn({ err: (err as Error).message, url }, 'refresh-urls falhou');
+				return undefined;
+			}
+			if (res.status === 401 || res.status === 403) continue;
+			if (!res.ok) return undefined;
+			const refreshed = refreshedUrlFrom(await res.json().catch(() => undefined), url);
+			if (!refreshed) return undefined;
+			this.log.info({ url, refreshed }, 'assinatura do anexo renovada');
+			return refreshed;
+		}
+		return undefined;
 	}
 
 	/**

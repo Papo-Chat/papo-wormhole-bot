@@ -62,8 +62,8 @@ const fixture = () => {
 		profilesBatch: async (ids: string[]) => ids.map((id) => ({ id, username: 'u', nickname: null })),
 		whoami: async () => ({ id: PAPO_BOT, username: 'bot' }),
 		ensureSession: async () => true,
-		sent: [] as { embeds?: { footer?: { text?: string } }[] }[],
-		sendMessage: async (input: { embeds?: { footer?: { text?: string } }[] }) => {
+		sent: [] as { embeds?: { description?: string; footer?: { text?: string } }[] }[],
+		sendMessage: async (input: { embeds?: { description?: string; footer?: { text?: string } }[] }) => {
 			api.sent.push(input);
 			return { id: `pm${api.sent.length}`, channel_id: 'chan-1', author_id: PAPO_BOT, content: null, created_at: new Date().toISOString() };
 		},
@@ -279,7 +279,7 @@ describe('P1.1: tentativa remota registrada imediatamente antes do envio', () =>
 		}
 	});
 
-	it('anexo que não existe no destino é falha permanente, não reconciliação', async () => {
+	it('anexo que não existe na origem não derruba a mensagem: vira aviso, sem reconciliação', async () => {
 		const { outbox, bridge, api, settle } = fixture();
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = async () => new Response(null, { status: 404 });
@@ -290,8 +290,11 @@ describe('P1.1: tentativa remota registrada imediatamente antes do envio', () =>
 			} as never);
 			await settle();
 
-			expect(outbox.counts().dead).toBe(1);
-			expect(api.sent).toHaveLength(0);
+			// perder o arquivo não é motivo para perder a mensagem: o texto chega com o aviso
+			expect(outbox.counts().dead).toBe(0);
+			expect(api.sent).toHaveLength(1);
+			expect(api.sent[0]!.embeds?.[0]?.description).toContain('não está mais disponível');
+			// nada foi enviado antes de falhar: não há duplicata a reconciliar
 			expect(api.listCalls).toBe(0);
 		} finally {
 			globalThis.fetch = originalFetch;

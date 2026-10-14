@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { APIEmbed } from 'discord.js';
 import { discordHostedMedia, discordMediaLinksInContent, firstDiscordPreview, firstPapoPreview, giphyEmbed } from '../src/bridge/previews.js';
-import { isDiscordMediaUrl } from '../src/bridge/embeds.js';
+import { discordLinkIsStale, discordSignatureExpiry, isDiscordMediaUrl } from '../src/bridge/embeds.js';
 import { DISCORD_LIMITS } from '../src/bridge/limits.js';
 import type { PapoEmbed } from '../src/papo/types.js';
 
@@ -120,6 +120,32 @@ describe('mídia hospedada pelo Discord (URL volátil)', () => {
 		expect(isDiscordMediaUrl('https://discord.com/channels/1/2/3')).toBe(false);
 		expect(isDiscordMediaUrl('https://example.com/x.png')).toBe(false);
 		expect(isDiscordMediaUrl(undefined)).toBe(false);
+	});
+
+	it('link de anexo sem assinatura válida está vencido (o CDN responde 404 com o arquivo vivo)', () => {
+		const hex = (seconds: number) => seconds.toString(16);
+		const now = Math.floor(Date.now() / 1000);
+		const past = hex(now - 3600);
+		const future = hex(now + 3600);
+
+		// copiar link no Discord entrega o caminho limpo: sem assinatura o CDN recusa
+		expect(discordLinkIsStale('https://cdn.discordapp.com/attachments/1/2/gif.gif')).toBe(true);
+		expect(discordLinkIsStale('https://media.discordapp.net/attachments/1/2/gif.gif')).toBe(true);
+		expect(discordLinkIsStale(`https://cdn.discordapp.com/attachments/1/2/gif.gif?ex=${past}&is=${past}&hm=ab`)).toBe(true);
+		expect(discordLinkIsStale(`https://cdn.discordapp.com/attachments/1/2/gif.gif?ex=${future}&is=${past}&hm=ab`)).toBe(false);
+		// `/emojis/` e `/stickers/` são públicos: não são assinados, não vencem
+		expect(discordLinkIsStale('https://cdn.discordapp.com/emojis/1.gif')).toBe(false);
+		expect(discordLinkIsStale('https://cdn.discordapp.com/stickers/1.json')).toBe(false);
+		// fora do CDN não é link que o bridge renova
+		expect(discordLinkIsStale('https://example.com/a.png')).toBe(false);
+		expect(discordLinkIsStale(undefined)).toBe(false);
+	});
+
+	it('lê a expiração da assinatura: `ex` é o epoch em hexadecimal', () => {
+		const seconds = Math.floor(Date.now() / 1000) + 60;
+		expect(discordSignatureExpiry(`https://cdn.discordapp.com/attachments/1/2/a.png?ex=${seconds.toString(16)}&is=1&hm=ab`)).toBe(seconds);
+		expect(discordSignatureExpiry('https://cdn.discordapp.com/attachments/1/2/a.png')).toBeUndefined();
+		expect(discordSignatureExpiry('https://cdn.discordapp.com/attachments/1/2/a.png?ex=zz')).toBeUndefined();
 	});
 
 	it('re-host tira do preview a mídia do Discord, e o resto do card continua', () => {

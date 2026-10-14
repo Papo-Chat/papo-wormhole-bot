@@ -45,7 +45,9 @@ import {
 	buildDiscordBridgeEmbed,
 	buildPapoBridgeEmbed,
 	discordApiEmbed,
+	discordLinkIsStale,
 	discordMediaSourceUrl,
+	discordSignatureExpiry,
 	fitEmbedBudget,
 	mediaAttachmentName,
 	mimeFromUrl,
@@ -54,7 +56,7 @@ import {
 	type DiscordMedia,
 	type PreviewMedia
 } from './embeds.js';
-import { prepareAttachments, sanitizeName, type SourceAttachment } from './attachments.js';
+import { prepareAttachments, sanitizeName, SourceGoneError, type SourceAttachment } from './attachments.js';
 import { mergeReactionCounts, reactionSummaryText, type ReactionDisplay } from './reactions.js';
 import { EMBED_CHUNK_CHARS, PAPO_LIMITS, PAPO_EMBED_CHUNK_CHARS, DISCORD_LIMITS, PAPO_VIDEO_MIMES, clampText } from './limits.js';
 import { EmojiBridge, type ApplicationEmojiResolver, type GuildEmojiResolver } from './emoji.js';
@@ -108,9 +110,14 @@ const REACTION_MARK = '↳ ';
 /**
  * Nota de reply da cópia de webhook. Webhook não responde mensagem (limitação da API do
  * Discord), então a referência chega como link no topo do `content` — o link é o que o leitor
- * do Discord usa para abrir a mensagem respondida.
+ * do Discord usa para abrir a mensagem respondida, e o `de @autor` diz quem é sem precisar
+ * abrir. Sem o rótulo do autor (cópia antiga, anterior à coluna) a nota fica só com o link.
  */
-const replyNoteFor = (link?: string | null): string => (link ? `*Respondendo:[${link}]*` : '');
+const replyNoteFor = (link?: string | null, author?: string | null): string => {
+	if (!link) return '';
+	const who = author ? ` de @${author}` : '';
+	return `*Respondendo:[${link}]${who}*`;
+};
 
 /** Buscas no Discord por menção que o payload não trouxe, por mensagem. */
 const MENTION_LOOKUP_LIMIT = 10;
@@ -431,10 +438,15 @@ export class Bridge {
 	/**
 	 * Cópia bridgeada da mensagem que está sendo respondida. Sem cópia (mensagem anterior
 	 * ao link, ou apagada) o reply simplesmente não é propagado: não existe id de destino.
+	 * A linha é o que dá o id **e** o autor da nota de reply (`de @autor`).
 	 */
-	private copyForPapoMessage(papoMessageId?: string | null): string | undefined {
+	private replyCopy(papoMessageId?: string | null): MessageMapRow | undefined {
 		if (!papoMessageId) return undefined;
-		return this.store.findMapByPapo(papoMessageId).find((r) => !r.deleted && r.discord_message_id)?.discord_message_id ?? undefined;
+		return this.store.findMapByPapo(papoMessageId).find((r) => !r.deleted && r.discord_message_id);
+	}
+
+	private copyForPapoMessage(papoMessageId?: string | null): string | undefined {
+		return this.replyCopy(papoMessageId)?.discord_message_id ?? undefined;
 	}
 
 	private copyForDiscordMessage(discordMessageId?: string | null): string | undefined {
@@ -1575,21 +1587,88 @@ export class Bridge {
 			moderationStatus: s.moderationStatus,
 			download: async () => {
 				if (s.side === 'papo') return this.api.downloadAttachment(s.id);
-				if (!s.url) throw new PermanentError(`attachment ${s.id} sem URL de origem`);
-				let res: Response;
-				try {
-					res = await fetch(s.url, { signal: AbortSignal.timeout(60_000) });
-				} catch (err) {
-					// rede instável não é motivo para matar a mensagem: volta para a fila
-					throw new RetryableError(`download ${s.url}: ${(err as Error).message}`);
-				}
-				if (!res.ok) {
-					if (res.status === 429 || res.status >= 500) throw new RetryableError(`download ${s.url} → HTTP ${res.status}`);
-					throw new PermanentError(`download ${s.url} → HTTP ${res.status}`);
-				}
-				return Buffer.from(await res.arrayBuffer());
+				return this.downloadDiscordFile(s);
 			}
 		}));
+	}
+
+	/**
+	 * Baixa um arquivo do CDN do Discord. O link é assinado (`?ex=&is=&hm=`) e vence em ~24h,
+	 * então 404 não quer dizer "arquivo morto": quase sempre quer dizer "link vencido". O bridge
+	 * renova a assinatura e tenta de novo antes de declarar a mídia perdida. Link já vencido é
+	 * renovado antes da primeira tentativa — bater no 404 certo seria só desperdiçar uma ida à rede.
+	 */
+	private async downloadDiscordFile(source: SourceRef): Promise<Buffer> {
+		const url = source.url;
+		if (!url) throw new PermanentError(`attachment ${source.id} sem URL de origem`);
+		const stale = discordLinkIsStale(url);
+		const tried = new Set<string>();
+		for (const candidate of stale ? [await this.refreshDiscordUrl(url), url] : [url]) {
+			if (!candidate || tried.has(candidate)) continue;
+			tried.add(candidate);
+			const data = await this.fetchDiscordFile(candidate);
+			if (data) return data;
+		}
+		// recusado com assinatura válida: o arquivo pode estar vivo e o link, não
+		if (!stale) {
+			const refreshed = await this.refreshDiscordUrl(url);
+			if (refreshed && !tried.has(refreshed)) {
+				const data = await this.fetchDiscordFile(refreshed);
+				if (data) return data;
+			}
+		}
+		throw new SourceGoneError(`download ${url} → indisponível na origem`);
+	}
+
+	/** `undefined` = o CDN recusou o link (4xx): quem chama decide entre renovar ou desistir. */
+	private async fetchDiscordFile(url: string): Promise<Buffer | undefined> {
+		let res: Response;
+		try {
+			res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+		} catch (err) {
+			// rede instável não é motivo para matar a mensagem: volta para a fila
+			throw new RetryableError(`download ${url}: ${(err as Error).message}`);
+		}
+		if (!res.ok) {
+			if (res.status === 429 || res.status >= 500) throw new RetryableError(`download ${url} → HTTP ${res.status}`);
+			return undefined;
+		}
+		return Buffer.from(await res.arrayBuffer());
+	}
+
+	/**
+	 * Assinatura renovada, indexada pelo caminho do CDN. O mesmo GIF de favorito é enviado por
+	 * muita gente e o embed sempre aponta para o caminho original: sem cache cada mensagem pagaria
+	 * uma chamada de refresh pelo mesmo arquivo.
+	 */
+	private refreshedMedia = new Map<string, { url: string; expiresAt: number }>();
+	/** Renovação em andamento, para um burst do mesmo arquivo não pagar uma chamada cada. */
+	private refreshing = new Map<string, Promise<string | undefined>>();
+
+	private async refreshDiscordUrl(url: string): Promise<string | undefined> {
+		const key = mediaKey(url);
+		if (!key) return undefined;
+		const cached = this.refreshedMedia.get(key);
+		if (cached && cached.expiresAt > Date.now()) return cached.url;
+		const inflight = this.refreshing.get(key);
+		if (inflight) return inflight;
+		const promise = this.refreshDiscordMedia(url, key);
+		this.refreshing.set(key, promise);
+		try {
+			return await promise;
+		} finally {
+			this.refreshing.delete(key);
+		}
+	}
+
+	private async refreshDiscordMedia(url: string, key: string): Promise<string | undefined> {
+		const refreshed = await this.discord.refreshMediaUrl?.(url);
+		if (!refreshed) return undefined;
+		if (this.refreshedMedia.size > 500) this.refreshedMedia.clear();
+		const expiry = discordSignatureExpiry(refreshed);
+		// sem `ex` legível na resposta o cache vale pouco: o suficiente para não repetir a chamada
+		this.refreshedMedia.set(key, { url: refreshed, expiresAt: expiry ? expiry * 1000 : Date.now() + 60_000 });
+		return refreshed;
 	}
 
 	/** Nome de arquivo para mídia de preview que só existe como URL (o destino quer um nome). */
@@ -1780,10 +1859,14 @@ export class Bridge {
 			: undefined;
 		const webhookMode = Boolean(webhook);
 		// Webhook não responde mensagem (limitação da API do Discord): a referência de um reply
-		// chega como link no topo do `content`. Guardar a nota em `message_map.reply_note` é o
-		// que permite reescrevê-la em toda reescrita do content (edição, resumo de reação).
-		const replyTarget = this.copyForPapoMessage(job.replyRefPapoId);
-		const replyNote = webhookMode ? replyNoteFor(replyTarget && this.discord.messageLink(job.discordChannelId, replyTarget)) : '';
+		// chega como link no topo do `content`, com o autor da mensagem respondida. Guardar a
+		// nota em `message_map.reply_note` é o que permite reescrevê-la em toda reescrita do
+		// content (edição, resumo de reação).
+		const replyCopy = this.replyCopy(job.replyRefPapoId);
+		const replyTarget = replyCopy?.discord_message_id ?? undefined;
+		const replyNote = webhookMode
+			? replyNoteFor(replyTarget && this.discord.messageLink(job.discordChannelId, replyTarget), replyCopy?.author_label)
+			: '';
 
 		const avatar = webhookMode ? undefined : this.avatarAttachment(job.authorIconSha, embed?.author?.icon_url);
 		// embeds **da origem Papo** (preview de link, GIF do picker): já vêm em `job.linkEmbeds`.
@@ -1975,6 +2058,9 @@ export class Bridge {
 			link_embeds: extra ? null : webhookCopy ? webhookPreviews : (job.linkEmbeds ?? []),
 			// só o grupo 0 tem `content`: os grupos de arquivo não repetem a nota
 			reply_note: extra ? null : replyNote || null,
+			// autor da origem: rótulo do "de @autor" da nota, e o que identifica a cópia numa
+			// reconciliação manual
+			author_label: job.authorName || null,
 			webhook_copy: webhookCopy
 		});
 	}
@@ -2124,7 +2210,9 @@ export class Bridge {
 			rendered: extra ? null : text,
 			bridge_embed: extra ? null : mainEmbed ?? null,
 			footer_base: extra ? null : footerBase,
-			link_embeds: extra ? null : (job.linkEmbeds ?? [])
+			link_embeds: extra ? null : (job.linkEmbeds ?? []),
+			// autor Discord de origem: é ele que a nota de reply de uma cópia aponta
+			author_label: job.authorName || null
 		});
 	}
 

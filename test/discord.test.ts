@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { GatewayIntentBits } from 'discord.js';
 import { DiscordBridge, buildSendPayload } from '../src/discord/bridge.js';
@@ -138,5 +139,70 @@ describe('threads', () => {
 		bridge.client.channels.cache.set('222', { guildId: '999' } as never);
 		expect(bridge.isThread('222')).toBe(false);
 		void bridge.destroy();
+	});
+});
+
+describe('refresh de link de anexo (assinatura vencida)', () => {
+	const url = 'https://cdn.discordapp.com/attachments/111/222/image0-6.gif';
+	const json = (payload: unknown, status = 200) =>
+		new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } });
+
+	/** O bridge chama o endpoint uma ou duas vezes (a forma do token pode ser trocada). */
+	const withFetch = (respond: (call: number, body: Record<string, unknown>) => Response) => {
+		const calls: { url: string; body: Record<string, unknown>; authorization: string | null }[] = [];
+		const original = globalThis.fetch;
+		globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+			const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+			calls.push({ url: String(input), body, authorization: new Headers(init?.headers).get('authorization') });
+			return respond(calls.length, body);
+		}) as never;
+		const bridge = new DiscordBridge({ token: 'TOKEN', handlers: {} });
+		const run = async () => {
+			try {
+				return await bridge.refreshMediaUrl(url);
+			} finally {
+				globalThis.fetch = original;
+				await bridge.destroy();
+			}
+		};
+		return { calls, run };
+	};
+
+	it('pede a assinatura nova no endpoint do Discord', async () => {
+		const { calls, run } = withFetch(() => json({ refreshed_urls: [{ original: url, refreshed: `${url}?ex=68f0a1b2&is=68ef4f62&hm=beef` }] }));
+		expect(await run()).toBe(`${url}?ex=68f0a1b2&is=68ef4f62&hm=beef`);
+		expect(calls[0]?.url).toBe('https://discord.com/api/v9/attachments/refresh-urls');
+		expect(calls[0]?.body).toEqual({ attachment_urls: [url] });
+		expect(calls[0]?.authorization).toBe('Bot TOKEN');
+	});
+
+	it('403 com `Bot <token>` tenta o token cru: o endpoint é do cliente', async () => {
+		const { calls, run } = withFetch((call) =>
+			call === 1 ? json({ code: 40333 }, 403) : json({ refreshed_urls: [{ original: url, refreshed: `${url}?ex=1&is=1&hm=aa` }] })
+		);
+		expect(await run()).toBe(`${url}?ex=1&is=1&hm=aa`);
+		expect(calls.map((c) => c.authorization)).toEqual(['Bot TOKEN', 'TOKEN']);
+	});
+
+	it('aceita a resposta indexada pelo sha256 do caminho (`asset_lookup`)', async () => {
+		const key = createHash('sha256').update('/attachments/111/222/image0-6.gif').digest('hex');
+		const { run } = withFetch(() => json({ asset_lookup: { [key]: { updated: `${url}?ex=2&is=2&hm=bb`, expires_at: '2026-10-15T00:00:00+00:00' } } }));
+		expect(await run()).toBe(`${url}?ex=2&is=2&hm=bb`);
+	});
+
+	it('resposta sem link utilizável não inventa nada', async () => {
+		const { run } = withFetch(() => json({}));
+		expect(await run()).toBeUndefined();
+	});
+
+	it('recusa do endpoint não derruba o envio', async () => {
+		const { run } = withFetch(() => json({ code: 429 }, 429));
+		expect(await run()).toBeUndefined();
+	});
+
+	it('sem token não há o que renovar', async () => {
+		const bridge = new DiscordBridge({ token: '', handlers: {} });
+		expect(await bridge.refreshMediaUrl(url)).toBeUndefined();
+		await bridge.destroy();
 	});
 });

@@ -251,10 +251,33 @@ Nitro 500 MB; boost L2 50 MB / L3 100 MB — usar o valor configurado, nunca ass
 | `pending` / `processing` | bridgear normalmente: o Papo também mostra e serve o arquivo durante a inferência (`GET /attachments/{id}` só recusa `blocked`, com 410). Se o veredito for `blocked`, o Papo apaga a mensagem inteira e o `message_delete` apaga a cópia do outro lado |
 
 **Mídia que o Discord hospeda** (`cdn.discordapp.com` / `media.discordapp.net` em `/attachments/…`,
-`/embeds/…`): a URL é volátil — expira junto com a mensagem original e o hotlink é bloqueado. Ela
-nunca vira embed no destino: o bridge baixa e re-envia como anexo, pelo mesmo caminho dos anexos
-(acima). Vale também para o link de arquivo colado no texto da mensagem. Com
-`bridge_attachments = 0` não há para onde re-hospedar, e o preview mantém a URL.
+`/embeds/…`): a URL é volátil e o hotlink é bloqueado. Ela nunca vira embed no destino: o bridge
+baixa e re-envia como anexo, pelo mesmo caminho dos anexos (acima). Vale também para o link de
+arquivo colado no texto da mensagem. Com `bridge_attachments = 0` não há para onde re-hospedar, e
+o preview mantém a URL.
+
+**O link de anexo é assinado.** Desde dez/2023 o CDN só serve `/attachments/` e `/embed/attachments/`
+com `?ex=&is=&hm=` válidos — `ex` é o epoch de expiração em hexadecimal, ~24h. Sem parâmetro, ou com
+`ex` no passado, o CDN responde 404 *"This content is no longer available"* **com o arquivo vivo**: é
+o que acontece com o link limpo que o Discord entrega ao copiar, com o GIF de favorito (o embed aponta
+para o caminho original, sem assinatura) e com um job que volta para a fila depois que a assinatura do
+payload expirou. Por isso 404 nunca é tratado como "arquivo morto" na primeira tentativa:
+
+1. `discordLinkIsStale` decide antes de ir à rede: link sem assinatura ou com `ex` vencido é renovado
+   primeiro — bater no 404 certo seria só desperdiçar uma ida.
+2. A renovação é `POST https://discord.com/api/v9/attachments/refresh-urls` com `{attachment_urls:[url]}`
+   e o token do bot (aceito; se `Bot <token>` for recusado, o token cru é re-tentado). A leitura aceita
+   as duas formas que o endpoint já respondeu: `refreshed_urls[{original, refreshed}]` e
+   `asset_lookup[sha256(caminho)].updated`. O resultado é cacheado por **caminho** até o `ex` vencer, e
+   uma renovação em andamento é compartilhada: o mesmo GIF de favorito, que muita gente manda ao mesmo
+   tempo, paga uma chamada só.
+3. Persistiu o 404 depois da renovação: `SourceGoneError` — o anexo é omitido com aviso no texto
+   (`⚠️ anexo "…" não está mais disponível na origem`) e **a mensagem continua bridgeada**. Perder um
+   arquivo não é motivo para perder a cópia inteira; o job não vai para `dead`.
+4. 429/5xx e erro de rede continuam `RetryableError`: volta para a fila, a mídia não é descartada.
+
+Os outros caminhos do CDN (`/emojis/`, `/stickers/`, `/embeds/`, avatares) não são assinados e não
+expiram — não passam por renovação.
 
 Cache de mídia em disco (`media_cache(sha256, path, mime, size_bytes, source)`) para:
 reuso de avatar, retries sem novo download, e URLs estáveis no media server.
@@ -491,8 +514,10 @@ CREATE TABLE message_map (
   -- cópia enviada pelo webhook do usuário: o texto mora no `content`, não em cartão
   webhook_copy      INTEGER NOT NULL DEFAULT 0,
   link_embeds       TEXT,      -- JSON do preview de link aplicado à cópia (atrás do cartão)
-  -- nota de reply da cópia de webhook (`*Respondendo:[link]*`): webhook não responde mensagem
+  -- nota de reply da cópia de webhook (`*Respondendo:[link] de @autor*`): webhook não responde mensagem
   reply_note        TEXT,
+  -- rótulo do autor da mensagem de origem: o "de @autor" da nota de reply
+  author_label      TEXT,
   edit_revision     TEXT,      -- revisão da última edição aplicada (edição atrasada não reverte)
   embed_revision    TEXT,      -- revisão da última atualização de preview aplicada
   deleted           INTEGER NOT NULL DEFAULT 0,
@@ -648,10 +673,13 @@ O reply é propagado por referência mapeada, não por texto copiado:
 - Não copiamos o texto respondido no corpo do embed: os dois lados já renderizam o preview nativo
   (Discord mostra a mensagem referenciada, o Papo mostra o reply do próprio Papo).
 - **Modo webhook não tem reply nativo** (o Discord não permite que webhook responda mensagem): a
-  referência chega como `*Respondendo:[link da mensagem no Discord]*` no topo do `content` da
-  cópia. A nota fica em `message_map.reply_note` porque toda re-escrita do content (edição, resumo
-  de reações) reescreve o `content` inteiro e precisa reescrevê-la junto. No envio pelo cartão o
-  reply continua sendo reply nativo do Discord.
+  referência chega como `*Respondendo:[link da mensagem no Discord] de @autor*` no topo do
+  `content` da cópia — o autor citado é o da mensagem respondida, lido de `message_map.author_label`
+  (autor Papo quando a cópia é `papo_to_discord`, autor Discord quando é `discord_to_papo`; sem
+  rótulo — cópia anterior à coluna — a nota fica só com o link). A nota fica em
+  `message_map.reply_note` porque toda re-escrita do content (edição, resumo de reações) reescreve
+  o `content` inteiro e precisa reescrevê-la junto. No envio pelo cartão o reply continua sendo
+  reply nativo do Discord.
 
 ---
 

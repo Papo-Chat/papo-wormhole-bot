@@ -1,6 +1,12 @@
 import { gzip, isCompressibleMime, partition, tarGz } from './tar.js';
 import { PART_TARGET_BYTES } from './limits.js';
 
+/**
+ * O arquivo não está mais disponível na origem (link expirado sem renovação possível, mensagem
+ * apagada). Não é motivo para perder a mensagem inteira: o bridge segue sem ele e avisa no texto.
+ */
+export class SourceGoneError extends Error {}
+
 export interface SourceAttachment {
 	id: string;
 	name: string;
@@ -79,7 +85,18 @@ export async function prepareAttachments(
 			notes.push(`⚠️ anexo "${a.name}" marcado como conteúdo sensível.`);
 		}
 
-		const data = await a.download();
+		// mídia que não existe mais na origem não apaga a mensagem: vira aviso no texto e o
+		// resto continua bridgeado
+		let data: Buffer;
+		try {
+			data = await a.download();
+		} catch (err) {
+			if (err instanceof SourceGoneError) {
+				notes.push(`⚠️ anexo "${a.name}" não está mais disponível na origem (não reenviado).`);
+				continue;
+			}
+			throw err;
+		}
 		const name = sanitizeName(a.name);
 
 		if (data.length <= limits.maxFileBytes) {

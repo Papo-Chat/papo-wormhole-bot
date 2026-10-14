@@ -167,6 +167,8 @@ const fixture = (opts: {
 		unreact: async () => {},
 		delete: async () => {},
 		fetchMessage: async () => undefined,
+		/** Preenchido por teste: o bridge renova a assinatura vencida antes de desistir. */
+		refreshMediaUrl: undefined as ((url: string) => Promise<string | undefined>) | undefined,
 		destroy: async () => {}
 	};
 
@@ -987,5 +989,149 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 		expect(sent.attachments ?? []).toHaveLength(0);
 		expect(sent.embeds ?? []).toHaveLength(2);
 		expect(sent.embeds![1]!.thumbnail?.url).toBe('https://cdn.discordapp.com/attachments/111/222/foto.png');
+	});
+});
+
+describe('link de anexo do Discord com assinatura vencida', () => {
+	/**
+	 * O CDN só serve anexo com `?ex=&is=&hm=` válidos, e a assinatura vence em ~24h: um 404 não
+	 * quer dizer que o arquivo morreu, quer dizer que o link venceu. O bridge renova a assinatura
+	 * em `attachments/refresh-urls` antes de declarar a mídia perdida.
+	 */
+	const hex = (seconds: number) => seconds.toString(16);
+	const now = () => Math.floor(Date.now() / 1000);
+	const signed = (path: string, ttl: number) =>
+		`https://cdn.discordapp.com/attachments/111/222/${path}?ex=${hex(now() + ttl)}&is=${hex(now())}&hm=beef`;
+
+	it('GIF de favorito sem assinatura: renova o link e nem tenta o link vencido', async () => {
+		const { bridge, api, discord, outbox, settle } = fixture();
+		const unsigned = 'https://media.discordapp.net/attachments/223594824681521152/935544876509048852/image0-6.gif';
+		const renewed = `https://cdn.discordapp.com/attachments/223594824681521152/935544876509048852/image0-6.gif?ex=${hex(now() + 86_400)}&is=${hex(now())}&hm=deadbeef`;
+		discord.refreshMediaUrl = async () => renewed;
+
+		const { urls } = await withFetch(
+			async (url) =>
+				url === renewed
+					? new Response(Buffer.from('gif-vivo'), { status: 200, headers: { 'content-type': 'image/gif' } })
+					: new Response('This content is no longer available.', { status: 404 }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'olha o gif', {
+						embeds: [
+							{
+								type: 'gifv',
+								url: unsigned,
+								title: 'image0-6.gif',
+								image: { url: unsigned, width: 480, height: 480, content_type: 'image/gif' }
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		expect(api.sent[0]?.attachments?.map((a) => a.name)).toEqual(['image0-6.gif']);
+		// o link sem assinatura seria 404 certo: a renovação vem antes da primeira tentativa
+		expect(urls).toEqual([renewed]);
+		expect(outbox.counts().dead).toBe(0);
+	});
+
+	it('404 com assinatura ainda válida também tenta renovar antes de desistir', async () => {
+		const { bridge, api, discord, outbox, settle } = fixture();
+		const fresh = signed('clipe.mp4', 3600);
+		const renewed = signed('clipe.mp4', 86_400);
+		discord.refreshMediaUrl = async () => renewed;
+
+		const { urls } = await withFetch(
+			async (url) =>
+				url === renewed
+					? new Response(Buffer.from('video-vivo'), { status: 200, headers: { 'content-type': 'video/mp4' } })
+					: new Response('This content is no longer available.', { status: 404 }),
+			async () => {
+				await bridge.onDiscordMessage(discordMessage('dm-1', fresh));
+				await settle();
+			}
+		);
+
+		expect(api.sent[0]?.attachments?.map((a) => a.name)).toEqual(['clipe.mp4']);
+		expect(urls).toEqual([fresh, renewed]);
+		expect(outbox.counts().dead).toBe(0);
+	});
+
+	it('o mesmo arquivo enviado por pessoas diferentes renova a assinatura uma vez só', async () => {
+		const { bridge, api, discord, settle } = fixture();
+		const path = 'https://cdn.discordapp.com/attachments/223594824681521152/935544876509048852/image0-6.gif';
+		const renewed = `${path}?ex=${hex(now() + 86_400)}&is=${hex(now())}&hm=deadbeef`;
+		let refreshes = 0;
+		discord.refreshMediaUrl = async () => {
+			refreshes++;
+			return renewed;
+		};
+
+		await withFetch(
+			async (url) =>
+				url === renewed
+					? new Response(Buffer.from('gif'), { status: 200, headers: { 'content-type': 'image/gif' } })
+					: new Response('This content is no longer available.', { status: 404 }),
+			async () => {
+				// assinaturas diferentes, o mesmo caminho: é o GIF de favorito que muita gente manda
+				await bridge.onDiscordMessage(discordMessage('dm-1', `${path}?ex=1&is=1&hm=aa`));
+				await bridge.onDiscordMessage(discordMessage('dm-2', `${path}?ex=2&is=2&hm=bb`));
+				await settle();
+			}
+		);
+
+		expect(refreshes).toBe(1);
+		expect(api.sent.map((s) => s.attachments?.map((a) => a.name))).toEqual([['image0-6.gif'], ['image0-6.gif']]);
+	});
+
+	it('mídia que não existe mais vira aviso no texto: a mensagem continua bridgeada', async () => {
+		const { bridge, api, outbox, settle } = fixture();
+		await withFetch(
+			async () => new Response('This content is no longer available.', { status: 404 }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-1', 'olha o gif', {
+						embeds: [
+							{
+								type: 'image',
+								url: 'https://cdn.discordapp.com/attachments/111/222/morto.gif',
+								title: 'morto.gif',
+								image: { url: 'https://cdn.discordapp.com/attachments/111/222/morto.gif', width: 300, height: 224, content_type: 'image/gif' }
+							}
+						]
+					})
+				);
+				await settle();
+			}
+		);
+
+		const sent = api.sent[0]!;
+		expect(sent.attachments ?? []).toHaveLength(0);
+		expect(sent.embeds![0]!.description).toContain('olha o gif');
+		expect(sent.embeds![0]!.description).toContain('morto.gif');
+		expect(sent.embeds![0]!.description).toContain('não está mais disponível');
+		// o job não vai para `dead`: perder um arquivo não é motivo para perder a mensagem
+		expect(outbox.counts().dead).toBe(0);
+	});
+
+	it('429 do CDN é transitório: o bridge re-tenta em vez de descartar a mídia', async () => {
+		const { bridge, api, outbox, settle } = fixture();
+		await withFetch(
+			async () => new Response(null, { status: 429 }),
+			async () => {
+				await bridge.onDiscordMessage(discordMessage('dm-1', signed('foto.png', 3600)));
+				await settle();
+			}
+		);
+
+		expect(api.sent).toHaveLength(0);
+		// a fila do teste esgota as tentativas rápido: o que importa é que o 429 re-tentou,
+		// em vez de virar "mídia indisponível" na primeira recusa
+		const dead = outbox.list('dead');
+		expect(dead).toHaveLength(1);
+		expect(dead[0]!.attempts).toBeGreaterThan(1);
+		expect(dead[0]!.last_error).toContain('429');
 	});
 });

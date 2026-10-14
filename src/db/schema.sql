@@ -76,9 +76,12 @@ CREATE TABLE IF NOT EXISTS message_map (
   -- embed extra de preview de link aplicado à cópia (JSON array). Guardado porque todo
   -- re-render do cartão (resumo de reações, edição) precisa reenviá-lo junto.
   link_embeds        TEXT,
-  -- nota de reply da cópia de webhook (`*Respondendo:[link]*`): webhook não responde mensagem,
-  -- e toda re-escrita do content precisa reescrever a nota junto.
+  -- nota de reply da cópia de webhook (`*Respondendo:[link] de @autor*`): webhook não responde
+  -- mensagem, e toda re-escrita do content precisa reescrever a nota junto.
   reply_note         TEXT,
+  -- rótulo do autor da mensagem de origem: a nota de reply precisa dizer de quem é a mensagem
+  -- respondida (autor Papo ou autor Discord, conforme a direção da cópia).
+  author_label       TEXT,
   -- revisão (timestamp ISO da origem) da última edição aplicada à cópia: impede que uma
   -- edição mais antiga, enfileirada depois, sobrescreva a mais recente
   edit_revision      TEXT,

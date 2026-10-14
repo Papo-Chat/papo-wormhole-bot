@@ -120,8 +120,8 @@ Papo REST/WS ──► Bridge (tradução, chunking, embeds) ──► SQLite ou
   `bridge_webhooks` (registro de posse, que também identifica o eco sem chute por nome). Sem
   webhook (limite de webhooks do canal, bot sem *Manage Webhooks*) o envio continua pelo cartão
   do bot. Webhook não responde mensagens: a referência do reply chega como
-  `*Respondendo:[link da mensagem]*` no topo do `content`. Edição/apagamento da cópia usam o
-  token do webhook quando a mensagem é de webhook.
+  `*Respondendo:[link da mensagem] de @autor*` no topo do `content`. Edição/apagamento da cópia
+  usam o token do webhook quando a mensagem é de webhook.
 
 ## Mapeamento de identidade
 
@@ -247,10 +247,12 @@ trabalho (commite ou `git stash` antes).
   coloca no cookie `Auth`. Configure `PAPO_SERVER_PASSWORD` — é a senha do servidor, não a senha da
   conta do bot. `npm run check-auth` confirma o fluxo de sessão antes de subir.
 - Mídia hospedada pelo Discord (`cdn.discordapp.com`, `media.discordapp.net`) nunca vira embed no
-  Papo: a URL expira junto com a mensagem original e o hotlink é bloqueado. O bridge baixa o
-  arquivo e re-envia como anexo da mensagem — vale para a mídia do embed/preview e para o link de
-  arquivo colado no texto (o texto não é alterado: o link continua lá, e o arquivo chega junto).
-  Com `attachments` desligado não há para onde re-hospedar, e o preview continua com a URL.
+  Papo: o link de anexo é assinado (`?ex=&is=&hm=`) e vence em ~24h, e o hotlink é bloqueado. O
+  bridge baixa o arquivo e re-envia como anexo da mensagem — vale para a mídia do embed/preview e
+  para o link de arquivo colado no texto (o texto não é alterado: o link continua lá, e o arquivo
+  chega junto). Link vencido é renovado em `attachments/refresh-urls` antes de desistir; arquivo
+  que realmente não existe mais vira aviso no texto, e a mensagem continua bridgeada. Com
+  `attachments` desligado não há para onde re-hospedar, e o preview continua com a URL.
 - Thread do Discord é linkável a um canal do Papo (`/link-channel`), que é o que a thread vira do
   outro lado: o Papo não tem thread. O bridge entra na thread (o Discord só entrega mensagens de
   uma thread a quem é membro) e as cópias entram nela; webhook de thread é o do canal pai, com a

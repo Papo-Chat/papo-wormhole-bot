@@ -290,6 +290,12 @@ const DISCORD_MEDIA_HOSTS = new Set([
 const DISCORD_MEDIA_PATH = /^\/(embed\/)?(attachments|embeds|emojis|stickers)\//i;
 
 /**
+ * Só `/attachments/` e `/embed/attachments/` são assinados. Os outros caminhos do CDN
+ * (`/emojis/`, `/stickers/`, `/embeds/`) são públicos e não expiram.
+ */
+const DISCORD_SIGNED_PATH = /^\/(embed\/)?attachments\//i;
+
+/**
  * URL de arquivo hospedado pelo Discord (`/attachments/…`, `/embeds/…`). O proxy de terceiros
  * (`images-ext-N.discordapp.net/external/…`) fica fora de propósito: ele re-serva conteúdo
  * de fora, não a mídia que o Discord hospeda.
@@ -299,6 +305,38 @@ export function isDiscordMediaUrl(url?: string | null): boolean {
 	if (!host || !DISCORD_MEDIA_HOSTS.has(host.toLowerCase())) return false;
 	try {
 		return DISCORD_MEDIA_PATH.test(new URL(url!).pathname);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Momento em que a assinatura do link vence. Desde dez/2023 o CDN só serve anexo com
+ * `?ex=&is=&hm=` válidos, e `ex` é o epoch de expiração em hexadecimal: link sem parâmetro
+ * ou com `ex` no passado responde 404 mesmo com o arquivo vivo.
+ */
+export function discordSignatureExpiry(url?: string | null): number | undefined {
+	try {
+		const ex = new URL(url!).searchParams.get('ex');
+		const seconds = ex ? Number.parseInt(ex, 16) : Number.NaN;
+		return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Link de anexo do Discord que o CDN já não serve: falta assinatura ou ela venceu. É o caso
+ * do link colado no texto (Discord mostra o link limpo, sem assinatura) e do job que volta
+ * para a fila horas depois, quando a assinatura do payload original expirou.
+ */
+export function discordLinkIsStale(url?: string | null): boolean {
+	const host = hostOf(url);
+	if (!host || !DISCORD_MEDIA_HOSTS.has(host.toLowerCase())) return false;
+	try {
+		if (!DISCORD_SIGNED_PATH.test(new URL(url!).pathname)) return false;
+		const expiry = discordSignatureExpiry(url);
+		return expiry === undefined || expiry * 1000 <= Date.now();
 	} catch {
 		return false;
 	}
