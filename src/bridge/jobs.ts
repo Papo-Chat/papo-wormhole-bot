@@ -12,11 +12,6 @@ export interface SourceRef {
 	sizeBytes: number;
 	/** URL direta (CDN do Discord) ou link público do Papo, para fallback. */
 	url?: string;
-	/**
-	 * Variante `.gif` deduzida do mesmo arquivo, tentada antes da URL principal: é o que devolve
-	 * a animação quando o player do Discord só expõe o mp4 em loop. Só vale se vier um GIF.
-	 */
-	gifVariant?: string;
 	moderationStatus?: string;
 }
 

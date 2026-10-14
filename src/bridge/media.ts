@@ -30,32 +30,6 @@ export const guessExt = (mime?: string | null): string => (mime && EXT_BY_MIME[m
 export const guessMime = (ext: string): string => MIME_BY_EXT[ext] ?? 'application/octet-stream';
 export type ImgInfo = { ext: 'png' | 'jpg' | 'gif' | 'webp'; mime: string };
 
-const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-
-/**
- * Tipo real do arquivo pelas magic bytes. O nome que a origem dá nem sempre é o que chegou:
- * o player do Discord re-serviu um GIF como mp4, um host devolve HTML com URL de arquivo, e
- * o destino mostra o nome que recebe.
- */
-export function sniffMedia(buf: Buffer): { ext: string; mime: string } | undefined {
-	if (buf.length >= 6 && buf.subarray(0, 4).toString('ascii') === 'GIF8') return { ext: 'gif', mime: 'image/gif' };
-	if (buf.length >= 8 && PNG_MAGIC.every((byte, i) => buf[i] === byte)) return { ext: 'png', mime: 'image/png' };
-	if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return { ext: 'jpg', mime: 'image/jpeg' };
-	if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP')
-		return { ext: 'webp', mime: 'image/webp' };
-	// contêiner ISO base media: `ftyp` aos 4 bytes, a marca aos 8 diz qual
-	if (buf.length >= 12 && buf.subarray(4, 8).toString('ascii') === 'ftyp')
-		return buf.subarray(8, 12).toString('ascii') === 'qt  '
-			? { ext: 'mov', mime: 'video/quicktime' }
-			: { ext: 'mp4', mime: 'video/mp4' };
-	// EBML: webm
-	if (buf.length >= 4 && buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3)
-		return { ext: 'webm', mime: 'video/webm' };
-	return undefined;
-}
-
-export const isGifBytes = (buf: Buffer): boolean => buf.length >= 6 && buf.subarray(0, 4).toString('ascii') === 'GIF8';
-
 
 /** Cache de mídia em disco, endereçado por sha256 (content-addressable). */
 export class MediaStore {
@@ -112,9 +86,17 @@ export class MediaStore {
 	}
 
 	 sniffImage(buf: Buffer): ImgInfo | null {
-		const info = sniffMedia(buf);
-		return info && info.mime.startsWith('image/') ? { ext: info.ext as ImgInfo['ext'], mime: info.mime } : null;
-	}
+		if (buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a])))
+			return { ext: 'png', mime: 'image/png' };
+		if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff)
+			return { ext: 'jpg', mime: 'image/jpeg' };
+		if (buf.length >= 6 && buf.subarray(0, 4).toString('ascii') === 'GIF8')
+			return { ext: 'gif', mime: 'image/gif' };
+		if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
+			buf.subarray(8, 12).toString('ascii') === 'WEBP')
+			return { ext: 'webp', mime: 'image/webp' };
+		return null;
+		}
 }
 
 /**

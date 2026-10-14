@@ -299,7 +299,7 @@ Mapeamento Discord Embed → Papo `EmbedInput`:
 | `author.name` / `author.url` | `author.name` / `author.url` | idêntico |
 | `author.icon_url` | `author.icon_url` | backend do Papo baixa e re-serva (`embeds.author_media`); o card usa esse ícone no selo da linha de topo |
 | `thumbnail.url` / `image.url` | `thumbnail.url` / `image.url` | Papo baixa e re-serva (HTTPS + allowlist de MIME) |
-| `video` | `video` | Discord raramente expõe vídeo direto; se houver, `mime_type` obrigatório. **Player de GIF (`gifv`/`gif`) não entra**: ver abaixo |
+| `video` | `video` | Discord raramente expõe vídeo direto; se houver, `mime_type` obrigatório |
 | `footer.text` | `footer.text` | usado também para data/origem |
 | `fields[]` | `fields[]` | 25 fields, name 256 / value 1024 nos dois |
 
@@ -314,27 +314,6 @@ preview que só existia por essa mídia sai do card. Avatar e banner
 backend do Papo já re-serva (`author_media`). Preview que chega tarde (`message_edit`) é o único
 caso em que a mídia não pode ser anexada — o Papo não aceita anexo em `PUT /messages/{id}` — então
 ela sai do card e a URL da página continua como link.
-
-**Exceção — GIF.** O player do Discord (`gifv`, tipo histórico do picker, e `gif` desde fev/2026)
-re-serviu o GIF como **mp4 em loop mais um frame estático**, e o backend do Papo desenha isso como
-player de vídeo: a animação morre ali. O GIF viaja como **arquivo da mensagem** (`discordGifOf`, em
-`previews.ts`):
-
-1. O anexo `.gif` da mensagem (o picker entrega o GIF como arquivo) já é o arquivo — nada é baixado,
-   e o mp4/frame do player não é re-hospedado junto (`discordHostedMedia(…, { skipGifPlayerMedia })`):
-   a mesma mídia chegaria três vezes.
-2. Sem anexo, a mídia `image/gif` do embed é o arquivo.
-3. Sem GIF visível no embed, procura a **variante `.gif` do mesmo caminho** (`gifVariantUrl`): Klipy e
-   Giphy servem `…/d7ae/vTXu.mp4` e `…/d7ae/vTXu.gif`. O proxy de terceiros do Discord
-   (`images-ext-N`) fica fora — ali a extensão faz parte do caminho assinado. A query da CDN é
-   descartada junto: a assinatura vale para o caminho assinado, e o link renovado é buscado em seguida.
-4. A variante é tentativa, não substituta: o download aceita a URL principal se a variante falhar ou
-   devolver outra coisa (`isGifBytes` confere a magic antes de aceitar), e `prepareAttachments`
-   renomeia pelo tipo que os bytes realmente são (`sniffMedia`) — o anexo chega com o nome do arquivo
-   que chegou.
-5. Com o GIF indo como arquivo, o card não repete o que o arquivo já mostra: `gifAsFile` tira
-   `video` e `thumbnail` do preview. Com `bridge_attachments = 0` não há para onde anexar, e o loop
-   continua no card. Preview que chega tarde só perde o loop quando a cópia já carrega o `.gif`.
 
 Mapeamento Papo Embed → Discord Embed: espelho do acima; `source_type='link'` (preview
 automático do Papo) é recriado no Discord **deixando a URL nua no `content`** — o Discord gera o
@@ -639,7 +618,6 @@ MESSAGE_CREATE
   → canal-link? (thread linkada é canal como qualquer outro)
   → traduzir conteúdo + embeds (rich/link preview) + attachments
   → mídia hospedada pelo Discord (embed, preview ou link colado no texto) vira anexo baixado; o link sai do texto (§7, §8)
-  → GIF (anexo `.gif`, mídia `image/gif` ou variante `.gif` do loop do player) vira arquivo; o mp4/frame do player sai do card (§8)
   → m.reference da origem → cópia Papo em message_map → reply_to do Papo (sem cópia: sem reply)
   → montar EmbedInput (author, thumbnail=avatar Discord, image=anexo, footer=data/origem)
   → multipart POST /messages {channel_id, content, embeds(JSON string), attachments[](binary), reply_to?}
