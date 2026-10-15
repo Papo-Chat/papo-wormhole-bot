@@ -732,39 +732,37 @@ describe('preview do Discord que chega depois da mensagem', () => {
 		expect(outbox.counts().dead).toBe(0);
 	});
 
-	it('GIF que só existe como imagem do embed vai como arquivo animado', async () => {
+	it.each([
+		['Tenor', 'https://tenor.com/view/funny-gif-1234567890', 'https://media.tenor.com/abc/tenor.gif'],
+		['Giphy', 'https://giphy.com/gifs/lkdH8FmImcGoylv3t3', 'https://media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif'],
+		['Klipy', 'https://klipy.com/gifs/some-gif', 'https://static.klipy.com/gifs/some-gif.gif']
+	])('%s URL is sent cleanly for backend crawling, without a duplicate provider embed', async (_provider, url, mediaUrl) => {
 		const { bridge, api, settle } = fixture();
-		const { urls } = await withFetch(
-			async () => new Response(Buffer.from('gif-animado'), { status: 200, headers: { 'content-type': 'image/gif' } }),
-			async () => {
-				await bridge.onDiscordMessage(
-					discordMessage('dm-1', 'https://giphy.com/gifs/lkdH8FmImcGoylv3t3', {
-						embeds: [
-							{
-								type: 'rich',
-								url: 'https://giphy.com/gifs/lkdH8FmImcGoylv3t3',
-								title: 'GIF',
-								image: {
-									url: 'https://media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif',
-									proxy_url: 'https://images-ext-1.discordapp.net/external/ZgLT/https/media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif',
-									width: 300,
-									height: 224,
-									content_type: 'image/gif'
-								}
-							}
-						]
-					})
-				);
-				await settle();
-			}
-		);
 
-		// o Papo re-encode a imagem do embed como thumbnail estática: animação só sobrevive como arquivo
-		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['lkdH8FmImcGoylv3t3-giphy.gif']);
-		expect(urls.some((u) => u.includes('giphy.gif'))).toBe(true);
-		const preview = api.sent[0]!.embeds![1]!;
-		expect(preview.title).toBe('GIF');
-		expect(preview.thumbnail).toBeUndefined();
+		await bridge.onDiscordMessage(
+			discordMessage('dm-1', url, {
+				embeds: [
+					{
+						type: 'rich',
+						url,
+						title: 'GIF',
+						image: {
+							url: mediaUrl,
+							proxy_url: 'https://images-ext-1.discordapp.net/external/proxy/gif.gif',
+							width: 300,
+							height: 224,
+							content_type: 'image/gif'
+						}
+					}
+				]
+			})
+		);
+		await settle();
+
+		// O backend recebe a URL original no campo content; o bridge envia só o card de autoria.
+		expect(api.sent[0]!.content).toBe(url);
+		expect(api.sent[0]!.embeds).toHaveLength(1);
+		expect(api.sent[0]!.embeds![0]!.description).toBe('');
 	});
 });
 
