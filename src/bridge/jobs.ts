@@ -55,6 +55,16 @@ export interface ToPapoMessageJob {
 	chunkIndex: number;
 	chunkTotal: number;
 	authorName: string;
+	/**
+	 * Autor Discord da origem. É a chave do webhook do bridge no Papo (um por usuário
+	 * Discord por canal), como `authorId` é a chave do webhook no Discord.
+	 */
+	authorId?: string;
+	/** Username Discord (compõe o nome do webhook: `nickname (@username)`). */
+	authorUsername?: string;
+	/** Hash do avatar Discord; o download dos bytes acontece na execução do job. */
+	authorAvatarHash?: string;
+	authorAvatarUrl?: string;
 	content: string;
 	footerBase: string;
 	bridgeEmbed?: PapoEmbedInput;

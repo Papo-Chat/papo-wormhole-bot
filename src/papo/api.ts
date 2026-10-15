@@ -11,6 +11,7 @@ import type {
 	PapoProblem,
 	PapoUserProfile,
 	PapoUserSummary,
+	PapoWebhook,
 	PapoWhoami
 } from './types.js';
 import { PapoApiError } from './types.js';
@@ -48,6 +49,33 @@ export interface SendMessageInput {
 	channelId: string;
 	content?: string | null;
 	replyTo?: string | null;
+	attachments?: OutAttachment[];
+	embeds?: PapoEmbedInput[];
+}
+
+/**
+ * Identidade persistente de um webhook (`PATCH /webhooks/{id}`). Campo ausente preserva o
+ * valor atual; `displayName: null` remove o nickname (volta a usar o `name`);
+ * `avatarBase64: ''` remove o avatar.
+ */
+export interface WebhookIdentityInput {
+	displayName?: string | null;
+	/** base64 de GIF/JPEG/PNG/WEBP de até 2 MB e até 512 px (mesmas regras do avatar de usuário). */
+	avatarBase64?: string;
+	avatarFormat?: string;
+}
+
+export interface SendWebhookMessageInput {
+	webhookId: string;
+	/** Credencial escopada do webhook: a única autorização aceita por essas rotas. */
+	token: string;
+	content?: string | null;
+	replyTo?: string | null;
+	/**
+	 * Chave de idempotência (`external_message_id`): retry do mesmo webhook com a mesma
+	 * chave devolve a mensagem existente (200) em vez de duplicar.
+	 */
+	externalMessageId?: string;
 	attachments?: OutAttachment[];
 	embeds?: PapoEmbedInput[];
 }
@@ -360,6 +388,82 @@ export class PapoApi {
 		await this.request<void>(`/messages/${messageId}`, { method: 'DELETE' });
 	}
 
+	// ── webhooks ───────────────────────────────────────────
+
+	/**
+	 * Cria um webhook em um canal (`POST /webhooks`, exige `manage_webhooks` no usuário).
+	 * O `token` aparece somente nesta resposta: é a única vez que existe fora do hash.
+	 */
+	async createWebhook(channelId: string, name: string): Promise<PapoWebhook> {
+		return this.request<PapoWebhook>('/webhooks', {
+			method: 'POST',
+			body: JSON.stringify({ channel_id: channelId, name })
+		});
+	}
+
+	/** Webhooks ativos de todos os canais (gestão; exige `manage_webhooks`). */
+	async listWebhooks(): Promise<PapoWebhook[]> {
+		const res = await this.request<{ webhooks?: PapoWebhook[] }>('/webhooks');
+		return res.webhooks ?? [];
+	}
+
+	/** Atualiza nickname/avatar persistentes do webhook (exige `manage_webhooks`). */
+	async updateWebhookIdentity(webhookId: string, input: WebhookIdentityInput): Promise<PapoWebhook> {
+		const body: Record<string, unknown> = {};
+		if (input.displayName !== undefined) body.display_name = input.displayName;
+		if (input.avatarBase64 !== undefined) body.avatar = input.avatarBase64;
+		if (input.avatarFormat) body.avatar_format = input.avatarFormat;
+		return this.request<PapoWebhook>(`/webhooks/${webhookId}`, { method: 'PATCH', body: JSON.stringify(body) });
+	}
+
+	/** Revoga o webhook (soft delete): o token deixa de autenticar, as mensagens ficam. */
+	async revokeWebhook(webhookId: string): Promise<void> {
+		await this.request<void>(`/webhooks/${webhookId}`, { method: 'DELETE' });
+	}
+
+	/**
+	 * Envia mensagem com a credencial do webhook (`POST /webhooks/{id}/messages`).
+	 * Retry com a mesma `externalMessageId` devolve a mensagem existente (200) — é a
+	 * reconciliação de um envio cujo resultado foi incerto, sem procurar a cópia no canal.
+	 */
+	async sendWebhookMessage(input: SendWebhookMessageInput): Promise<PapoMessage> {
+		const form = new FormData();
+		if (input.content != null) form.append('content', input.content);
+		if (input.replyTo) form.append('reply_to', input.replyTo);
+		if (input.externalMessageId) form.append('external_message_id', input.externalMessageId);
+		for (const a of input.attachments ?? []) {
+			form.append('attachments', new Blob([new Uint8Array(a.data)], { type: a.mime ?? 'application/octet-stream' }), a.name);
+		}
+		if (input.embeds?.length) form.append('embeds', JSON.stringify(input.embeds));
+		return this.webhookRequest<PapoMessage>(`/webhooks/${input.webhookId}/messages`, { method: 'POST', body: form }, input.token);
+	}
+
+	/**
+	 * Edita mensagem enviada pelo webhook (`PUT /webhooks/{id}/messages/{id}`): somente o
+	 * webhook autor edita as próprias mensagens — o JWT do bot que criou o webhook não pode.
+	 * `content` vazio limpa o texto, e `embeds` ausente preserva os embeds; quem quer manter
+	 * o texto precisa reenviá-lo.
+	 */
+	async editWebhookMessage(
+		webhookId: string,
+		token: string,
+		messageId: string,
+		content: string,
+		embeds?: PapoEmbedInput[]
+	): Promise<PapoMessage> {
+		const body: { content: string; embeds?: PapoEmbedInput[] } = { content };
+		if (embeds) body.embeds = embeds;
+		return this.webhookRequest<PapoMessage>(`/webhooks/${webhookId}/messages/${messageId}`, {
+			method: 'PUT',
+			body: JSON.stringify(body)
+		}, token);
+	}
+
+	/** Apaga mensagem enviada pelo webhook (somente o webhook autor). */
+	async deleteWebhookMessage(webhookId: string, token: string, messageId: string): Promise<void> {
+		await this.webhookRequest<void>(`/webhooks/${webhookId}/messages/${messageId}`, { method: 'DELETE' }, token);
+	}
+
 	// ── reactions / pins ───────────────────────────────────
 
 	async addReaction(channelId: string, messageId: string, reaction: { emojiId?: string; unicode?: string }): Promise<void> {
@@ -512,12 +616,13 @@ export class PapoApi {
 		}
 	}
 
-	private async raw(path: string, init: RequestInit): Promise<Response> {
+	private async raw(path: string, init: RequestInit, opts: { session?: boolean } = {}): Promise<Response> {
 		await this.throttle.acquire();
 		const headers = new Headers(init.headers ?? {});
 		headers.set('X-Request-ID', randomUUID());
 		if (!headers.has('Accept')) headers.set('Accept', 'application/problem+json, application/json');
-		if (this.cookie && !headers.has('Cookie')) headers.set('Cookie', this.cookie);
+		// rota de webhook tem credencial própria (Bearer do token): a sessão do bot não entra
+		if (this.cookie && opts.session !== false && !headers.has('Cookie')) headers.set('Cookie', this.cookie);
 		if (init.body && typeof init.body === 'string' && !headers.has('Content-Type')) {
 			headers.set('Content-Type', 'application/json');
 		}
@@ -556,6 +661,24 @@ export class PapoApi {
 			// uma única recuperação por onda de 401; o retry é feito com a sessão renovada
 			if (await this.recoverSession()) return this.request<T>(path, init, false);
 		}
+		if (res.status >= 400) await this.problem(res, path);
+		if (res.status === 204) return undefined as T;
+		const ct = res.headers.get('content-type') ?? '';
+		if (!ct.includes('json')) return (await res.text()) as unknown as T;
+		return (await res.json()) as T;
+	}
+
+	/**
+	 * Requisição de rota de webhook: a autorização é o `Bearer` do token escopado, nunca a
+	 * sessão do bot, e um 401 não se conserta renovando sessão (é a credencial que morreu) —
+	 * por isso não passa pela recuperação de sessão de `request`.
+	 */
+	private async webhookRequest<T>(path: string, init: RequestInit, token: string): Promise<T> {
+		const res = await this.raw(
+			path,
+			{ ...init, headers: { ...(init.headers ?? {}), authorization: `Bearer ${token}` } },
+			{ session: false }
+		);
 		if (res.status >= 400) await this.problem(res, path);
 		if (res.status === 204) return undefined as T;
 		const ct = res.headers.get('content-type') ?? '';

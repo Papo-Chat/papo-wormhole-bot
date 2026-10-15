@@ -82,6 +82,9 @@ CREATE TABLE IF NOT EXISTS message_map (
   -- rótulo do autor da mensagem de origem: a nota de reply precisa dizer de quem é a mensagem
   -- respondida (autor Papo ou autor Discord, conforme a direção da cópia).
   author_label       TEXT,
+  -- webhook que enviou a cópia (`webhook_copy = 1`): é a credencial que precisa ser usada para
+  -- editar/apagar a cópia — nenhum dos lados aceita editar mensagem de webhook por outra via.
+  webhook_id         TEXT,
   -- revisão (timestamp ISO da origem) da última edição aplicada à cópia: impede que uma
   -- edição mais antiga, enfileirada depois, sobrescreva a mais recente
   edit_revision      TEXT,
@@ -241,3 +244,19 @@ CREATE TABLE IF NOT EXISTS bridge_webhooks (
   created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_bridge_webhooks_user ON bridge_webhooks (channel_id, papo_user_id);
+
+-- Webhook do bridge no Papo: o espelho do modo webhook do Discord (cópia Discord → Papo).
+-- Um por usuário Discord por canal Papo, com nickname + avatar fixos no webhook. O `token`
+-- é a credencial escopada: o backend o mostra uma única vez, na criação, e é ele que
+-- permite editar/apagar as cópias que o webhook enviou (o JWT do bot não pode).
+CREATE TABLE IF NOT EXISTS papo_webhooks (
+  webhook_id      TEXT PRIMARY KEY,
+  channel_id      TEXT NOT NULL,
+  discord_user_id TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  display_name    TEXT,
+  avatar_sha      TEXT,
+  token           TEXT NOT NULL,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_papo_webhooks_user ON papo_webhooks (channel_id, discord_user_id);

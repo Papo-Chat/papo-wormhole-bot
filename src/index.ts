@@ -4,6 +4,7 @@ import { openDb } from './db/index.js';
 import { Store } from './db/store.js';
 import { Outbox } from './db/outbox.js';
 import { PapoApi } from './papo/api.js';
+import { PapoWebhooks } from './papo/webhooks.js';
 import { PapoWs } from './papo/ws.js';
 import { DiscordBridge } from './discord/bridge.js';
 import { MediaStore, startMediaServer } from './bridge/media.js';
@@ -83,7 +84,7 @@ async function main(): Promise<void> {
 		}
 	});
 
-	bridge = new Bridge(cfg, store, outbox, api, ws, discord, media);
+	bridge = new Bridge(cfg, store, outbox, api, ws, discord, media, new PapoWebhooks(api, store, scoped('papo-webhook')));
 
 	discord.client.on('interactionCreate', (interaction) => {
 		if (!interaction.isChatInputCommand()) return;

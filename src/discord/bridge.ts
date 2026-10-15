@@ -23,18 +23,9 @@ import {
 import type { Logger } from 'pino';
 import { scoped } from '../logger.js';
 import type { Store } from '../db/store.js';
-
-/**
- * Nome do webhook de um usuário Papo (item 27): `nickname (@username)`, ou só o
- * username quando o apelido é o próprio nome. O sufixo com o username torna o nome
- * único e reaproveitável entre runs — apelidos iguais entre usuários colidiriam.
- */
-export function bridgeWebhookName(displayName: string, username: string): string {
-	const base = displayName.trim() || username;
-	if (base === username) return username;
-	// o sufixo `(@username)` precisa sobreviver ao limite de 80: o apelido cede espaço
-	return `${base.slice(0, 76 - username.length)} (@${username})`.slice(0, 80);
-}
+// nome do webhook do bridge: a mesma convenção nos dois lados da ponte
+export { bridgeWebhookName } from '../bridge/identity.js';
+import { bridgeWebhookName } from '../bridge/identity.js';
 
 const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
 

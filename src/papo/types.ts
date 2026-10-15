@@ -99,6 +99,35 @@ export interface PapoReactionSummary {
 	count: number;
 }
 
+/**
+ * Webhook do Papo (`POST /webhooks`). Remetente escopado a um canal, autenticado por
+ * token Bearer próprio (nunca pelo JWT do usuário que o criou).
+ * `token` aparece **uma única vez**, na resposta de criação: a backend guarda só o hash.
+ * `display_name` é o nickname persistente; ausente, o Papo usa o `name` como nickname.
+ */
+export interface PapoWebhook {
+	id: string;
+	channel_id: string;
+	name: string;
+	display_name?: string | null;
+	created_by: string;
+	created_at: string;
+	revoked_at?: string | null;
+	token?: string;
+}
+
+/**
+ * Autoria de exibição de uma mensagem de webhook. Não é usuário do Papo e nunca autoriza
+ * nada; sobrescreve a identidade persistente do webhook só naquela mensagem.
+ */
+export interface PapoExternalAuthor {
+	source: string;
+	id: string;
+	name: string;
+	avatar_url?: string;
+	profile_url?: string;
+}
+
 export interface PapoMessage {
 	id: string;
 	channel_id: string;
@@ -111,6 +140,9 @@ export interface PapoMessage {
 	embeds?: PapoEmbed[];
 	reactions?: PapoReactionSummary[] | null;
 	user_reactions?: { id: string; emoji_id: string | null; unicode: string | null }[];
+	/** Presente somente em mensagem de webhook (`author_id` fica vazio nesse caso). */
+	webhook_id?: string | null;
+	external_author?: PapoExternalAuthor | null;
 }
 
 export interface PapoMessageList {
@@ -162,11 +194,14 @@ export interface PapoWsMessageEvent {
 	type: 'message';
 	id: string;
 	channel_id: string;
+	/** Vazio quando a mensagem é de webhook (a identidade vem de `external_author`). */
 	author_id: string;
 	content: string | null;
 	reply_to?: string | null;
 	attachments?: PapoAttachment[];
 	created_at: string;
+	webhook_id?: string | null;
+	external_author?: PapoExternalAuthor | null;
 }
 
 export interface PapoWsEditEvent {

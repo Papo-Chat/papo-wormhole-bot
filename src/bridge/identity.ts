@@ -15,6 +15,18 @@ export interface AuthorInfo {
 	avatarUrl?: string;
 }
 
+/**
+ * Nome do webhook de um autor (modo webhook, nos dois lados): `nickname (@username)`, ou só
+ * o username quando o apelido é o próprio nome. O sufixo com o username torna o nome único
+ * e reaproveitável entre runs — apelidos iguais entre usuários colidiriam.
+ */
+export function bridgeWebhookName(displayName: string, username: string): string {
+	const base = displayName.trim() || username;
+	if (base === username) return username;
+	// o sufixo `(@username)` precisa sobreviver ao limite de 80: o apelido cede espaço
+	return `${base.slice(0, 76 - username.length)} (@${username})`.slice(0, 80);
+}
+
 /** Resolve e cachea autores do lado Papo (perfil + avatar). */
 export class PapoIdentity {
 	private readonly fetchedAt = new Map<string, number>();

@@ -66,6 +66,8 @@ export interface MessageMapRow {
 	reply_note: string | null;
 	/** Rótulo do autor da mensagem de origem (o "de @autor" da nota de reply). */
 	author_label: string | null;
+	/** Webhook que enviou a cópia quando `webhook_copy = 1` (credencial do edit/delete). */
+	webhook_id: string | null;
 	edit_revision: string | null;
 	/** Revisão da última atualização de preview aplicada à cópia. */
 	embed_revision: string | null;
@@ -75,6 +77,17 @@ export interface MessageMapRow {
 export interface ReactionCountRow {
 	emoji: string;
 	count: number;
+}
+
+/** Webhook do bridge no Papo: um por usuário Discord por canal Papo. */
+export interface PapoWebhookRow {
+	webhook_id: string;
+	channel_id: string;
+	discord_user_id: string;
+	name: string;
+	display_name: string | null;
+	avatar_sha: string | null;
+	token: string;
 }
 
 export interface DeferredEventRow {
@@ -225,6 +238,72 @@ export class Store {
 		this.db.prepare('DELETE FROM bridge_webhooks WHERE webhook_id = ?').run(webhookId);
 	}
 
+	// ── webhooks do bridge no Papo (por usuário Discord, por canal) ───
+	upsertPapoWebhook(w: {
+		webhook_id: string;
+		channel_id: string;
+		discord_user_id: string;
+		name: string;
+		display_name?: string | null;
+		avatar_sha?: string | null;
+		token: string;
+	}): void {
+		// webhook recriado para o mesmo usuário: a linha antiga liberaria o índice único
+		this.db
+			.prepare('DELETE FROM papo_webhooks WHERE channel_id = ? AND discord_user_id = ? AND webhook_id != ?')
+			.run(w.channel_id, w.discord_user_id, w.webhook_id);
+		this.db
+			.prepare(
+				`INSERT INTO papo_webhooks (webhook_id, channel_id, discord_user_id, name, display_name, avatar_sha, token)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)
+				 ON CONFLICT(webhook_id) DO UPDATE SET
+				   name = excluded.name,
+				   display_name = excluded.display_name,
+				   avatar_sha = excluded.avatar_sha,
+				   token = excluded.token`
+			)
+			.run(
+				w.webhook_id,
+				w.channel_id,
+				w.discord_user_id,
+				w.name,
+				w.display_name ?? null,
+				w.avatar_sha ?? null,
+				w.token
+			);
+	}
+	getPapoWebhookByUser(
+		channelId: string,
+		discordUserId: string
+	): { webhook_id: string; name: string; display_name: string | null; avatar_sha: string | null; token: string } | undefined {
+		return rows<{ webhook_id: string; name: string; display_name: string | null; avatar_sha: string | null; token: string }>(
+			this.db
+				.prepare(
+					'SELECT webhook_id, name, display_name, avatar_sha, token FROM papo_webhooks WHERE channel_id = ? AND discord_user_id = ?'
+				)
+				.all(channelId, discordUserId)
+		)[0];
+	}
+	getPapoWebhookById(webhookId: string): PapoWebhookRow | undefined {
+		return rows<PapoWebhookRow>(
+			this.db
+				.prepare(
+					'SELECT webhook_id, channel_id, discord_user_id, name, display_name, avatar_sha, token FROM papo_webhooks WHERE webhook_id = ?'
+				)
+				.all(webhookId)
+		)[0];
+	}
+	listPapoWebhooks(): PapoWebhookRow[] {
+		return rows<PapoWebhookRow>(
+			this.db
+				.prepare('SELECT webhook_id, channel_id, discord_user_id, name, display_name, avatar_sha, token FROM papo_webhooks')
+				.all()
+		);
+	}
+	deletePapoWebhook(webhookId: string): void {
+		this.db.prepare('DELETE FROM papo_webhooks WHERE webhook_id = ?').run(webhookId);
+	}
+
 	// ── server links ───────────────────────────────────────
 	upsertServerLink(papoServerId: string, discordGuildId: string): void {
 		this.db
@@ -349,11 +428,13 @@ export class Store {
 		reply_note?: string | null;
 		author_label?: string | null;
 		webhook_copy?: boolean;
+		/** Webhook que enviou a cópia (necessário para editá-la/apagá-la depois). */
+		webhook_id?: string | null;
 	}): void {
 		this.db
 			.prepare(
-				`INSERT INTO message_map (link_id, direction, papo_message_id, discord_message_id, chunk_index, chunk_total, content_sha, rendered, bridge_embed, footer_base, link_embeds, reply_note, author_label, webhook_copy)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`INSERT INTO message_map (link_id, direction, papo_message_id, discord_message_id, chunk_index, chunk_total, content_sha, rendered, bridge_embed, footer_base, link_embeds, reply_note, author_label, webhook_copy, webhook_id)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT DO NOTHING`
 			)
 			.run(
@@ -370,7 +451,8 @@ export class Store {
 				m.link_embeds === undefined || m.link_embeds === null ? null : JSON.stringify(m.link_embeds),
 				m.reply_note ?? null,
 				m.author_label ?? null,
-				m.webhook_copy ? 1 : 0
+				m.webhook_copy ? 1 : 0,
+				m.webhook_id ?? null
 			);
 	}
 

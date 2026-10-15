@@ -61,7 +61,8 @@ import { mergeReactionCounts, reactionSummaryText, type ReactionDisplay } from '
 import { EMBED_CHUNK_CHARS, PAPO_LIMITS, PAPO_EMBED_CHUNK_CHARS, DISCORD_LIMITS, PAPO_VIDEO_MIMES, clampText } from './limits.js';
 import { EmojiBridge, type ApplicationEmojiResolver, type GuildEmojiResolver } from './emoji.js';
 import type { MediaStore } from './media.js';
-import { PapoIdentity } from './identity.js';
+import { PapoIdentity, type AuthorInfo } from './identity.js';
+import { PapoWebhooks, type PapoWebhookRef } from '../papo/webhooks.js';
 import { copySignatures, signedFooter } from './signature.js';
 import {
 	discordHostedMedia,
@@ -224,7 +225,12 @@ export class Bridge {
 		private api: PapoApi,
 		private ws: PapoWs,
 		private discord: DiscordBridge,
-		private media: MediaStore
+		private media: MediaStore,
+		/**
+		 * Pool de webhooks do bridge no Papo (modo webhook Discord → Papo). Ausente = as
+		 * cópias do Papo continuam pelo cartão do bot (mesma queda do lado Discord).
+		 */
+		private papoWebhooks?: PapoWebhooks
 	) {
 		this.log = scoped('bridge');
 		this.identity = new PapoIdentity(api, store, media, cfg.bridge.mediaBaseUrl);
@@ -242,6 +248,15 @@ export class Bridge {
 
 		await this.discord.login();
 		this.ws.connect();
+
+		// modo webhook Discord → Papo: as linhas de webhook com credencial morta são descartadas
+		// antes da primeira cópia, e a indisponibilidade fica registrada no log em vez de aparecer
+		// só quando uma mensagem cai para o cartão do bot.
+		if (this.papoWebhooks) {
+			const state = await this.papoWebhooks.reconcile();
+			if (state) this.log.info(state, 'webhooks do bridge no Papo ativos');
+			else this.log.warn('gestão de webhooks do Papo indisponível: cópias Discord → Papo podem sair pelo cartão do bot');
+		}
 
 		if (this.cfg.papo.backfillOnStart) await this.backfill();
 		await this.drain();
@@ -457,10 +472,14 @@ export class Bridge {
 
 	private async onPapoMessage(msg: PapoWsMessageEvent | PapoMessage): Promise<void> {
 		if (msg.author_id === this.papoUserId) return; // anti-loop
+		// Cópia criada pelo webhook do bridge: o autor não é o bot (mensagem de webhook tem
+		// `author_id` vazio). O registro de posse em `papo_webhooks` é o que distingue o eco
+		// de um webhook de terceiro no canal — webhook alheio continua sendo ponteado.
+		if (this.papoWebhooks?.owns(msg.webhook_id)) return; // anti-loop
 		if (this.store.findMapByPapo(msg.id).length) return; // idempotência
 
 		//se for um comando ja despachamos logo
-		if (await handlePapoCommand(
+		if (!msg.webhook_id && await handlePapoCommand(
 		{ id: msg.id, channelId: msg.channel_id, authorId: msg.author_id, content: msg.content || "", createdAt: msg.created_at },
 		{api: this.api,bridge: this,outbox: this.outbox,store: this.store},           
 		{client: this.discord.client, reply: async (text) => {await this.api.sendMessage({channelId: msg.channel_id, content: text})} }
@@ -468,7 +487,11 @@ export class Bridge {
 		const link = this.linkForPapoChannel(msg.channel_id);
 		if (!link) return;
 
-		const author = await this.identity.author(msg.author_id);
+		// webhook de terceiro no canal: não é usuário do Papo e não tem perfil — a identidade de
+		// exibição é a que o próprio webhook declara. Sem `authorId` a cópia sai pelo cartão do bot.
+		const author: AuthorInfo = msg.webhook_id
+			? { userId: '', name: msg.external_author?.name || 'Webhook', username: msg.external_author?.name || 'Webhook' }
+			: await this.identity.author(msg.author_id);
 		await this.warmPapoMentions(msg.content ?? '');
 		if (this.propagatesMentions(link) && /@/.test(msg.content ?? '')) await this.discord.ensureMemberIndex?.();
 		const preview = await this.papoPreview(msg);
@@ -1256,6 +1279,11 @@ export class Bridge {
 				chunkIndex: i,
 				chunkTotal: total,
 				authorName: displayName,
+				// identidade do autor Discord: é ela que fixa o webhook do bridge no Papo
+				authorId: m.author.id,
+				authorUsername: m.author.username,
+				authorAvatarHash: m.author.avatar ?? undefined,
+				authorAvatarUrl: avatarUrl,
 				content: chunkContent,
 				footerBase: `🕒 ${formatDate(m.createdAt.toISOString(), this.cfg.bridge.timezone)} · Discord${chunkLabel(i, total)}`,
 				notes: [],
@@ -1789,6 +1817,50 @@ export class Bridge {
 	}
 
 	/**
+	 * Avatar do autor Discord já baixado neste processo (`hash` → bytes/sha). O hash é a chave:
+	 * avatar novo é baixado uma vez; falha tem janela de re-tentativa para não martelar o CDN.
+	 */
+	private readonly discordAvatars = new Map<
+		string,
+		{ hash: string; sha?: string; buffer?: Buffer; format?: string; at: number }
+	>();
+	private static readonly AVATAR_RETRY_MS = 10 * 60_000;
+
+	/**
+	 * Bytes do avatar do autor Discord no cache de mídia, para fixar no webhook do bridge no
+	 * Papo (o webhook carrega o avatar; a mensagem não). Falha de download não derruba a
+	 * mensagem: o webhook fica só com o nome.
+	 */
+	private async discordAvatarFor(job: ToPapoMessageJob): Promise<{ sha: string; buffer: Buffer; format: string } | undefined> {
+		const userId = job.authorId;
+		const url = job.authorAvatarUrl;
+		const hash = job.authorAvatarHash;
+		if (!userId || !url || !hash) return undefined;
+
+		const cached = this.discordAvatars.get(userId);
+		if (cached?.hash === hash) {
+			if (cached.sha && cached.buffer) return { sha: cached.sha, buffer: cached.buffer, format: cached.format ?? 'PNG' };
+			// falha recente: não se martela o CDN por um avatar
+			if (Date.now() - cached.at < Bridge.AVATAR_RETRY_MS) return undefined;
+		}
+		try {
+			// marca antes do download: a falha também respeita a janela
+			this.discordAvatars.set(userId, { hash, at: Date.now() });
+			const buffer = await this.fetchDiscordFile(url);
+			const info = buffer ? this.media.sniffImage(buffer) : null;
+			if (!buffer || !info) return undefined;
+			const { sha256 } = this.media.save(buffer, info.mime, 'discord-avatar');
+			const format = info.ext.toUpperCase();
+			this.discordAvatars.set(userId, { hash, sha: sha256, buffer, format, at: Date.now() });
+			return { sha: sha256, buffer, format };
+		} catch (err) {
+			// avatar é identidade, não conteúdo: download ou cache de mídia não derrubam a mensagem
+			this.log.debug({ err, userId }, 'avatar do autor Discord indisponível');
+			return undefined;
+		}
+	}
+
+	/**
 	 * Avatar do autor do Papo como anexo da mensagem. Sem media server público o
 	 * Discord não tem URL absoluta para `author.icon_url`, e `attachment://` é a
 	 * forma de entregar o avatar sem hospedar nada fora do bot (o anexo referenciado
@@ -2114,32 +2186,65 @@ export class Bridge {
 			return;
 		}
 
+		// modo webhook (espelho do modo webhook do Discord): cada usuário Discord tem um webhook
+		// próprio no canal Papo, com nick + avatar fixos no webhook. `content` = texto do
+		// Discord e os únicos embeds são os previews de link que vieram com a mensagem; a data é
+		// o timestamp nativo do Papo. Sem pool de webhooks (bot sem `manage_webhooks`) o envio
+		// continua pelo cartão do bot — e o avatar nem chega a ser baixado.
+		const avatar = this.papoWebhooks && job.authorId ? await this.discordAvatarFor(job) : undefined;
+		const webhook =
+			this.papoWebhooks && job.authorId
+				? await this.papoWebhooks.userWebhook(job.papoChannelId, {
+						userId: job.authorId,
+						displayName: job.authorName,
+						username: job.authorUsername ?? job.authorName,
+						avatarSha: avatar?.sha,
+						avatarBuffer: avatar?.buffer,
+						avatarFormat: avatar?.format
+					})
+				: undefined;
+		const webhookMode = Boolean(webhook);
+
 		const plan = await prepareAttachments(this.sourcesToAttachments(job.sources), {
 			maxFileBytes: PAPO_LIMITS.attachmentMaxBytes,
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
 		});
 
-		// O texto vai todo no `description` do embed: a mensagem do Papo sai sem `content`
-		// (o card é a mensagem). Notas de mídia entram no mesmo bloco.
+		// modo webhook: o texto vai no `content` da mensagem (o teto é o da mensagem). Sem
+		// webhook o texto vai no `description` do embed, que é o card da mensagem.
 		const notes = [...job.notes, ...plan.notes];
 		const text = clampText(
 			notes.length
 				? `${job.content}${job.content ? '\n\n' : ''}${notes.map((n) => `> ${n}`).join('\n')}`.trim()
 				: job.content,
-			PAPO_LIMITS.embedDescriptionMax
+			webhookMode ? PAPO_LIMITS.contentMax : PAPO_LIMITS.embedDescriptionMax
 		);
 
 		const groups = plan.groups.length ? plan.groups : [[]];
 		const signatures = copySignatures('discord', job.discordMessageId, job.chunkIndex, groups.length);
+		const summary = await this.reactionSummaryFor('papo', this.store.listReactions(job.linkId, 'discord', job.discordMessageId));
+
+		// modo webhook: `content` = texto do Discord com a linha de reações no fim. Diferente do
+		// Discord, o webhook do Papo responde mensagem: a referência do reply é nativa e não
+		// precisa virar nota no texto. Sem cartão, sem rodapé, sem embed de continuação.
+		//
+		// O preview de link também é nativo: o `content` carrega a URL e o backend faz o crawl
+		// dela em background. Reenviar o preview como embed customizado duplicaria o mesmo link
+		// — o crawler do Papo não deduplica contra os embeds da mensagem.
+		const webhookContent = this.webhookCopyContent('', text, summary, PAPO_LIMITS.contentMax);
+
 		const signedBase = signedFooter(job.footerBase, signatures[0]!, PAPO_LIMITS.embedFooterMax);
 		const footers = groups.map((_, g) =>
 			g === 0
 				? signedBase
 				: signedFooter(`${job.footerBase} · 📎 ${g + 1}/${groups.length}`, signatures[g]!, PAPO_LIMITS.embedFooterMax)
 		);
-		const existing = uncertain
-			? await this.findPapoCopies(job.papoChannelId, signatures, job.timestamp)
-			: new Map<string, string>();
+		// cópia de webhook não tem rodapé assinado para reconhecer: a reconciliação de um envio
+		// incerto é a chave de idempotência do envio (`external_message_id`)
+		const existing =
+			uncertain && !webhookMode
+				? await this.findPapoCopies(job.papoChannelId, signatures, job.timestamp)
+				: new Map<string, string>();
 		if (existing.size) {
 			this.log.warn({ discordMessageId: job.discordMessageId, found: existing.size }, 'cópia já criada no Papo: envio não repetido');
 		}
@@ -2148,6 +2253,28 @@ export class Bridge {
 		for (let g = 0; g < groups.length; g++) {
 			const attachments = groups[g]!.map((f) => ({ name: f.name, data: f.data, mime: f.mime }));
 			const extra = g > 0;
+
+			if (webhook && webhookMode) {
+				if (!extra && !webhookContent && !attachments.length) {
+					this.log.debug({ discordMessageId: job.discordMessageId }, 'mensagem sem conteúdo ou anexo: nada a enviar');
+					continue;
+				}
+				markAttempt();
+				const created = await this.sendWebhookSafe(webhook, job, g, extra, lastPapoId, {
+					...(extra ? {} : { content: webhookContent }),
+					attachments
+				});
+				if (!created)
+					// webhook morto no envio (revogado, apagado por fora): nada foi entregue. O job
+					// re-tenta; a resolução recria o webhook ou cai para o cartão do bot.
+					throw new RetryableError('webhook do autor indisponível no Papo');
+				lastPapoId = created.id;
+				this.mapPapoCopy(job, created.id, g, extra, text, undefined, '', {
+					webhookCopy: true,
+					webhookId: webhook.webhookId
+				});
+				continue;
+			}
 
 			const embeds = extra
 				? [
@@ -2162,11 +2289,7 @@ export class Bridge {
 
 			const mainEmbed = extra ? undefined : embeds[0];
 			if (mainEmbed) {
-				mainEmbed.description = this.withReactionSummary(
-					text,
-					await this.reactionSummaryFor('papo', this.store.listReactions(job.linkId, 'discord', job.discordMessageId)),
-					PAPO_LIMITS.embedDescriptionMax
-				);
+				mainEmbed.description = this.withReactionSummary(text, summary, PAPO_LIMITS.embedDescriptionMax);
 				mainEmbed.footer = { text: footers[g]! };
 			}
 			if (!text && !attachments.length && !embeds.length) return;
@@ -2196,6 +2319,38 @@ export class Bridge {
 		}
 	}
 
+	/**
+	 * Envio pelo webhook do autor, com a mesma tolerância de `sendToPapoSafe`: `reply_to` de
+	 * mensagem já apagada dá 404 e a mensagem não pode se perder por causa da referência.
+	 * A chave de idempotência é determinística — re-tentar o mesmo job não duplica a cópia.
+	 */
+	private async sendWebhookSafe(
+		webhook: PapoWebhookRef,
+		job: ToPapoMessageJob,
+		group: number,
+		extra: boolean,
+		lastPapoId: string | undefined,
+		options: { content?: string; embeds?: PapoEmbedInput[]; attachments: { name: string; data: Buffer; mime?: string }[] }
+	): Promise<PapoMessage | null> {
+		const replyTo = extra ? lastPapoId : this.copyForDiscordMessage(job.replyRefDiscordId);
+		const externalMessageId = `discord:${job.discordMessageId}:${job.chunkIndex}:${group}`;
+		const send = (reference?: string) =>
+			this.papoWebhooks!.send(webhook, job.papoChannelId, {
+				...options,
+				...(reference ? { replyTo: reference } : {}),
+				externalMessageId
+			});
+		try {
+			return await send(replyTo);
+		} catch (err) {
+			if (err instanceof PapoApiError && err.status === 404 && replyTo) {
+				this.log.warn({ replyTo }, 'reply_to aponta para mensagem apagada; enviando sem referência');
+				return send(undefined);
+			}
+			throw err;
+		}
+	}
+
 	private mapPapoCopy(
 		job: ToPapoMessageJob,
 		papoMessageId: string,
@@ -2203,8 +2358,10 @@ export class Bridge {
 		extra: boolean,
 		text: string,
 		mainEmbed: unknown,
-		footerBase: string
+		footerBase: string,
+		opts: { webhookCopy?: boolean; webhookId?: string } = {}
 	): void {
+		const webhookCopy = Boolean(opts.webhookCopy);
 		this.store.mapMessage({
 			link_id: job.linkId,
 			direction: 'discord_to_papo',
@@ -2213,11 +2370,18 @@ export class Bridge {
 			chunk_index: extra ? EXTRA_CHUNK_BASE + group : job.chunkIndex,
 			chunk_total: job.chunkTotal,
 			rendered: extra ? null : text,
-			bridge_embed: extra ? null : mainEmbed ?? null,
-			footer_base: extra ? null : footerBase,
-			link_embeds: extra ? null : (job.linkEmbeds ?? []),
+			// cópia de webhook não tem cartão: NULL de verdade, para o refresh de rodapé não
+			// tomar a linha como cartão
+			bridge_embed: extra || webhookCopy ? null : mainEmbed ?? null,
+			footer_base: extra || webhookCopy ? null : footerBase,
+			// cópia de webhook não tem embed do bridge: o único embed da mensagem é o
+			// link-preview que o Papo faz a partir das URLs do próprio `content`
+			link_embeds: extra || webhookCopy ? null : (job.linkEmbeds ?? []),
 			// autor Discord de origem: é ele que a nota de reply de uma cópia aponta
-			author_label: job.authorName || null
+			author_label: job.authorName || null,
+			webhook_copy: webhookCopy,
+			// credencial que precisa ser usada para editar/apagar esta cópia
+			webhook_id: webhookCopy ? opts.webhookId ?? null : null
 		});
 	}
 
@@ -2323,6 +2487,19 @@ export class Bridge {
 			this.log.debug({ papoMessageId: map.papo_message_id }, 'edição ignorada: mensagem do Papo não é do bot');
 			return;
 		}
+		if (map.webhook_copy) {
+			// cópia de webhook: o texto mora no `content`, e só a credencial do webhook alcança
+			// a mensagem. Previews e anexos ficam intactos — o edit manda só o texto novo.
+			const content = this.webhookCopyContent(
+				'',
+				job.text,
+				await this.reactionSummaryForMap(map, 'papo'),
+				PAPO_LIMITS.contentMax
+			);
+			if (await this.editPapoWebhookCopy(map, content))
+				this.store.updateMapSnapshot(map.id, { rendered: job.text, edit_revision: job.revision ?? null });
+			return;
+		}
 		const embed = await this.papoCopyEmbed(map, job.text);
 		await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
 		this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed, edit_revision: job.revision ?? null });
@@ -2385,6 +2562,12 @@ export class Bridge {
 				{ sourceMessageId: job.sourceMessageId, revision: job.revision },
 				'preview obsoleto ignorado: estado mais recente já aplicado'
 			);
+			return;
+		}
+		if (map.webhook_copy) {
+			// cópia de webhook: o preview não é embed do bridge. O `content` carrega a URL e o
+			// Papo faz o link-preview dele mesmo (crawl em background) — não há o que escrever.
+			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'preview ignorado: cópia de webhook tem preview nativo');
 			return;
 		}
 		const previews = env.papoPreviews ?? [];
@@ -2463,6 +2646,31 @@ export class Bridge {
 	}
 
 	/**
+	 * Edita uma cópia do Papo criada por webhook. A posse é do webhook: o backend recusa que
+	 * o JWT do bot — mesmo ele tendo criado o webhook — mexa em mensagem de webhook, então
+	 * a edição sai pela credencial salva em `papo_webhooks`.
+	 *
+	 * `embeds` ausente preserva os embeds da mensagem (edição só de texto); enviar `[]`
+	 * substitui os customizados por nada. `content` nunca é omitido: sem ele o backend limpa
+	 * o texto, e no modo webhook o texto é a mensagem.
+	 *
+	 * `false` quando a credencial se perdeu (webhook revogado, linha apagada): a cópia existe,
+	 * mas não há como o bridge mexer nela — registrar e seguir, não queimar as tentativas do job.
+	 */
+	private async editPapoWebhookCopy(map: MessageMapRow, content: string, embeds?: PapoEmbedInput[]): Promise<boolean> {
+		if (!map.papo_message_id) return false;
+		const ref = this.papoWebhooks?.refFor(map.webhook_id);
+		if (!ref) {
+			this.log.warn(
+				{ papoMessageId: map.papo_message_id, webhookId: map.webhook_id },
+				'cópia de webhook sem credencial: edição impossível no Papo'
+			);
+			return false;
+		}
+		return this.papoWebhooks!.edit(ref, map.papo_message_id, content, embeds);
+	}
+
+	/**
 	 * Re-rendera o embed salvo em `message_map` com o resumo atual de reações (linha no
 	 * `description`: footer não renderiza emoji custom em nenhum dos lados).
 	 * O destino é a cópia que o bot criou (definida por `map.direction`): a mensagem original
@@ -2513,8 +2721,19 @@ export class Bridge {
 				});
 				continue;
 			}
-			// a cópia editável está no Papo: o texto mora no embed, `content` fica limpo
+			// a cópia editável está no Papo: sem webhook o texto mora no embed, `content` fica limpo
 			if (!map.papo_message_id) continue;
+			if (map.webhook_copy) {
+				// cópia de webhook: o resumo de reações é anexado ao `content` (não há cartão)
+				const content = this.webhookCopyContent(
+					'',
+					map.rendered ?? '',
+					await this.reactionSummaryForMap(map, 'papo'),
+					PAPO_LIMITS.contentMax
+				);
+				await this.editPapoWebhookCopy(map, content);
+				continue;
+			}
 			const embed = JSON.parse(map.bridge_embed!) as PapoEmbedInput;
 			embed.description = this.withReactionSummary(
 				map.rendered ?? '',
@@ -2551,6 +2770,21 @@ export class Bridge {
 					// bridge papo→discord: a mensagem do Papo é a original, de outro autor
 					// (o backend recusa: 403). A cópia do Discord já sumiu por si só.
 					if (map.direction !== 'discord_to_papo') continue;
+					if (map.webhook_copy) {
+						// cópia de webhook: só a credencial do webhook apaga a mensagem. Sem ela a
+						// cópia fica órfã no Papo — não há como recuperá-la, então o map é encerrado
+						// mesmo assim (re-tentar não muda nada).
+						const ref = this.papoWebhooks?.refFor(map.webhook_id);
+						if (!ref) {
+							this.log.warn(
+								{ papoMessageId: map.papo_message_id, webhookId: map.webhook_id },
+								'cópia de webhook sem credencial: exclusão impossível no Papo'
+							);
+							continue;
+						}
+						await this.papoWebhooks!.delete(ref, map.papo_message_id);
+						continue;
+					}
 					await this.api.deleteMessage(map.papo_message_id);
 				}
 			} catch (err) {
