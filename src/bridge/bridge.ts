@@ -188,6 +188,33 @@ const isUnknownEmoji = (err: unknown): boolean => {
 	return e?.code === 10014 || /unknown emoji/i.test(e?.message ?? '');
 };
 
+const GIF_SOURCE_DOMAINS = ['tenor.com', 'giphy.com', 'giphy.media', 'klipy.com'] as const;
+const GIF_SOURCE_URL_RE = /https?:\/\/[^\s<>"'\x60)\]]+/g;
+
+function isGifSourceUrl(raw?: string | null): boolean {
+	if (!raw) return false;
+	try {
+		const url = new URL(raw);
+		if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+		const host = url.hostname.toLowerCase().replace(/\.$/, '');
+		return GIF_SOURCE_DOMAINS.some((domain) => host === domain || host.endsWith('.' + domain));
+	} catch {
+		return false;
+	}
+}
+
+function gifSourceUrlIn(content: string, embeds: readonly { url?: string | null }[] = []): string | undefined {
+	for (const match of content.matchAll(GIF_SOURCE_URL_RE)) {
+		const candidate = (match[0] ?? '').replace(/[.,;:!?]+$/, '');
+		if (isGifSourceUrl(candidate)) return candidate;
+	}
+	return embeds.find((embed) => isGifSourceUrl(embed.url))?.url ?? undefined;
+}
+
+function withGifSourceUrl(content: string, sourceUrl: string): string {
+	return gifSourceUrlIn(content) ? content : content.trim() ? content + '\n' + sourceUrl : sourceUrl;
+}
+
 export class Bridge {
 	private readonly log: Logger;
 	private papoUserId?: string;
@@ -576,34 +603,6 @@ export class Bridge {
 	/** Índice nome→uuid dos usuários do Papo (resolução de `@nome`, item 28); TTL curto. */
 	private papoNameIndex = { at: 0, byUsername: new Map<string, string>(), byNickname: new Map<string, string | null>() };
 	private static readonly PAPO_NAME_INDEX_TTL_MS = 10 * 60_000;
-
-const GIF_SOURCE_DOMAINS = ['tenor.com', 'giphy.com', 'giphy.media', 'klipy.com'] as const;
-const GIF_SOURCE_URL_RE = /https?:\/\/[^\s<>"'\x60)\]]+/g;
-
-function isGifSourceUrl(raw?: string | null): boolean {
-	if (!raw) return false;
-	try {
-		const url = new URL(raw);
-		if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-		const host = url.hostname.toLowerCase().replace(/\.$/, '');
-		return GIF_SOURCE_DOMAINS.some((domain) => host === domain || host.endsWith('.' + domain));
-	} catch {
-		return false;
-	}
-}
-
-function gifSourceUrlIn(content: string, embeds: readonly { url?: string | null }[] = []): string | undefined {
-	for (const match of content.matchAll(GIF_SOURCE_URL_RE)) {
-		const candidate = (match[0] ?? '').replace(/[.,;:!?]+$/, '');
-		if (isGifSourceUrl(candidate)) return candidate;
-	}
-	return embeds.find((embed) => isGifSourceUrl(embed.url))?.url ?? undefined;
-}
-
-function withGifSourceUrl(content: string, sourceUrl: string): string {
-	return gifSourceUrlIn(content) ? content : content.trim() ? content + '\n' + sourceUrl : sourceUrl;
-}
-
 
 	private async ensurePapoNameIndex(): Promise<void> {
 		if (this.papoNameIndex.at && Date.now() - this.papoNameIndex.at < Bridge.PAPO_NAME_INDEX_TTL_MS) return;
