@@ -73,6 +73,8 @@ CREATE TABLE IF NOT EXISTS message_map (
   -- cópia enviada pelo webhook do usuário (item 27): o texto mora no `content` da mensagem,
   -- não em cartão. Edição e resumo de reações reescrevem o content em vez do embed.
   webhook_copy       INTEGER NOT NULL DEFAULT 0,
+  -- Discord → Papo source URL is sent as message content for backend embed crawling
+  content_mode       INTEGER NOT NULL DEFAULT 0,
   -- embed extra de preview de link aplicado à cópia (JSON array). Guardado porque todo
   -- re-render do cartão (resumo de reações, edição) precisa reenviá-lo junto.
   link_embeds        TEXT,

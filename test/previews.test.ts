@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { APIEmbed } from 'discord.js';
-import { discordHostedMedia, discordMediaLinksInContent, firstDiscordPreview, firstPapoPreview, giphyEmbed, stripDiscordMediaLinks } from '../src/bridge/previews.js';
+import { discordHostedMedia, discordMediaLinksInContent, firstDiscordPreview, firstPapoPreview, stripDiscordMediaLinks } from '../src/bridge/previews.js';
 import { discordLinkIsStale, discordSignatureExpiry, isDiscordMediaUrl } from '../src/bridge/embeds.js';
 import { DISCORD_LIMITS } from '../src/bridge/limits.js';
 import type { PapoEmbed } from '../src/papo/types.js';
@@ -262,29 +262,5 @@ describe('firstPapoPreview (Papo → Discord)', () => {
 		expect(firstPapoPreview([])).toBeUndefined();
 		expect(firstPapoPreview(null)).toBeUndefined();
 		expect(firstPapoPreview(undefined)).toBeUndefined();
-	});
-});
-
-describe('giphyEmbed', () => {
-	it('o GIF do picker vira embed de imagem com a página como link', () => {
-		const embed = giphyEmbed({
-			id: 'abc',
-			url: 'https://media.giphy.com/media/abc/giphy.gif',
-			pageUrl: 'https://giphy.com/gifs/abc',
-			title: 'Gato dançando'
-		});
-		expect(embed.image?.url).toBe('https://media.giphy.com/media/abc/giphy.gif');
-		expect(embed.url).toBe('https://giphy.com/gifs/abc');
-		expect(embed.title).toBe('Gato dançando');
-	});
-
-	it('título longo é cortado no limite do Discord', () => {
-		const embed = giphyEmbed({
-			id: 'abc',
-			url: 'https://x/g.gif',
-			pageUrl: 'https://giphy.com/gifs/abc',
-			title: 't'.repeat(1000)
-		});
-		expect((embed.title ?? '').length).toBeLessThanOrEqual(DISCORD_LIMITS.embedTitleMax);
 	});
 });

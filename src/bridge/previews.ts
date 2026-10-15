@@ -12,8 +12,6 @@ import {
 	type DiscordToPapoOptions,
 	type PreviewMedia
 } from './embeds.js';
-import { DISCORD_LIMITS, clampText } from './limits.js';
-import type { GiphyGif } from './giphy.js';
 
 /**
  * Preview de link como embed extra da ponte.
@@ -37,7 +35,8 @@ const urlOf = (e: { url?: string | null }): string | undefined => (e.url ? e.url
  * Identidade da mídia: o caminho do URL, sem host nem query.
  * O Discord serve a mesma mídia por hosts diferentes (`cdn.discordapp.com` no anexo,
  * `media.discordapp.net` no embed) e com assinatura de proxy na query; o caminho é o que
- * permanece igual. Picker de GIF (Klipy/Giphy) chega como anexo **e** embed da mesma mídia.
+ * permanece igual. Previews que repetem o mesmo caminho são descartados; GIF provider URLs
+ * são encaminhadas ao backend para crawl, enquanto o re-hospedamento de mídia do Discord segue separado.
  */
 export const mediaKey = (url?: string | null): string | undefined => {
 	if (!url) return undefined;
@@ -183,13 +182,4 @@ export function firstPapoPreview(
 		if (converted && Object.keys(converted).length) return converted;
 	}
 	return undefined;
-}
-
-/** GIF do picker do Papo como embed extra do Discord (o marcador cru não renderiza lá). */
-export function giphyEmbed(gif: GiphyGif): DiscordEmbedPayload {
-	return {
-		title: clampText(gif.title, DISCORD_LIMITS.embedTitleMax),
-		url: gif.pageUrl,
-		image: { url: gif.url }
-	};
 }

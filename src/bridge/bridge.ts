@@ -69,12 +69,10 @@ import {
 	discordMediaLinksInContent,
 	firstDiscordPreview,
 	firstPapoPreview,
-	giphyEmbed,
 	mediaKey,
 	rawDiscordEmbeds,
 	stripDiscordMediaLinks
 } from './previews.js';
-import { GiphyResolver, giphyId } from './giphy.js';
 import { EXTRA_CHUNK_BASE, type BridgeJob, type DeleteJob, type EditJob, type PinJob, type ReactionJob, type SourceRef, type ToDiscordMessageJob, type ToPapoMessageJob } from './jobs.js';
 import { createHash } from 'node:crypto';
 
@@ -190,13 +188,38 @@ const isUnknownEmoji = (err: unknown): boolean => {
 	return e?.code === 10014 || /unknown emoji/i.test(e?.message ?? '');
 };
 
+const GIF_SOURCE_DOMAINS = ['tenor.com', 'giphy.com', 'giphy.media', 'klipy.com'] as const;
+const GIF_SOURCE_URL_RE = /https?:\/\/[^\s<>"'\x60)\]]+/g;
+
+function isGifSourceUrl(raw?: string | null): boolean {
+	if (!raw) return false;
+	try {
+		const url = new URL(raw);
+		if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+		const host = url.hostname.toLowerCase().replace(/\.$/, '');
+		return GIF_SOURCE_DOMAINS.some((domain) => host === domain || host.endsWith('.' + domain));
+	} catch {
+		return false;
+	}
+}
+
+function gifSourceUrlIn(content: string, embeds: readonly { url?: string | null }[] = []): string | undefined {
+	for (const match of content.matchAll(GIF_SOURCE_URL_RE)) {
+		const candidate = (match[0] ?? '').replace(/[.,;:!?]+$/, '');
+		if (isGifSourceUrl(candidate)) return candidate;
+	}
+	return embeds.find((embed) => isGifSourceUrl(embed.url))?.url ?? undefined;
+}
+
+function withGifSourceUrl(content: string, sourceUrl: string): string {
+	return gifSourceUrlIn(content) ? content : content.trim() ? content + '\n' + sourceUrl : sourceUrl;
+}
+
 export class Bridge {
 	private readonly log: Logger;
 	private papoUserId?: string;
 	private readonly identity: PapoIdentity;
 	private readonly emojis: EmojiBridge;
-	/** GIF do picker do Papo (`content = giphy:<id>`) convertido em imagem para o Discord. */
-	private readonly gifs: GiphyResolver;
 	/** Um worker serializado por canal-link (preserva a ordem da conversa). */
 	private readonly running = new Map<number, Promise<void>>();
 	/**
@@ -235,7 +258,6 @@ export class Bridge {
 		this.log = scoped('bridge');
 		this.identity = new PapoIdentity(api, store, media, cfg.bridge.mediaBaseUrl);
 		this.emojis = new EmojiBridge(api, store, { autoImport: cfg.bridge.emojiAutoImport });
-		this.gifs = new GiphyResolver(cfg.bridge.giphyApiKey, this.log);
 	}
 
 	// ── ciclo de vida ──────────────────────────────────────
@@ -545,25 +567,15 @@ export class Bridge {
 	/**
 	 * Preview que acompanha o cartão da ponte no Discord.
 	 *
-	 * Duas origens: o picker de GIF do Papo (`content = giphy:<id>`, resolvido em imagem —
-	 * o Discord não conhece o marcador) e o link-preview que o backfill traz junto da
-	 * mensagem. Na vida ao vivo o preview chega depois, por `message_embeds_update`.
-	 * Preview que não converte não derruba a ponte: a mensagem segue sem ele.
+	 * O backend é responsável por descobrir GIFs e gerar os embeds. O bridge só consome
+	 * `msg.embeds` quando disponíveis e encaminha o texto/URLs sem resolver marcadores
+	 * específicos de provedor.
 	 */
 	private async papoPreview(msg: { content?: string | null; embeds?: PapoEmbed[] | null }): Promise<{
 		text: string;
 		embed?: DiscordEmbedPayload;
 	}> {
 		const content = msg.content ?? '';
-		const gifId = giphyId(content);
-		if (gifId) {
-			const gif = await this.gifs.resolve(gifId).catch((err) => {
-				this.log.debug({ err, gifId }, 'GIF do picker do Papo não resolvido');
-				return undefined;
-			});
-			if (!gif) return { text: content };
-			return { text: '', embed: giphyEmbed(gif) };
-		}
 		if (msg.embeds?.length) {
 			const embed = await this.papoPreviewEmbed(msg.embeds);
 			if (embed) return { text: content, embed };
@@ -1203,10 +1215,14 @@ export class Bridge {
 		if (this.propagatesMentions(link) && /@/.test(m.content ?? '')) await this.ensurePapoNameIndex();
 
 		const bridgeFiles = Boolean(link.bridge_attachments);
-		// o link do CDN vira anexo da mensagem: no texto ele só acrescenta uma URL que não abre
-		// fora do Discord
+		const rawEmbeds = rawDiscordEmbeds(m.embeds as APIEmbed[]);
+		const gifSourceUrl = gifSourceUrlIn(m.content ?? '', rawEmbeds);
+		// O crawler do backend examina content. Se o Discord trouxe somente o link-preview,
+		// copie a URL da página (não a URL proxy da imagem), sem reescrevê-la.
 		const translated = discordToPapoContent(m.content ?? '', this.resolvers(link));
-		const content = bridgeFiles ? stripDiscordMediaLinks(translated) : translated;
+		const crawlerText = gifSourceUrl ? withGifSourceUrl(translated, gifSourceUrl) : translated;
+		// Os links do CDN do Discord continuam passando pelo pipeline de anexos existente.
+		const content = bridgeFiles ? stripDiscordMediaLinks(crawlerText) : crawlerText;
 		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
 		const sources: SourceRef[] = bridgeFiles
 			? m.attachments.map((a) => ({
@@ -1218,11 +1234,10 @@ export class Bridge {
 					url: a.url
 				}))
 			: [];
-		const rawEmbeds = rawDiscordEmbeds(m.embeds as APIEmbed[]);
 		const attachmentUrls = m.attachments.map((a) => a.url);
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
-		const preview = link.bridge_embeds
+		const preview = link.bridge_embeds && !gifSourceUrl
 			? firstDiscordPreview(rawEmbeds, attachmentUrls, { rehostDiscordMedia: bridgeFiles })
 			: undefined;
 		// mídia que o Discord hospeda (`cdn.discordapp.com`, `media.discordapp.net`) é volátil:
@@ -1285,6 +1300,7 @@ export class Bridge {
 				authorAvatarHash: m.author.avatar ?? undefined,
 				authorAvatarUrl: avatarUrl,
 				content: chunkContent,
+				contentMode: Boolean(gifSourceUrl),
 				footerBase: `🕒 ${formatDate(m.createdAt.toISOString(), this.cfg.bridge.timezone)} · Discord${chunkLabel(i, total)}`,
 				notes: [],
 				sources: i === 0 ? sources : [],
@@ -1334,7 +1350,11 @@ export class Bridge {
 		}
 		await this.cacheMentionedDiscordUsers(fresh);
 		if (this.propagatesMentions(link) && /@/.test(fresh.content ?? '')) await this.ensurePapoNameIndex();
-		const edited = discordToPapoContent(fresh.content ?? '', this.resolvers(link));
+		const previewEmbeds = rawDiscordEmbeds(fresh.embeds as APIEmbed[]);
+		const gifSourceUrl = gifSourceUrlIn(fresh.content ?? '', previewEmbeds);
+		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(gifSourceUrl);
+		const translated = discordToPapoContent(fresh.content ?? '', this.resolvers(link));
+		const edited = gifSourceUrl ? withGifSourceUrl(translated, gifSourceUrl) : translated;
 		const chunks = chunkText(link.bridge_attachments ? stripDiscordMediaLinks(edited) : edited, PAPO_EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
@@ -1345,8 +1365,7 @@ export class Bridge {
 		const revision = fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : new Date().toISOString();
 		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
 		// e sem isso o cartão do Papo fica só com a URL escrita
-		const previewEmbeds = rawDiscordEmbeds(fresh.embeds as APIEmbed[]);
-		const preview = link.bridge_embeds
+		const preview = link.bridge_embeds && !contentMode
 			? firstDiscordPreview(previewEmbeds, fresh.attachments.map((a) => a.url), { rehostDiscordMedia: true })
 			: undefined;
 		if (preview && link.bridge_attachments) {
@@ -1383,7 +1402,8 @@ export class Bridge {
 					chunkIndex: target.chunkIndex,
 					chunkTotal: target.chunkTotal,
 					text: chunks[target.chunkIndex] ?? '',
-					revision
+					revision,
+					contentMode: contentMode && target.chunkIndex < EXTRA_CHUNK_BASE
 				};
 				this.outbox.enqueue({
 					linkId: link.id,
@@ -2217,7 +2237,7 @@ export class Bridge {
 			notes.length
 				? `${job.content}${job.content ? '\n\n' : ''}${notes.map((n) => `> ${n}`).join('\n')}`.trim()
 				: job.content,
-			webhookMode ? PAPO_LIMITS.contentMax : PAPO_LIMITS.embedDescriptionMax
+			webhookMode || job.contentMode ? PAPO_LIMITS.contentMax : PAPO_LIMITS.embedDescriptionMax
 		);
 
 		const groups = plan.groups.length ? plan.groups : [[]];
@@ -2289,7 +2309,7 @@ export class Bridge {
 
 			const mainEmbed = extra ? undefined : embeds[0];
 			if (mainEmbed) {
-				mainEmbed.description = this.withReactionSummary(text, summary, PAPO_LIMITS.embedDescriptionMax);
+				mainEmbed.description = this.withReactionSummary(job.contentMode ? '' : text, summary, PAPO_LIMITS.embedDescriptionMax);
 				mainEmbed.footer = { text: footers[g]! };
 			}
 			if (!text && !attachments.length && !embeds.length) return;
@@ -2304,7 +2324,7 @@ export class Bridge {
 			markAttempt();
 			const created = await this.sendToPapoSafe({
 				channelId: job.papoChannelId,
-				content: undefined,
+				content: job.contentMode && g === 0 ? text : undefined,
 				replyTo: extra ? lastPapoId : this.copyForDiscordMessage(job.replyRefDiscordId),
 				attachments,
 				embeds: embeds.length ? (embeds as ToPapoMessageJob['linkEmbeds']) : undefined
@@ -2370,6 +2390,7 @@ export class Bridge {
 			chunk_index: extra ? EXTRA_CHUNK_BASE + group : job.chunkIndex,
 			chunk_total: job.chunkTotal,
 			rendered: extra ? null : text,
+			content_mode: Boolean(!extra && job.contentMode && !webhookCopy),
 			// cópia de webhook não tem cartão: `undefined` é o NULL de verdade (o JSON "null"
 			// seria lido como cartão pelo refresh de rodapé)
 			bridge_embed: extra || webhookCopy || mainEmbed == null ? undefined : mainEmbed,
@@ -2498,6 +2519,18 @@ export class Bridge {
 			);
 			if (await this.editPapoWebhookCopy(map, content))
 				this.store.updateMapSnapshot(map.id, { rendered: job.text, edit_revision: job.revision ?? null });
+			return;
+		}
+		if (map.content_mode || job.contentMode) {
+			const embed = await this.papoCopyEmbed(map, '');
+			const content = clampText(job.text, PAPO_LIMITS.contentMax);
+			await this.api.editMessage(map.papo_message_id, content, [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
+			this.store.updateMapSnapshot(map.id, {
+				rendered: content,
+				bridge_embed: embed,
+				content_mode: true,
+				edit_revision: job.revision ?? null
+			});
 			return;
 		}
 		const embed = await this.papoCopyEmbed(map, job.text);
@@ -2736,12 +2769,12 @@ export class Bridge {
 			}
 			const embed = JSON.parse(map.bridge_embed!) as PapoEmbedInput;
 			embed.description = this.withReactionSummary(
-				map.rendered ?? '',
+				map.content_mode ? '' : (map.rendered ?? ''),
 				await this.reactionSummaryForMap(map, 'papo'),
 				PAPO_LIMITS.embedDescriptionMax
 			);
 			embed.footer = { text: this.footerText(map, embed, PAPO_LIMITS.embedFooterMax) };
-			await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
+			await this.api.editMessage(map.papo_message_id, map.content_mode ? (map.rendered ?? '') : '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
 		}
 	}
 

@@ -377,18 +377,16 @@ describe('preview no bridge Papo → Discord', () => {
 		expect(embeds[1]!.thumbnail?.url).toMatch(/^http:\/\/media\.local:8080\/media\/[0-9a-f]{64}\.webp$/);
 	});
 
-	it('GIF do picker do Papo vira imagem no Discord, sem o marcador cru', async () => {
+	it('URL de GIF de provedor é encaminhada sem resolução local', async () => {
 		const { bridge, discord, settle } = fixture();
+		const url = 'https://giphy.com/gifs/3oEdV9QtPEA95';
 
-		bridge.onPapoEvent(papoMessage('pm1', 'giphy:3oEdV9QtPEA95'));
+		bridge.onPapoEvent(papoMessage('pm1', url));
 		await settle();
 
 		const embeds = discord.sends[0]!.embeds;
-		expect(embeds).toHaveLength(2);
-		expect(embeds[1]!.image?.url).toBe('https://media.giphy.com/media/3oEdV9QtPEA95/giphy.gif');
-		expect(embeds[1]!.url).toBe('https://giphy.com/gifs/3oEdV9QtPEA95');
-		// o marcador não pode chegar como texto no Discord
-		expect(embeds[0]!.description).not.toContain('giphy:');
+		expect(embeds).toHaveLength(1);
+		expect(embeds[0]!.description).toContain(url);
 	});
 
 	it('mensagem sem preview sai com um único embed', async () => {
@@ -734,40 +732,61 @@ describe('preview do Discord que chega depois da mensagem', () => {
 		expect(outbox.counts().dead).toBe(0);
 	});
 
-	it('GIF que só existe como imagem do embed vai como arquivo animado', async () => {
+	it.each([
+		['Tenor', 'https://tenor.com/view/funny-gif-1234567890', 'https://media.tenor.com/abc/tenor.gif'],
+		['Giphy', 'https://giphy.com/gifs/lkdH8FmImcGoylv3t3', 'https://media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif'],
+		['Klipy', 'https://klipy.com/gifs/some-gif', 'https://static.klipy.com/gifs/some-gif.gif']
+	])('%s URL is sent cleanly for backend crawling, without a duplicate provider embed', async (_provider, url, mediaUrl) => {
 		const { bridge, api, settle } = fixture();
-		const { urls } = await withFetch(
-			async () => new Response(Buffer.from('gif-animado'), { status: 200, headers: { 'content-type': 'image/gif' } }),
-			async () => {
-				await bridge.onDiscordMessage(
-					discordMessage('dm-1', 'https://giphy.com/gifs/lkdH8FmImcGoylv3t3', {
-						embeds: [
-							{
-								type: 'rich',
-								url: 'https://giphy.com/gifs/lkdH8FmImcGoylv3t3',
-								title: 'GIF',
-								image: {
-									url: 'https://media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif',
-									proxy_url: 'https://images-ext-1.discordapp.net/external/ZgLT/https/media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif',
-									width: 300,
-									height: 224,
-									content_type: 'image/gif'
-								}
-							}
-						]
-					})
-				);
-				await settle();
-			}
-		);
 
-		// o Papo re-encode a imagem do embed como thumbnail estática: animação só sobrevive como arquivo
-		expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['lkdH8FmImcGoylv3t3-giphy.gif']);
-		expect(urls.some((u) => u.includes('giphy.gif'))).toBe(true);
-		const preview = api.sent[0]!.embeds![1]!;
-		expect(preview.title).toBe('GIF');
-		expect(preview.thumbnail).toBeUndefined();
+		await bridge.onDiscordMessage(
+			discordMessage('dm-1', url, {
+				embeds: [
+					{
+						type: 'rich',
+						url,
+						title: 'GIF',
+						image: {
+							url: mediaUrl,
+							proxy_url: 'https://images-ext-1.discordapp.net/external/proxy/gif.gif',
+							width: 300,
+							height: 224,
+							content_type: 'image/gif'
+						}
+					}
+				]
+			})
+		);
+		await settle();
+
+		// O backend recebe a URL original no campo content; o bridge envia só o card de autoria.
+		expect(api.sent[0]!.content).toBe(url);
+		expect(api.sent[0]!.embeds).toHaveLength(1);
+		expect(api.sent[0]!.embeds![0]!.description).toBe('');
 	});
+
+	it('uses the clean provider page URL when Discord sends only an embed', async () => {
+		const { bridge, api, settle } = fixture();
+		const url = 'https://klipy.com/gifs/source-only';
+
+		await bridge.onDiscordMessage(
+			discordMessage('dm-embed-only', '', {
+				embeds: [
+					{
+						type: 'rich',
+						url,
+						title: 'GIF',
+						image: { url: 'https://static.klipy.com/gifs/source-only.gif', content_type: 'image/gif' }
+					}
+				]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.content).toBe(url);
+		expect(api.sent[0]!.embeds).toHaveLength(1);
+	});
+
 });
 
 describe('mídia do preview no Discord', () => {
