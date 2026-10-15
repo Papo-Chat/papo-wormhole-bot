@@ -60,6 +60,8 @@ export interface MessageMapRow {
 	footer_base: string | null;
 	/** Cópia enviada pelo webhook do usuário: texto no `content`, sem cartão. */
 	webhook_copy: number;
+	/** Content is sent to Papo's crawler instead of duplicated in the bridge embed. */
+	content_mode?: number;
 	/** JSON dos embeds extra de preview aplicados à cópia (atrás do cartão). */
 	link_embeds: string | null;
 	/** Nota de reply da cópia de webhook: webhook não responde mensagem, a referência vira texto. */
@@ -428,13 +430,14 @@ export class Store {
 		reply_note?: string | null;
 		author_label?: string | null;
 		webhook_copy?: boolean;
+		content_mode?: boolean;
 		/** Webhook que enviou a cópia (necessário para editá-la/apagá-la depois). */
 		webhook_id?: string | null;
 	}): void {
 		this.db
 			.prepare(
-				`INSERT INTO message_map (link_id, direction, papo_message_id, discord_message_id, chunk_index, chunk_total, content_sha, rendered, bridge_embed, footer_base, link_embeds, reply_note, author_label, webhook_copy, webhook_id)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`INSERT INTO message_map (link_id, direction, papo_message_id, discord_message_id, chunk_index, chunk_total, content_sha, rendered, bridge_embed, footer_base, link_embeds, reply_note, author_label, webhook_copy, webhook_id, content_mode)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT DO NOTHING`
 			)
 			.run(
@@ -452,7 +455,8 @@ export class Store {
 				m.reply_note ?? null,
 				m.author_label ?? null,
 				m.webhook_copy ? 1 : 0,
-				m.webhook_id ?? null
+				m.webhook_id ?? null,
+				m.content_mode ? 1 : 0
 			);
 	}
 
@@ -469,6 +473,7 @@ export class Store {
 			link_embeds?: unknown;
 			edit_revision?: string | null;
 			embed_revision?: string | null;
+			content_mode?: boolean;
 		}
 	): void {
 		const sets: string[] = [];
@@ -496,6 +501,10 @@ export class Store {
 		if (snapshot.embed_revision !== undefined) {
 			sets.push('embed_revision = ?');
 			args.push(snapshot.embed_revision);
+		}
+		if (snapshot.content_mode !== undefined) {
+			sets.push('content_mode = ?');
+			args.push(snapshot.content_mode ? 1 : 0);
 		}
 		if (!sets.length) return;
 		args.push(id);
