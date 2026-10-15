@@ -69,12 +69,10 @@ import {
 	discordMediaLinksInContent,
 	firstDiscordPreview,
 	firstPapoPreview,
-	giphyEmbed,
 	mediaKey,
 	rawDiscordEmbeds,
 	stripDiscordMediaLinks
 } from './previews.js';
-import { GiphyResolver, giphyId } from './giphy.js';
 import { EXTRA_CHUNK_BASE, type BridgeJob, type DeleteJob, type EditJob, type PinJob, type ReactionJob, type SourceRef, type ToDiscordMessageJob, type ToPapoMessageJob } from './jobs.js';
 import { createHash } from 'node:crypto';
 
@@ -195,8 +193,6 @@ export class Bridge {
 	private papoUserId?: string;
 	private readonly identity: PapoIdentity;
 	private readonly emojis: EmojiBridge;
-	/** GIF do picker do Papo (`content = giphy:<id>`) convertido em imagem para o Discord. */
-	private readonly gifs: GiphyResolver;
 	/** Um worker serializado por canal-link (preserva a ordem da conversa). */
 	private readonly running = new Map<number, Promise<void>>();
 	/**
@@ -235,7 +231,6 @@ export class Bridge {
 		this.log = scoped('bridge');
 		this.identity = new PapoIdentity(api, store, media, cfg.bridge.mediaBaseUrl);
 		this.emojis = new EmojiBridge(api, store, { autoImport: cfg.bridge.emojiAutoImport });
-		this.gifs = new GiphyResolver(cfg.bridge.giphyApiKey, this.log);
 	}
 
 	// ── ciclo de vida ──────────────────────────────────────
@@ -545,25 +540,15 @@ export class Bridge {
 	/**
 	 * Preview que acompanha o cartão da ponte no Discord.
 	 *
-	 * Duas origens: o picker de GIF do Papo (`content = giphy:<id>`, resolvido em imagem —
-	 * o Discord não conhece o marcador) e o link-preview que o backfill traz junto da
-	 * mensagem. Na vida ao vivo o preview chega depois, por `message_embeds_update`.
-	 * Preview que não converte não derruba a ponte: a mensagem segue sem ele.
+	 * O backend é responsável por descobrir GIFs e gerar os embeds. O bridge só consome
+	 * `msg.embeds` quando disponíveis e encaminha o texto/URLs sem resolver marcadores
+	 * específicos de provedor.
 	 */
 	private async papoPreview(msg: { content?: string | null; embeds?: PapoEmbed[] | null }): Promise<{
 		text: string;
 		embed?: DiscordEmbedPayload;
 	}> {
 		const content = msg.content ?? '';
-		const gifId = giphyId(content);
-		if (gifId) {
-			const gif = await this.gifs.resolve(gifId).catch((err) => {
-				this.log.debug({ err, gifId }, 'GIF do picker do Papo não resolvido');
-				return undefined;
-			});
-			if (!gif) return { text: content };
-			return { text: '', embed: giphyEmbed(gif) };
-		}
 		if (msg.embeds?.length) {
 			const embed = await this.papoPreviewEmbed(msg.embeds);
 			if (embed) return { text: content, embed };
