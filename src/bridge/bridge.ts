@@ -2390,7 +2390,7 @@ function withGifSourceUrl(content: string, sourceUrl: string): string {
 			discord_message_id: job.discordMessageId,
 			chunk_index: extra ? EXTRA_CHUNK_BASE + group : job.chunkIndex,
 			chunk_total: job.chunkTotal,
-			rendered: extra ? null : text,
+			rendered: extra ? null : job.contentMode && !webhookCopy ? '' : text,
 			content_mode: Boolean(job.contentMode && !webhookCopy),
 			// cópia de webhook não tem cartão: `undefined` é o NULL de verdade (o JSON "null"
 			// seria lido como cartão pelo refresh de rodapé)
