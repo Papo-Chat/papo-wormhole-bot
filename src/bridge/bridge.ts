@@ -1404,7 +1404,7 @@ function withGifSourceUrl(content: string, sourceUrl: string): string {
 					chunkTotal: target.chunkTotal,
 					text: chunks[target.chunkIndex] ?? '',
 					revision,
-					contentMode
+					contentMode: contentMode && target.chunkIndex < EXTRA_CHUNK_BASE
 				};
 				this.outbox.enqueue({
 					linkId: link.id,
