@@ -2390,7 +2390,7 @@ function withGifSourceUrl(content: string, sourceUrl: string): string {
 			discord_message_id: job.discordMessageId,
 			chunk_index: extra ? EXTRA_CHUNK_BASE + group : job.chunkIndex,
 			chunk_total: job.chunkTotal,
-			rendered: extra ? null : job.contentMode && !webhookCopy ? '' : text,
+			rendered: extra ? null : text,
 			content_mode: Boolean(job.contentMode && !webhookCopy),
 			// cópia de webhook não tem cartão: `undefined` é o NULL de verdade (o JSON "null"
 			// seria lido como cartão pelo refresh de rodapé)
@@ -2527,7 +2527,7 @@ function withGifSourceUrl(content: string, sourceUrl: string): string {
 			const content = clampText(job.text, PAPO_LIMITS.contentMax);
 			await this.api.editMessage(map.papo_message_id, content, [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
 			this.store.updateMapSnapshot(map.id, {
-				rendered: '',
+				rendered: content,
 				bridge_embed: embed,
 				content_mode: true,
 				edit_revision: job.revision ?? null
@@ -2770,12 +2770,12 @@ function withGifSourceUrl(content: string, sourceUrl: string): string {
 			}
 			const embed = JSON.parse(map.bridge_embed!) as PapoEmbedInput;
 			embed.description = this.withReactionSummary(
-				map.rendered ?? '',
+				map.content_mode ? '' : (map.rendered ?? ''),
 				await this.reactionSummaryForMap(map, 'papo'),
 				PAPO_LIMITS.embedDescriptionMax
 			);
 			embed.footer = { text: this.footerText(map, embed, PAPO_LIMITS.embedFooterMax) };
-			await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
+			await this.api.editMessage(map.papo_message_id, map.content_mode ? (map.rendered ?? '') : '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
 		}
 	}
 
