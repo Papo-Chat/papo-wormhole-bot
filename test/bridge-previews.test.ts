@@ -377,18 +377,16 @@ describe('preview no bridge Papo → Discord', () => {
 		expect(embeds[1]!.thumbnail?.url).toMatch(/^http:\/\/media\.local:8080\/media\/[0-9a-f]{64}\.webp$/);
 	});
 
-	it('GIF do picker do Papo vira imagem no Discord, sem o marcador cru', async () => {
+	it('URL de GIF de provedor é encaminhada sem resolução local', async () => {
 		const { bridge, discord, settle } = fixture();
+		const url = 'https://giphy.com/gifs/3oEdV9QtPEA95';
 
-		bridge.onPapoEvent(papoMessage('pm1', 'giphy:3oEdV9QtPEA95'));
+		bridge.onPapoEvent(papoMessage('pm1', url));
 		await settle();
 
 		const embeds = discord.sends[0]!.embeds;
-		expect(embeds).toHaveLength(2);
-		expect(embeds[1]!.image?.url).toBe('https://media.giphy.com/media/3oEdV9QtPEA95/giphy.gif');
-		expect(embeds[1]!.url).toBe('https://giphy.com/gifs/3oEdV9QtPEA95');
-		// o marcador não pode chegar como texto no Discord
-		expect(embeds[0]!.description).not.toContain('giphy:');
+		expect(embeds).toHaveLength(1);
+		expect(embeds[0]!.description).toContain(url);
 	});
 
 	it('mensagem sem preview sai com um único embed', async () => {
