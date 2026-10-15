@@ -66,6 +66,8 @@ export interface ToPapoMessageJob {
 	authorAvatarHash?: string;
 	authorAvatarUrl?: string;
 	content: string;
+	/** Send source-provider URLs as Papo content so the backend crawler owns embeds. */
+	contentMode?: boolean;
 	footerBase: string;
 	bridgeEmbed?: PapoEmbedInput;
 	linkEmbeds?: PapoEmbedInput[];
@@ -96,6 +98,8 @@ export interface EditJob {
 	 * cronológica dos eventos de origem.
 	 */
 	revision?: string;
+	/** Keep source-provider links in Papo content instead of custom bridge-card text. */
+	contentMode?: boolean;
 }
 
 export interface DeleteJob {
