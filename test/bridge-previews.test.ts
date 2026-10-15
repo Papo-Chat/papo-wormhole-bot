@@ -764,6 +764,29 @@ describe('preview do Discord que chega depois da mensagem', () => {
 		expect(api.sent[0]!.embeds).toHaveLength(1);
 		expect(api.sent[0]!.embeds![0]!.description).toBe('');
 	});
+
+	it('uses the clean provider page URL when Discord sends only an embed', async () => {
+		const { bridge, api, settle } = fixture();
+		const url = 'https://klipy.com/gifs/source-only';
+
+		await bridge.onDiscordMessage(
+			discordMessage('dm-embed-only', '', {
+				embeds: [
+					{
+						type: 'rich',
+						url,
+						title: 'GIF',
+						image: { url: 'https://static.klipy.com/gifs/source-only.gif', content_type: 'image/gif' }
+					}
+				]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.content).toBe(url);
+		expect(api.sent[0]!.embeds).toHaveLength(1);
+	});
+
 });
 
 describe('mídia do preview no Discord', () => {
