@@ -53,15 +53,6 @@ const EnvSchema = z.object({
 	WORMHOLE_MAX_ATTEMPTS: z.coerce.number().int().min(1).default(12),
 	WORMHOLE_BACKOFF_BASE_MS: z.coerce.number().int().min(100).default(1000),
 	WORMHOLE_BACKOFF_MAX_MS: z.coerce.number().int().min(1000).default(900_000),
-	/**
-	 * Chave da API do Giphy. O picker do Papo envia `content = giphy:<id>`; sem chave a ponte
-	 * usa a URL direta do slug (`media.giphy.com/media/<id>/giphy.gif`), com chave resolve a
-	 * imagem original.
-	 */
-	GIPHY_API_KEY: z
-		.string()
-		.optional()
-		.transform((v) => (v && v.trim() ? v.trim() : undefined)),
 	WORMHOLE_LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info')
 });
 
@@ -96,8 +87,6 @@ export interface Config {
 		maxAttempts: number;
 		backoffBaseMs: number;
 		backoffMaxMs: number;
-		/** Chave da API do Giphy (opcional): resolução do GIF do picker do Papo. */
-		giphyApiKey?: string;
 	};
 }
 
@@ -146,7 +135,6 @@ export function loadConfig(): Config {
 			maxAttempts: e.WORMHOLE_MAX_ATTEMPTS,
 			backoffBaseMs: e.WORMHOLE_BACKOFF_BASE_MS,
 			backoffMaxMs: e.WORMHOLE_BACKOFF_MAX_MS,
-			giphyApiKey: e.GIPHY_API_KEY
 		}
 	};
 }
