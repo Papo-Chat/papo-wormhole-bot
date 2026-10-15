@@ -2370,9 +2370,9 @@ export class Bridge {
 			chunk_index: extra ? EXTRA_CHUNK_BASE + group : job.chunkIndex,
 			chunk_total: job.chunkTotal,
 			rendered: extra ? null : text,
-			// cópia de webhook não tem cartão: NULL de verdade, para o refresh de rodapé não
-			// tomar a linha como cartão
-			bridge_embed: extra || webhookCopy ? null : mainEmbed ?? null,
+			// cópia de webhook não tem cartão: `undefined` é o NULL de verdade (o JSON "null"
+			// seria lido como cartão pelo refresh de rodapé)
+			bridge_embed: extra || webhookCopy || mainEmbed == null ? undefined : mainEmbed,
 			footer_base: extra || webhookCopy ? null : footerBase,
 			// cópia de webhook não tem embed do bridge: o único embed da mensagem é o
 			// link-preview que o Papo faz a partir das URLs do próprio `content`
