@@ -47,7 +47,9 @@ npm run dev
 ### Permissões do bot no Discord
 
 `View Channels`, `Send Messages`, `Send Messages in Threads`, `Manage Messages` (edição/deleção/
-reações/pins) e `Manage Channels` para os comandos de configuração. Thread privada ou anunciada
+reações/pins), `Manage Channels` para os comandos de configuração e `Manage Webhooks` para o modo
+webhook (nick + avatar do autor fixos no webhook; sem ela as cópias saem pelo cartão do bot).
+Thread privada ou anunciada
 só entrega mensagens a quem é membro: `Manage Threads` é o que permite ao bridge entrar nela
 (thread pública não exige nada). Se quiser usar emojis do guild no lado
 Discord, `Manage Emojis` ajuda, mas não é obrigatório: o fallback do bridge é o emoji da
@@ -58,7 +60,9 @@ permissão nenhuma no servidor.
 
 O usuário-bot precisa ser membro do canal linkado. Para importar emojis do Discord para o
 Papo (`WORMHOLE_EMOJI_AUTO_IMPORT=true`) é necessário `manage_server`; sem isso o bridge cai
-para o shortcode `:nome:` literal.
+para o shortcode `:nome:` literal. Para que a cópia Discord → Papo saia pelo webhook do autor
+(nick + avatar fixos no webhook) é necessário `manage_webhooks`; sem isso o bridge usa o cartão do
+bot. Reações e pins continuam funcionando nas cópias de webhook: quem os aplica é o JWT do bot.
 
 ## Configuração (comandos)
 
@@ -110,25 +114,33 @@ Papo REST/WS ──► Bridge (tradução, chunking, embeds) ──► SQLite ou
   URL absoluta para `author.icon_url`, então o avatar do autor Papo é servido pelo media
   server embutido (`WORMHOLE_MEDIA_BASE_URL`); sem ele o avatar é enviado como anexo da
   mensagem e o embed referencia `attachment://avatar-<sha256>.<ext>`.
-- **Webhook por usuário**: no Discord, cada usuário Papo tem um webhook próprio por canal, com
+- **Webhook por usuário (nos dois lados)**: cada autor tem um webhook próprio por canal, com
   nick + avatar fixos no webhook (nome `nickname (@username)`, ou só o username quando o apelido
-  é o próprio nome). O Discord agrupa mensagens consecutivas quando autor e username batem — num
-  webhook compartilhado as cópias de usuários diferentes nunca agrupariam. No modo webhook o
-  bridge **não gera cartão**: `content` = conteúdo do Papo (com a linha de reações anexada quando
-  existem) e os únicos embeds são os previews que vieram do Papo; a data é o timestamp nativo do
-  Discord. O webhook é criado sob demanda e reaproveitado entre runs pela tabela
-  `bridge_webhooks` (registro de posse, que também identifica o eco sem chute por nome). Sem
-  webhook (limite de webhooks do canal, bot sem *Manage Webhooks*) o envio continua pelo cartão
-  do bot. Webhook não responde mensagens: a referência do reply chega como
-  `*Respondendo:[link da mensagem] de @autor*` no topo do `content`. Edição/apagamento da cópia
-  usam o token do webhook quando a mensagem é de webhook.
+  é o próprio nome). No modo webhook o bridge **não gera cartão**: `content` = o texto da mensagem
+  de origem (com a linha de reações anexada quando existem) e a data é o timestamp nativo do
+  destino. Os webhooks são criados sob demanda e reaproveitados entre runs por `bridge_webhooks`
+  (Discord) e `papo_webhooks` (Papo) — registro de posse, que também identifica o eco sem chute
+  por nome. Sem webhook (limite de webhooks do canal, bot sem *Manage Webhooks* no Discord ou sem
+  a permissão `manage_webhooks` no Papo) o envio continua pelo cartão do bot. Edição e apagamento
+  da cópia usam o token do webhook quando a mensagem é de webhook: nenhum dos lados deixa o JWT
+  do bot mexer em mensagem de webhook.
+  - **Papo → Discord**: os únicos embeds são os previews que vieram do Papo. Webhook não responde
+    mensagens no Discord: a referência do reply chega como `*Respondendo:[link da mensagem] de
+    @autor*` no topo do `content`.
+  - **Discord → Papo**: o webhook do Papo responde mensagem, então o reply continua nativo
+    (`reply_to`) e não vira nota no texto. Os únicos embeds são os link previews, e eles são
+    nativos: o `content` carrega a URL e o backend do Papo faz o preview dela — reenviar o preview
+    como embed duplicaria o mesmo link. O envio leva `external_message_id` (chave de idempotência):
+    re-tentar um job cujo resultado foi incerto devolve a cópia existente em vez de duplicá-la.
+    O token do webhook é salvo em `papo_webhooks` porque o backend o mostra uma única vez, na
+    criação.
 
 ## Mapeamento de identidade
 
 | Lado | Como a autoria aparece |
 | --- | --- |
-| Discord | embed author: `nickname > username` do Papo + avatar (media server ou anexo `attachment://`) + rodapé com data |
-| Papo | embed author: `displayName` do Discord no topo do card + avatar do Discord no selo do topo (`author_media`) + rodapé com data |
+| Discord | webhook do autor (nick + avatar) com o texto em `content`; sem webhook: embed author `nickname > username` do Papo + avatar (media server ou anexo `attachment://`) + rodapé com data |
+| Papo | webhook do autor (nick + avatar) com o texto em `content`; sem webhook: embed author `displayName` do Discord no topo do card + avatar do Discord no selo do topo (`author_media`) + rodapé com data |
 
 `/link-user` liga as duas identidades para que menções possam ser propagadas.
 

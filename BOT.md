@@ -29,9 +29,9 @@ deleções, preservando identidade visual do autor em ambos os lados.
 | Fato | Consequência no design |
 | --- | --- |
 | Papo tem **no máximo 1 servidor** (`POST /server` → 409 se já existe) | `/link-server` é 1:1 e quase sempre redundante; manter por conveniência de config, mas o bridge é chaveado por **canal** |
-| Papo não tem contas "bot": o bot é um **usuário comum** autenticado por cookie JWT (`Auth`) | Toda mensagem bridge no Papo é autoria do usuário-bot → a identidade real só pode ser transportada em **embed** (autor + avatar) |
+| Papo não tem contas "bot": o bot é um **usuário comum** autenticado por cookie JWT (`Auth`) | Toda mensagem bridge no Papo é autoria do usuário-bot, **ou** do webhook do bridge (`POST /webhooks`, escopado a um canal e autenticado por token próprio) → a identidade real vai em **embed** (autor + avatar) no modo cartão, ou no **webhook** (nick + avatar fixos) no modo webhook |
 | Autenticação Papo é cookie HttpOnly; JWT expira em 24h, renovável por até 30 dias em `POST /auth/refresh` | Loop de refresh agendado (ex.: a cada 12h) + re-login em 401 + reconexão WebSocket com o novo cookie |
-| Discord não permite username/avatar arbitrários por mensagem via bot comum | Autoria no Discord é feita por **embed author** (modo A) ou por **webhook** por canal (modo B, opcional) |
+| Discord não permite username/avatar arbitrários por mensagem via bot comum | Autoria no Discord é feita por **embed author** (modo A) ou por **webhook** por canal (modo B). O Papo tem a mesma dupla opção (`POST /webhooks` + `POST /webhooks/{id}/messages`), e o bridge aplica o mesmo modo nos dois lados: webhook quando o bot pode criá-lo, cartão quando não pode |
 | Discord: `content` 2000 chars, 10 embeds/mensagem, **6000 chars somando todos os embeds**, 10 arquivos/mensagem, arquivo ≤ 20 MB (free) | Chunking determinístico + pipeline de compressão/partição de arquivos |
 | Papo: `content` **8192 chars**, 10 attachments/mensagem (≤ 100 MB, nome ≤ 128), 10 embeds/mensagem, título 256, descrição 4192, 25 fields, field name 256 / value 1024, autor 256, footer 2048, **6000 chars somando todos os embeds**, URL 2048 | Orçamento de embed idêntico ao Discord → chunking único com `min(lado destino)`; o corpo vai em `content` (8192), não em embed |
 | Rate limits do Papo não documentados (só `authRateLimit` no middleware de rotas) | Throttle client-side conservador por canal + backoff em 429/5xx |
@@ -51,7 +51,8 @@ deleções, preservando identidade visual do autor em ambos os lados.
         │  PAPO ADAPTER       │        │  DISCORD ADAPTER       │
         │  - REST client      │        │  - gateway client      │
         │  - WS client (/ws)  │        │  - REST client         │
-        │  - auth/refresh     │        │  - webhook pool (modo B)│
+        │  - auth/refresh     │        │  - webhook pool (B)    │
+        │  - webhook pool (B) │        │                        │
         └──────────┬──────────┘        └─────────┬──────────────┘
                    │        ┌────────────┐       │
                    └────────┤  STORE     ├───────┘
@@ -73,7 +74,8 @@ deleções, preservando identidade visual do autor em ambos os lados.
 Componentes:
 
 - **Papo Adapter**: login (`/auth/login`), keep-alive (`heartbeat`), refresh de sessão, conexão
-  `ws://…/ws`, cursor de replay por canal (`GET /channels/{id}/messages?since=&last_id=&order=asc`).
+  `ws://…/ws`, cursor de replay por canal (`GET /channels/{id}/messages?since=&last_id=&order=asc`),
+  pool de webhooks por canal (modo B, `POST /webhooks` + envio pelo token escopado).
 - **Discord Adapter**: gateway (intents), REST, pool de webhooks por canal (modo B), tratamento de
   429 (`Retry-After`, `X-RateLimit-Reset-After`, bucket por rota).
 - **Translator**: markdown ↔ markdown, menções, emojis, embeds, attachments, reações.
@@ -89,17 +91,29 @@ Componentes:
 
 ## 4. Identidade e mapeamento de autores
 
-- **Modo A (padrão)** — bot comum no Discord, autoria via embed:
+- **Modo A (cartão)** — bot comum nos dois lados, autoria via embed. No Discord:
   `author.name = nickname ?? username` (Papo), `author.icon_url = <media server>/media/<sha>.png`
   (ou `attachment://avatar-<sha>.<ext>` quando não há media server público), `author.url` opcional.
-- **Modo B (opcional, por canal-link)** — webhook por canal: `username`/`avatar_url` do webhook
-  por mensagem → autoria visual perfeita, custo: permissão `Manage Webhooks`, limite de webhooks
-  por canal e rate limit próprio.
-- **Papo (ambos os modos)**: embed custom (`EmbedInput`) com
-  `author.name = nickname ?? username` do usuário Discord e `author.icon_url = <avatar Discord>`
-  (HTTPS). O backend do Papo baixa e re-serva o avatar em `embeds.author_media`; o card desenha
-  esse ícone no selo da linha de topo e `site_name` (aqui, o nome do autor) ao lado. Avatar na
-  `thumbnail` **não**: o `EmbedCard` desenha a thumbnail como imagem grande do card (largura total).
+  No Papo: embed custom (`EmbedInput`) com `author.name = displayName` do Discord e
+  `author.icon_url = <avatar Discord>` (HTTPS). O backend do Papo baixa e re-serva o avatar em
+  `embeds.author_media`; o card desenha esse ícone no selo da linha de topo e `site_name` (aqui, o
+  nome do autor) ao lado. Avatar na `thumbnail` **não**: o `EmbedCard` desenha a thumbnail como
+  imagem grande do card (largura total).
+- **Modo B (webhook por usuário, por canal)** — um webhook por autor, com nick + avatar fixos no
+  webhook (nome `nickname (@username)`), reaproveitado entre runs pela tabela de posse
+  (`bridge_webhooks` no Discord, `papo_webhooks` no Papo). Custo: *Manage Webhooks* no Discord,
+  permissão `manage_webhooks` no Papo, limite de webhooks por canal e rate limit próprio. O bridge
+  usa o modo B quando consegue criar o webhook e cai no modo A quando não consegue — a escolha é
+  pela capacidade do bot no canal (permissão e limite de webhooks), não por configuração:
+  `channel_links.identity` é superfície de config que o bridge ainda não consulta. Nos dois lados
+  `content` = texto da origem e o bridge não gera cartão.
+  - **Discord**: os únicos embeds extras são os previews que vieram do Papo. Webhook não responde
+    mensagem lá: a referência do reply vira nota no texto (ver §12).
+  - **Papo**: o webhook responde mensagem, então o reply continua nativo (`reply_to`). Os únicos
+    embeds são os link previews, e eles são **nativos**: o `content` carrega a URL e o backend faz
+    o crawl dela — reenviar o preview como embed duplicaria o mesmo link (o crawler não deduplica
+    contra os embeds da mensagem). O envio leva `external_message_id`, a chave de idempotência que
+    substitui a reconciliação por assinatura de rodapé.
 - `/link-user` é **opcional**: sem link, usa modo espelho (nome/avatar no embed). Com link,
   habilita: menções traduzidas, `/online` cruzado, reações atribuídas, e futura sincronia de papéis.
 
@@ -131,8 +145,11 @@ está no cache porque nunca autorou uma mensagem ponte, e snowflake/uuid não di
 rótulo o bridge assina `@usuário`, nunca o id cru.
 
 **Anti-loop (obrigatório)**: descartar na entrada qualquer mensagem cujo autor seja o usuário-bot
-do Papo ou o próprio bot/webhook do Discord; além disso `message_map` é único por
-`(origem, id_da_mensagem_origem)` — uma mensagem já bridgeada nunca é re-bridgeada.
+do Papo ou o próprio bot/webhook do Discord, e qualquer mensagem de webhook cujo `webhook_id` está
+no registro de posse (`bridge_webhooks`, `papo_webhooks`) — é cópia que nós mesmos enviamos, e o
+registro dispensa chute por nome; webhook de terceiro no canal não é eco e continua ponteado. Além
+disso `message_map` é único por `(origem, id_da_mensagem_origem)` — uma mensagem já bridgeada nunca
+é re-bridgeada.
 
 **Anti-eco em reações**: os filtros de autor só cobrem *mensagens*. No Discord dá para filtrar a
 reação pelo `user` do evento; no Papo o `react_update` traz apenas `count`, sem quem reagiu. Por
@@ -517,10 +534,14 @@ CREATE TABLE message_map (
   -- cópia enviada pelo webhook do usuário: o texto mora no `content`, não em cartão
   webhook_copy      INTEGER NOT NULL DEFAULT 0,
   link_embeds       TEXT,      -- JSON do preview de link aplicado à cópia (atrás do cartão)
-  -- nota de reply da cópia de webhook (`*Respondendo:[link] de @autor*`): webhook não responde mensagem
+  -- nota de reply da cópia enviada por webhook **no Discord** (`*Respondendo:[link] de @autor*`):
+  -- webhook do Discord não responde mensagem; no Papo o reply é nativo nos dois modos
   reply_note        TEXT,
   -- rótulo do autor da mensagem de origem: o "de @autor" da nota de reply
   author_label      TEXT,
+  -- webhook que enviou a cópia (`webhook_copy = 1`): é a credencial que precisa ser usada para
+  -- editar/apagar a cópia — nenhum dos lados aceita mexer em mensagem de webhook por outra via
+  webhook_id        TEXT,
   edit_revision     TEXT,      -- revisão da última edição aplicada (edição atrasada não reverte)
   embed_revision    TEXT,      -- revisão da última atualização de preview aplicada
   deleted           INTEGER NOT NULL DEFAULT 0,
@@ -528,6 +549,35 @@ CREATE TABLE message_map (
 );
 CREATE UNIQUE INDEX ux_map_papo    ON message_map (papo_message_id, chunk_index)    WHERE papo_message_id    IS NOT NULL;
 CREATE UNIQUE INDEX ux_map_discord ON message_map (discord_message_id, chunk_index) WHERE discord_message_id IS NOT NULL;
+
+-- Webhook do bridge por autor (modo B). O Discord agrupa mensagens consecutivas quando autor e
+-- username batem; num webhook compartilhado as cópias de autores diferentes nunca agrupariam.
+-- A linha é o registro de posse: identifica o webhook do bridge sem chute por nome (eco) e
+-- reaproveita o webhook entre runs.
+CREATE TABLE bridge_webhooks (
+  webhook_id   TEXT PRIMARY KEY,
+  channel_id   TEXT NOT NULL,      -- canal Discord
+  papo_user_id TEXT NOT NULL,      -- autor Papo da cópia
+  name         TEXT NOT NULL,      -- `nickname (@username)`
+  avatar_sha   TEXT,               -- avatar aplicado no webhook
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX ix_bridge_webhooks_user ON bridge_webhooks (channel_id, papo_user_id);
+
+-- Espelho do anterior para a cópia Discord → Papo. `token` é a credencial escopada do webhook:
+-- o backend do Papo o mostra uma única vez, na criação, e é ele (não o JWT do bot) que permite
+-- editar/apagar as cópias que o webhook enviou.
+CREATE TABLE papo_webhooks (
+  webhook_id      TEXT PRIMARY KEY,
+  channel_id      TEXT NOT NULL,   -- canal Papo
+  discord_user_id TEXT NOT NULL,   -- autor Discord da cópia
+  name            TEXT NOT NULL,   -- `nickname (@username)` (≤ 80)
+  display_name    TEXT,            -- nickname persistente (≤ 100)
+  avatar_sha      TEXT,
+  token           TEXT NOT NULL,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX ix_papo_webhooks_user ON papo_webhooks (channel_id, discord_user_id);
 CREATE INDEX ix_map_link ON message_map (link_id, created_at);
 
 -- Contagem de reações da mensagem de origem, no formato exibível do destino
@@ -597,8 +647,10 @@ CREATE TABLE audit_log (
 
 ### 12.1 Papo → Discord
 ```
-WS event {type:"message", id, channel_id, author_id, content, reply_to, attachments, created_at}
-  → ignorar se author_id == bot_papo_user_id
+WS event {type:"message", id, channel_id, author_id, content, reply_to, attachments, created_at, webhook_id?, external_author?}
+  → ignorar se author_id == bot_papo_user_id, ou se webhook_id é webhook do bridge (registro de posse)
+  → mensagem de webhook de terceiro: autoria é a que o webhook declara (`external_author.name`) —
+    webhook não é usuário do Papo e não tem perfil para resolver
   → canal-link existe e mode ∈ {both, to_discord}?
   → dedupe (message_map)
   → traduzir conteúdo (menções, emojis, timestamps)
@@ -614,14 +666,18 @@ WS event {type:"message", id, channel_id, author_id, content, reply_to, attachme
 ### 12.2 Discord → Papo
 ```
 MESSAGE_CREATE
-  → ignorar bot/webhook próprio
+  → ignorar bot próprio; mensagem de webhook cujo webhook_id está em papo_webhooks também é eco
+    (webhook de terceiro no canal continua sendo ponteado, com a autoria que ele declara)
   → canal-link? (thread linkada é canal como qualquer outro)
   → traduzir conteúdo + embeds (rich/link preview) + attachments
   → mídia hospedada pelo Discord (embed, preview ou link colado no texto) vira anexo baixado; o link sai do texto (§7, §8)
   → m.reference da origem → cópia Papo em message_map → reply_to do Papo (sem cópia: sem reply)
-  → montar EmbedInput (author, thumbnail=avatar Discord, image=anexo, footer=data/origem)
-  → multipart POST /messages {channel_id, content, embeds(JSON string), attachments[](binary), reply_to?}
-  → message_map
+  → modo webhook (par canal Papo × autor Discord em papo_webhooks): nick + avatar fixos no webhook,
+    multipart POST /webhooks/{id}/messages {content, attachments[], external_message_id, reply_to?}
+    — sem cartão e sem embed de preview: o preview é o crawl do `content` feito pelo backend
+  → sem webhook: montar EmbedInput (author, thumbnail=avatar Discord, image=anexo, footer=data/origem)
+    e multipart POST /messages {channel_id, content, embeds(JSON string), attachments[](binary), reply_to?}
+  → INSERT message_map(discord_message_id, papo_message_id, chunk, webhook_copy, webhook_id)
 ```
 
 ### 12.3 Demais eventos
@@ -675,14 +731,34 @@ O reply é propagado por referência mapeada, não por texto copiado:
 - `reply_to` apontando para mensagem apagada dá 404 no Papo: o bot reenvia sem referência.
 - Não copiamos o texto respondido no corpo do embed: os dois lados já renderizam o preview nativo
   (Discord mostra a mensagem referenciada, o Papo mostra o reply do próprio Papo).
-- **Modo webhook não tem reply nativo** (o Discord não permite que webhook responda mensagem): a
-  referência chega como `*Respondendo:[link da mensagem no Discord] de @autor*` no topo do
-  `content` da cópia — o autor citado é o da mensagem respondida, lido de `message_map.author_label`
-  (autor Papo quando a cópia é `papo_to_discord`, autor Discord quando é `discord_to_papo`; sem
-  rótulo — cópia anterior à coluna — a nota fica só com o link). A nota fica em
-  `message_map.reply_note` porque toda re-escrita do content (edição, resumo de reações) reescreve
-  o `content` inteiro e precisa reescrevê-la junto. No envio pelo cartão o reply continua sendo
-  reply nativo do Discord.
+- **No Discord, modo webhook não tem reply nativo** (o Discord não permite que webhook responda
+  mensagem): a referência chega como `*Respondendo:[link da mensagem no Discord] de @autor*` no topo
+  do `content` da cópia — o autor citado é o da mensagem respondida, lido de
+  `message_map.author_label` (autor Papo quando a cópia é `papo_to_discord`, autor Discord quando é
+  `discord_to_papo`; sem rótulo — cópia anterior à coluna — a nota fica só com o link). A nota fica
+  em `message_map.reply_note` porque toda re-escrita do content (edição, resumo de reações)
+  reescreve o `content` inteiro e precisa reescrevê-la junto. No envio pelo cartão o reply continua
+  sendo reply nativo do Discord.
+- **No Papo o reply é nativo nos dois modos**: `POST /webhooks/{id}/messages` aceita `reply_to`
+  como `POST /messages`. A cópia Discord → Papo não tem nota de reply — só `reply_to`, resolvido na
+  execução a partir de `message_map`.
+
+### 12.6 Superfície de webhooks do Papo conferida contra o backend
+
+Conferida em `papo-backend-infra` (`internal/handlers/webhooks.go`, `internal/services/messages.go`):
+
+| Chamada | Estado | Observação |
+| --- | --- | --- |
+| `POST /webhooks { channel_id, name }` | ✅ | JWT + `manage_webhooks`; `name` ≤ 80. O `token` escopado **só aparece nesta resposta** — é ele que vai em `papo_webhooks.token` |
+| `GET /webhooks` | ✅ | `{ webhooks: [...] }`, sem token: serve para reconciliar a posse na subida (linha cuja credencial morreu é descartada). Sem `manage_webhooks` falha — e nada é tocado |
+| `PATCH /webhooks/{id}` | ✅ | `display_name` ≤ 100 e `avatar` (base64 + `avatar_format`), ≤ 2 MB e ≤ 512 px. É onde nick e avatar ficam **fixos no webhook** |
+| `DELETE /webhooks/{id}` | ✅ | revoga a credencial: as cópias antigas continuam no canal, fora do alcance do bridge |
+| `POST /webhooks/{id}/messages` | ✅ | multipart, autenticado **só pelo Bearer do token** (sem cookie/JWT): `content`, `reply_to`, `attachments`, `embeds`, `external_message_id` |
+| `PUT`/`DELETE /webhooks/{id}/messages/{message_id}` | ✅ | mesma credencial. O JWT do bot **não** alcança mensagem de webhook (`author_id` é NULL): `PUT /messages/{id}` devolve 403 |
+| `external_message_id` | ✅ | chave de idempotência do envio: re-tentar um job de resultado incerto devolve a cópia existente em vez de duplicá-la |
+| edição de mensagem de webhook | ✅ | `embeds` omitido preserva os embeds customizados, `[]` os substitui por nenhum, e `content` vazio **limpa** o texto — todo edit do bridge reenvia o content |
+| link preview | ✅ | `ProcessMessageEmbeds` roda para mensagem de webhook: o backend crawlas URLs do `content` em background. O crawler **não** deduplica contra os embeds da mensagem — por isso o modo webhook não reenvia o preview como embed |
+| reações e pinos em mensagem de webhook | ✅ | funcionam normalmente pelo JWT do bot: o bridge continua resumindo reações de cópias de webhook |
 
 ---
 

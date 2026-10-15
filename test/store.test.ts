@@ -352,3 +352,93 @@ describe('webhooks do bridge (por usuário, por canal)', () => {
 		expect(store.listBridgeWebhookIds('111')).toEqual(['w2']);
 	});
 });
+
+describe('webhooks do bridge no Papo (por usuário Discord, por canal)', () => {
+	it('registra e recupera o webhook do par (canal Papo, usuário Discord) com o token', () => {
+		const { store } = fixture();
+		store.upsertPapoWebhook({
+			webhook_id: 'pw1',
+			channel_id: 'chan-1',
+			discord_user_id: 'user-1',
+			name: 'Jenga (@jenga)',
+			display_name: 'Jenga',
+			avatar_sha: 'sha1',
+			token: 'token-1'
+		});
+
+		const byUser = store.getPapoWebhookByUser('chan-1', 'user-1');
+		expect(byUser?.webhook_id).toBe('pw1');
+		expect(byUser?.name).toBe('Jenga (@jenga)');
+		expect(byUser?.display_name).toBe('Jenga');
+		expect(byUser?.avatar_sha).toBe('sha1');
+		// o token só existe na criação: é a linha que permite editar/apagar as cópias depois
+		expect(byUser?.token).toBe('token-1');
+
+		const byId = store.getPapoWebhookById('pw1');
+		expect(byId?.channel_id).toBe('chan-1');
+		expect(byId?.discord_user_id).toBe('user-1');
+		expect(store.listPapoWebhooks().map((r) => r.webhook_id)).toEqual(['pw1']);
+	});
+
+	it('atualiza identidade do mesmo webhook sem duplicar a linha', () => {
+		const { store } = fixture();
+		store.upsertPapoWebhook({ webhook_id: 'pw1', channel_id: 'chan-1', discord_user_id: 'user-1', name: 'Jenga (@jenga)', token: 'token-1' });
+		store.upsertPapoWebhook({
+			webhook_id: 'pw1',
+			channel_id: 'chan-1',
+			discord_user_id: 'user-1',
+			name: 'Jotac (@jenga)',
+			display_name: 'Jotac',
+			avatar_sha: 'sha2',
+			token: 'token-1'
+		});
+
+		const row = store.getPapoWebhookByUser('chan-1', 'user-1');
+		expect(row?.name).toBe('Jotac (@jenga)');
+		expect(row?.display_name).toBe('Jotac');
+		expect(row?.avatar_sha).toBe('sha2');
+		expect(store.listPapoWebhooks()).toHaveLength(1);
+	});
+
+	it('webhook recriado para o mesmo usuário substitui a linha (índice único)', () => {
+		const { store } = fixture();
+		store.upsertPapoWebhook({ webhook_id: 'pw1', channel_id: 'chan-1', discord_user_id: 'user-1', name: 'Jenga (@jenga)', token: 'token-1' });
+		store.upsertPapoWebhook({ webhook_id: 'pw2', channel_id: 'chan-1', discord_user_id: 'user-1', name: 'Jenga (@jenga)', token: 'token-2' });
+
+		expect(store.getPapoWebhookByUser('chan-1', 'user-1')?.webhook_id).toBe('pw2');
+		expect(store.getPapoWebhookById('pw1')).toBeUndefined();
+	});
+
+	it('usuários Discord diferentes no mesmo canal têm webhooks diferentes', () => {
+		const { store } = fixture();
+		store.upsertPapoWebhook({ webhook_id: 'pw1', channel_id: 'chan-1', discord_user_id: 'user-1', name: 'jenga', token: 'token-1' });
+		store.upsertPapoWebhook({ webhook_id: 'pw2', channel_id: 'chan-1', discord_user_id: 'user-2', name: 'ana', token: 'token-2' });
+
+		expect(store.listPapoWebhooks().map((r) => r.webhook_id).sort()).toEqual(['pw1', 'pw2']);
+		store.deletePapoWebhook('pw1');
+		expect(store.getPapoWebhookById('pw1')).toBeUndefined();
+		expect(store.listPapoWebhooks().map((r) => r.webhook_id)).toEqual(['pw2']);
+	});
+
+	it('a cópia guarda o webhook que a enviou (credencial do edit/delete)', () => {
+		const { store } = fixture();
+		const link = store.upsertChannelLink({ papo_channel_id: 'chan-1', discord_channel_id: '111' });
+		store.mapMessage({
+			link_id: link.id,
+			direction: 'discord_to_papo',
+			papo_message_id: 'pm-1',
+			discord_message_id: 'dm-1',
+			chunk_index: 0,
+			chunk_total: 1,
+			webhook_copy: true,
+			webhook_id: 'pw1'
+		});
+
+		const map = store.findMapByPapo('pm-1')[0];
+		expect(map?.webhook_copy).toBe(1);
+		expect(map?.webhook_id).toBe('pw1');
+		// cópia de webhook não tem cartão nem rodapé
+		expect(map?.bridge_embed).toBeNull();
+		expect(map?.footer_base).toBeNull();
+	});
+});
