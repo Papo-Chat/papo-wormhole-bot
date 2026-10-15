@@ -35,7 +35,8 @@ const urlOf = (e: { url?: string | null }): string | undefined => (e.url ? e.url
  * Identidade da mídia: o caminho do URL, sem host nem query.
  * O Discord serve a mesma mídia por hosts diferentes (`cdn.discordapp.com` no anexo,
  * `media.discordapp.net` no embed) e com assinatura de proxy na query; o caminho é o que
- * permanece igual. Picker de GIF (Klipy/Giphy) chega como anexo **e** embed da mesma mídia.
+ * permanece igual. Previews que repetem o mesmo caminho são descartados; GIF provider URLs
+ * são encaminhadas ao backend para crawl, enquanto o re-hospedamento de mídia do Discord segue separado.
  */
 export const mediaKey = (url?: string | null): string | undefined => {
 	if (!url) return undefined;
