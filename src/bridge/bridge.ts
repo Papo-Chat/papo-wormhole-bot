@@ -2325,7 +2325,7 @@ function withGifSourceUrl(content: string, sourceUrl: string): string {
 			markAttempt();
 			const created = await this.sendToPapoSafe({
 				channelId: job.papoChannelId,
-				content: job.contentMode ? text : undefined,
+				content: job.contentMode && g === 0 ? text : undefined,
 				replyTo: extra ? lastPapoId : this.copyForDiscordMessage(job.replyRefDiscordId),
 				attachments,
 				embeds: embeds.length ? (embeds as ToPapoMessageJob['linkEmbeds']) : undefined
@@ -2391,7 +2391,7 @@ function withGifSourceUrl(content: string, sourceUrl: string): string {
 			chunk_index: extra ? EXTRA_CHUNK_BASE + group : job.chunkIndex,
 			chunk_total: job.chunkTotal,
 			rendered: extra ? null : text,
-			content_mode: Boolean(job.contentMode && !webhookCopy),
+			content_mode: Boolean(!extra && job.contentMode && !webhookCopy),
 			// cópia de webhook não tem cartão: `undefined` é o NULL de verdade (o JSON "null"
 			// seria lido como cartão pelo refresh de rodapé)
 			bridge_embed: extra || webhookCopy || mainEmbed == null ? undefined : mainEmbed,
