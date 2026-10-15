@@ -12,8 +12,6 @@ import {
 	type DiscordToPapoOptions,
 	type PreviewMedia
 } from './embeds.js';
-import { DISCORD_LIMITS, clampText } from './limits.js';
-import type { GiphyGif } from './giphy.js';
 
 /**
  * Preview de link como embed extra da ponte.
@@ -183,13 +181,4 @@ export function firstPapoPreview(
 		if (converted && Object.keys(converted).length) return converted;
 	}
 	return undefined;
-}
-
-/** GIF do picker do Papo como embed extra do Discord (o marcador cru não renderiza lá). */
-export function giphyEmbed(gif: GiphyGif): DiscordEmbedPayload {
-	return {
-		title: clampText(gif.title, DISCORD_LIMITS.embedTitleMax),
-		url: gif.pageUrl,
-		image: { url: gif.url }
-	};
 }
