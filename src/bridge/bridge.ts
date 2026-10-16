@@ -1201,7 +1201,7 @@ export class Bridge {
 		return message.attachments
 			.map((attachment) => [attachment.id, attachment.name ?? '', attachment.size, attachment.contentType ?? '', attachment.url].join(':'))
 			.sort()
-			.join('\\n');
+			.join('\n');
 	}
 
 	private rememberDiscordAttachmentSignature(messageId: string, signature: string): void {
@@ -1382,7 +1382,7 @@ export class Bridge {
 					.map((m) => ({ chunkIndex: m.chunk_index, chunkTotal: Math.max(chunks.length, m.chunk_total) }))
 			: chunks.map((_, i) => ({ chunkIndex: i, chunkTotal: chunks.length }));
 		const revision = fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : new Date().toISOString();
-		const attachmentsChanged = Boolean(link.bridge_attachments) &&
+		const attachmentsChanged = Boolean(link.bridge_attachments && link.bridge_edits) &&
 			previousAttachmentSignature !== currentAttachmentSignature;
 		if (attachmentsChanged) {
 			const sources: SourceRef[] = fresh.attachments.map((attachment) => ({
@@ -2633,7 +2633,7 @@ export class Bridge {
 		});
 		const groups = plan.groups.length ? plan.groups : [[]];
 		const refreshedText = plan.notes.length
-			? `${job.text}${job.text ? '\\n\\n' : ''}${plan.notes.map((note) => `> ${note}`).join('\\n')}`.trim()
+			? `${job.text}${job.text ? '\n\n' : ''}${plan.notes.map((note) => `> ${note}`).join('\n')}`.trim()
 			: job.text;
 		const previousIds = new Map(maps.filter((entry) => entry.papo_message_id).map((entry) => [entry.id, entry.papo_message_id!]));
 		const created: { group: number; messageId: string; embed?: PapoEmbedInput }[] = [];
