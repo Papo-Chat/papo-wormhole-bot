@@ -407,7 +407,7 @@ export class DiscordBridge {
 			try {
 				const row = this.opts.store?.getBridgeWebhookByUser(host.id, identity.userId);
 				const hooks = await host.fetchWebhooks();
-				let webhook = row ? hooks.find((w) => w.id === row.webhook_id) : undefined;
+				let webhook: Webhook | undefined = row ? hooks.find((w) => w.id === row.webhook_id) : undefined;
 				if (!webhook) webhook = hooks.find((w) => w.name === name && w.owner?.id === this.client.user?.id);
 				if (!webhook) {
 					webhook = (await this.createWebhookWithRotation(host, name, identity.avatarBuffer, hooks)) ?? undefined;
