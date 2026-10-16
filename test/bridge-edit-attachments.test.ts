@@ -92,7 +92,7 @@ describe('edições de attachment no Discord', () => {
         name: 'wordle.png',
         mime: 'image/png',
         sizeBytes: 20,
-        url: 'https://cdn.discordapp.com/attachments/1/2/wordle.png'
+        url: 'https://cdn.discordapp.com/attachments/1/2/wordle.png?ex=ffffffff&is=1&hm=aa'
       }]
     };
 
