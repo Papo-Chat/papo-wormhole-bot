@@ -410,7 +410,7 @@ export class DiscordBridge {
 				let webhook = row ? hooks.find((w) => w.id === row.webhook_id) : undefined;
 				if (!webhook) webhook = hooks.find((w) => w.name === name && w.owner?.id === this.client.user?.id);
 				if (!webhook) {
-					webhook = await this.createWebhookWithRotation(host, name, identity.avatarBuffer, hooks);
+					webhook = (await this.createWebhookWithRotation(host, name, identity.avatarBuffer, hooks)) ?? undefined;
 					if (!webhook) {
 						this.webhookFailedAt.set(host.id, Date.now());
 						return null;
