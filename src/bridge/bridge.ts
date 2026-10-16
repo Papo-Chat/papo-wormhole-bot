@@ -1327,7 +1327,6 @@ export class Bridge {
 	}
 
 	async onDiscordEdit(before: DiscordMessage | PartialDiscordMessage, after: DiscordMessage | PartialDiscordMessage): Promise<void> {
-		void before;
 		if (this.stopping) return;
 		const link = this.linkForDiscordChannel(after.channelId);
 		if (!link || (!link.bridge_edits && !link.bridge_embeds)) return;
@@ -1363,6 +1362,46 @@ export class Bridge {
 					.map((m) => ({ chunkIndex: m.chunk_index, chunkTotal: Math.max(chunks.length, m.chunk_total) }))
 			: chunks.map((_, i) => ({ chunkIndex: i, chunkTotal: chunks.length }));
 		const revision = fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : new Date().toISOString();
+		const attachmentFingerprint = (message: DiscordMessage | PartialDiscordMessage) =>
+			message.attachments
+				.map((attachment) => [attachment.id, attachment.name ?? '', attachment.size, attachment.contentType ?? '', attachment.url].join(':'))
+				.sort()
+				.join('\\n');
+		const attachmentsChanged = Boolean(link.bridge_attachments) &&
+			attachmentFingerprint(before) !== attachmentFingerprint(fresh);
+		if (attachmentsChanged) {
+			const sources: SourceRef[] = fresh.attachments.map((attachment) => ({
+				side: 'discord',
+				id: attachment.id,
+				name: attachment.name ?? 'arquivo',
+				mime: attachment.contentType ?? undefined,
+				sizeBytes: attachment.size,
+				url: attachment.url
+			}));
+			const attachmentJob: EditJob = {
+				kind: 'edit',
+				side: 'discord',
+				linkId: link.id,
+				sourceMessageId: fresh.id,
+				targetChannelId: link.papo_channel_id,
+				chunkIndex: 0,
+				chunkTotal: Math.max(1, chunks.length),
+				text: chunks[0] ?? '',
+				revision,
+				contentMode,
+				refreshAttachments: true,
+				sources,
+				replyRefDiscordId: fresh.reference?.messageId ?? undefined
+			};
+			this.outbox.enqueue({
+				linkId: link.id,
+				direction: 'to_papo',
+				kind: 'edit',
+				dedupeKey: `discord-attachment-edit:${fresh.id}`,
+				revision,
+				payload: { job: attachmentJob } satisfies Envelope
+			});
+		}
 		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
 		// e sem isso o cartão do Papo fica só com a URL escrita
 		const preview = link.bridge_embeds && !contentMode
@@ -1392,6 +1431,8 @@ export class Bridge {
 			}
 		}
 		for (const target of targets) {
+			// A dedicated job replaces the main copy and all attachment continuation messages.
+			if (attachmentsChanged && (target.chunkIndex === 0 || target.chunkIndex >= EXTRA_CHUNK_BASE)) continue;
 			if (link.bridge_edits) {
 				const job: EditJob = {
 					kind: 'edit',
