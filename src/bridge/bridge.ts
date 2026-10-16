@@ -1197,11 +1197,28 @@ export class Bridge {
 		return viaBridge ?? this.discord.isSelf(m.author?.id);
 	}
 
+	private discordAttachmentSignature(message: DiscordMessage | PartialDiscordMessage): string {
+		return message.attachments
+			.map((attachment) => [attachment.id, attachment.name ?? '', attachment.size, attachment.contentType ?? '', attachment.url].join(':'))
+			.sort()
+			.join('\\n');
+	}
+
+	private rememberDiscordAttachmentSignature(messageId: string, signature: string): void {
+		this.discordAttachmentSignatures.set(messageId, signature);
+		// Bound memory use in long-running bridge processes.
+		if (this.discordAttachmentSignatures.size > 5_000) {
+			const oldest = this.discordAttachmentSignatures.keys().next().value;
+			if (oldest) this.discordAttachmentSignatures.delete(oldest);
+		}
+	}
+
 	async onDiscordMessage(m: DiscordMessage): Promise<void> {
 		if (this.stopping) return;
 		if (await this.isSelfDiscordMessage(m)) return; // anti-loop
 		const link = this.linkForDiscordChannel(m.channelId);
 		if (!link) return;
+		this.rememberDiscordAttachmentSignature(m.id, this.discordAttachmentSignature(m));
 		if (this.store.findMapByDiscord(m.id).length) return;
 
 		const displayName = m.member?.displayName ?? m.author.displayName ?? m.author.username;
@@ -1341,6 +1358,9 @@ export class Bridge {
 			this.log.debug({ messageId: fresh.id }, 'edição de embed ponte: eco ignorado');
 			return;
 		}
+		const previousAttachmentSignature = this.discordAttachmentSignatures.get(fresh.id) ?? this.discordAttachmentSignature(before);
+		const currentAttachmentSignature = this.discordAttachmentSignature(fresh);
+		this.rememberDiscordAttachmentSignature(fresh.id, currentAttachmentSignature);
 		const maps = this.store.findMapByDiscord(fresh.id);
 		if (!maps.length && Date.now() - fresh.createdTimestamp > EDIT_MAP_GRACE_MS) {
 			// mensagem antiga que nunca foi ponte: não há destino a atualizar
@@ -1362,13 +1382,8 @@ export class Bridge {
 					.map((m) => ({ chunkIndex: m.chunk_index, chunkTotal: Math.max(chunks.length, m.chunk_total) }))
 			: chunks.map((_, i) => ({ chunkIndex: i, chunkTotal: chunks.length }));
 		const revision = fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : new Date().toISOString();
-		const attachmentFingerprint = (message: DiscordMessage | PartialDiscordMessage) =>
-			message.attachments
-				.map((attachment) => [attachment.id, attachment.name ?? '', attachment.size, attachment.contentType ?? '', attachment.url].join(':'))
-				.sort()
-				.join('\\n');
 		const attachmentsChanged = Boolean(link.bridge_attachments) &&
-			attachmentFingerprint(before) !== attachmentFingerprint(fresh);
+			previousAttachmentSignature !== currentAttachmentSignature;
 		if (attachmentsChanged) {
 			const sources: SourceRef[] = fresh.attachments.map((attachment) => ({
 				side: 'discord',
@@ -1889,6 +1904,7 @@ export class Bridge {
 	 * Avatar do autor Discord já baixado neste processo (`hash` → bytes/sha). O hash é a chave:
 	 * avatar novo é baixado uma vez; falha tem janela de re-tentativa para não martelar o CDN.
 	 */
+	private discordAttachmentSignatures = new Map<string, string>();
 	private readonly discordAvatars = new Map<
 		string,
 		{ hash: string; sha?: string; buffer?: Buffer; format?: string; at: number }
