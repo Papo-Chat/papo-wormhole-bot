@@ -2632,6 +2632,9 @@ export class Bridge {
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
 		});
 		const groups = plan.groups.length ? plan.groups : [[]];
+		const refreshedText = plan.notes.length
+			? `${job.text}${job.text ? '\\n\\n' : ''}${plan.notes.map((note) => `> ${note}`).join('\\n')}`.trim()
+			: job.text;
 		const previousIds = new Map(maps.filter((entry) => entry.papo_message_id).map((entry) => [entry.id, entry.papo_message_id!]));
 		const created: { group: number; messageId: string; embed?: PapoEmbedInput }[] = [];
 		let mainEmbed: PapoEmbedInput | undefined;
@@ -2639,7 +2642,7 @@ export class Bridge {
 		const summary = await this.reactionSummaryForMap(mainMap, 'papo');
 		const content = this.webhookCopyContent(
 			mainMap.reply_note ?? '',
-			job.text,
+			refreshedText,
 			summary,
 			PAPO_LIMITS.contentMax
 		);
@@ -2650,12 +2653,12 @@ export class Bridge {
 				let message: PapoMessage;
 				let embed: PapoEmbedInput | undefined;
 				if (group === 0 && !webhookMode) {
-					embed = await this.papoCopyEmbed(mainMap, mainMap.content_mode || job.contentMode ? '' : job.text);
+					embed = await this.papoCopyEmbed(mainMap, mainMap.content_mode || job.contentMode ? '' : refreshedText);
 					mainEmbed = embed;
 					const embeds = [embed, ...this.mapPreviews<PapoEmbedInput>(mainMap)];
 					message = await this.sendToPapoSafe({
 						channelId: job.targetChannelId,
-						content: mainMap.content_mode || job.contentMode ? clampText(job.text, PAPO_LIMITS.contentMax) : undefined,
+						content: mainMap.content_mode || job.contentMode ? clampText(refreshedText, PAPO_LIMITS.contentMax) : undefined,
 						replyTo: this.copyForDiscordMessage(job.replyRefDiscordId),
 						attachments,
 						embeds
@@ -2712,7 +2715,7 @@ export class Bridge {
 				newIdByMapId.set(row.id, item.messageId);
 				this.store.updateMapDestination(row.id, 'papo', item.messageId);
 				this.store.updateMapSnapshot(row.id, {
-					rendered: item.group === 0 ? job.text : null,
+					rendered: item.group === 0 ? refreshedText : null,
 					bridge_embed: webhookMode ? null : (item.group === 0 ? mainEmbed ?? null : item.embed ?? null),
 					footer_base: item.group === 0 ? mainMap.footer_base : null,
 					...(item.group === 0 ? {} : { link_embeds: null }),
