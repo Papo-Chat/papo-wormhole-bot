@@ -2608,7 +2608,6 @@ export class Bridge {
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
 		});
 		const groups = plan.groups.length ? plan.groups : [[]];
-		const previousExtras = maps.filter((entry) => entry.chunk_index >= EXTRA_CHUNK_BASE);
 		const previousIds = new Map(maps.filter((entry) => entry.papo_message_id).map((entry) => [entry.id, entry.papo_message_id!]));
 		const created: { group: number; messageId: string; embed?: PapoEmbedInput }[] = [];
 		let mainEmbed: PapoEmbedInput | undefined;
@@ -2680,17 +2679,19 @@ export class Bridge {
 		}
 
 		const mappedIds = new Set<number>();
+		const newIdByMapId = new Map<number, string>();
 		for (const item of created) {
 			const chunkIndex = item.group === 0 ? 0 : EXTRA_CHUNK_BASE + item.group;
 			let row = maps.find((entry) => entry.chunk_index === chunkIndex);
 			if (row) {
 				mappedIds.add(row.id);
+				newIdByMapId.set(row.id, item.messageId);
 				this.store.updateMapDestination(row.id, 'papo', item.messageId);
 				this.store.updateMapSnapshot(row.id, {
 					rendered: item.group === 0 ? job.text : null,
 					bridge_embed: webhookMode ? null : (item.group === 0 ? mainEmbed ?? null : item.embed ?? null),
 					footer_base: item.group === 0 ? mainMap.footer_base : null,
-					link_embeds: item.group === 0 ? mainMap.link_embeds : null,
+					...(item.group === 0 ? {} : { link_embeds: null }),
 					edit_revision: job.revision ?? null,
 					content_mode: item.group === 0 && !webhookMode ? Boolean(mainMap.content_mode || job.contentMode) : false
 				});
@@ -2730,7 +2731,8 @@ export class Bridge {
 
 		for (const [id, oldMessageId] of previousIds) {
 			const row = maps.find((entry) => entry.id === id);
-			if (!row || mappedIds.has(id) || oldMessageId === row.papo_message_id) continue;
+			const newMessageId = newIdByMapId.get(id);
+			if (!row || !newMessageId || oldMessageId === newMessageId) continue;
 			try {
 				if (webhookMode && webhook) await this.papoWebhooks!.delete(webhook, oldMessageId);
 				else await this.api.deleteMessage(oldMessageId);
