@@ -146,6 +146,11 @@ export class DiscordBridge {
 	 */
 	private webhooks = new Map<string, Webhook>();
 	private webhookById = new Map<string, Webhook>();
+	/** Ordem de criação dos webhooks próprios, em memória; snowflake serve de fallback após restart. */
+	private webhookCreatedAt = new Map<string, number>();
+	/** Serializa criações/rotações por canal para evitar ultrapassar o orçamento em concorrência. */
+	private webhookLocks = new Map<string, Promise<void>>();
+	private readonly webhookBudget: number;
 	/** Canal linkado → canal dono do webhook (thread usa o canal pai). */
 	private webhookHostOf = new Map<string, string>();
 	/** Falha de criação por canal (limite de webhooks, sem Manage Webhooks): re-tenta após o TTL. */
@@ -162,9 +167,11 @@ export class DiscordBridge {
 			logger?: Logger;
 			presences?: boolean;
 			store?: Store;
+			webhookBudget?: number;
 		},
 	) {
 		this.log = opts.logger ?? scoped('discord');
+		this.webhookBudget = Math.max(1, Math.min(15, Math.floor(opts.webhookBudget ?? 15)));
 		this.client = new Client({
 			intents: [
 				GatewayIntentBits.Guilds,
@@ -386,37 +393,154 @@ export class DiscordBridge {
 			await this.applyWebhookIdentity(cached, name, identity);
 			return cached;
 		}
-		const failedAt = this.webhookFailedAt.get(host.id);
-		if (failedAt && Date.now() - failedAt < DiscordBridge.WEBHOOK_RETRY_MS) return null;
-		try {
-			const row = this.opts.store?.getBridgeWebhookByUser(host.id, identity.userId);
-			const hooks = await host.fetchWebhooks();
-			let webhook = row ? hooks.find((w) => w.id === row.webhook_id) : undefined;
-			if (!webhook) webhook = hooks.find((w) => w.name === name);
-			if (!webhook) {
-				try {
-					webhook = await host.createWebhook({
-						name,
-						...(identity.avatarBuffer ? { avatar: identity.avatarBuffer } : {}),
-						reason: 'papo bridge'
-					});
-				} catch (err) {
-					// limite de webhooks do canal ou sem Manage Webhooks: re-tenta após o TTL
-					this.webhookFailedAt.set(host.id, Date.now());
-					this.log.debug({ err, channelId: host.id }, 'webhook do usuário indisponível: envio pelo cartão do bot');
-					return null;
-				}
+
+		return this.withWebhookLock(host.id, async () => {
+			// Outra mensagem pode ter criado o webhook enquanto esta esperava o lock.
+			const resolved = this.webhooks.get(key);
+			if (resolved) {
+				await this.applyWebhookIdentity(resolved, name, identity);
+				return resolved;
 			}
-			this.webhooks.set(key, webhook);
-			this.webhookById.set(webhook.id, webhook);
-			await this.applyWebhookIdentity(webhook, name, identity);
-			return webhook;
-		} catch (err) {
-			this.log.debug({ err, channelId }, 'falha ao resolver o webhook do usuário');
-			return null;
+			const failedAt = this.webhookFailedAt.get(host.id);
+			if (failedAt && Date.now() - failedAt < DiscordBridge.WEBHOOK_RETRY_MS) return null;
+
+			try {
+				const row = this.opts.store?.getBridgeWebhookByUser(host.id, identity.userId);
+				const hooks = await host.fetchWebhooks();
+				let webhook = row ? hooks.find((w) => w.id === row.webhook_id) : undefined;
+				if (!webhook) webhook = hooks.find((w) => w.name === name);
+				if (!webhook) {
+					webhook = await this.createWebhookWithRotation(host, name, identity.avatarBuffer, hooks);
+					if (!webhook) {
+						this.webhookFailedAt.set(host.id, Date.now());
+						return null;
+					}
+				}
+				this.webhookFailedAt.delete(host.id);
+				this.webhooks.set(key, webhook);
+				this.webhookById.set(webhook.id, webhook);
+				this.rememberWebhook(webhook);
+				await this.applyWebhookIdentity(webhook, name, identity);
+				return webhook;
+			} catch (err) {
+				this.log.debug({ err, channelId }, 'falha ao resolver o webhook do usuário');
+				return null;
+			}
+		});
+	}
+
+	/** Mantém uma fila por canal mesmo quando diferentes usuários chegam ao mesmo tempo. */
+	private async withWebhookLock<T>(channelId: string, run: () => Promise<T>): Promise<T> {
+		const previous = this.webhookLocks.get(channelId) ?? Promise.resolve();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const tail = previous.then(() => gate);
+		this.webhookLocks.set(channelId, tail);
+		await previous.catch(() => undefined);
+		try {
+			return await run();
+		} finally {
+			release();
+			if (this.webhookLocks.get(channelId) === tail) this.webhookLocks.delete(channelId);
 		}
 	}
 
+	/** Criação FIFO. Só remove webhooks registrados como pertencentes ao bridge. */
+	private async createWebhookWithRotation(
+		host: TextChannel | NewsChannel,
+		name: string,
+		avatarBuffer: Buffer | undefined,
+		initialHooks: import('discord.js').Collection<string, Webhook>
+	): Promise<Webhook | null> {
+		let hooks = initialHooks;
+		const owned = (): Webhook[] => {
+			const ownedIds = this.opts.store?.listBridgeWebhookIds(host.id) ?? [];
+			const found = ownedIds
+				.map((id) => hooks.get(id))
+				.filter((webhook): webhook is Webhook => Boolean(webhook));
+			for (const webhook of found) this.rememberWebhook(webhook);
+			return found.sort((a, b) =>
+				(this.webhookCreatedAt.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+				(this.webhookCreatedAt.get(b.id) ?? Number.MAX_SAFE_INTEGER) || a.id.localeCompare(b.id)
+			);
+		};
+		const removeOldest = async (current: Webhook[]): Promise<boolean> => {
+			const oldest = current[0];
+			if (!oldest) return false;
+			try {
+				await oldest.delete('papo bridge webhook rotation');
+			} catch (err) {
+				this.log.warn({ err, channelId: host.id, webhookId: oldest.id }, 'não foi possível remover webhook antigo do bridge');
+				return false;
+			}
+			this.forgetWebhook(oldest.id);
+			this.opts.store?.deleteBridgeWebhook(oldest.id);
+			hooks.delete(oldest.id);
+			this.log.info({ channelId: host.id, webhookId: oldest.id, budget: this.webhookBudget }, 'webhook antigo do bridge rotacionado');
+			return true;
+		};
+
+		// Com orçamento menor que 15, reduz gradualmente uma pool antiga até liberar espaço.
+		let pool = owned();
+		while (pool.length >= this.webhookBudget) {
+			if (!(await removeOldest(pool))) return null;
+			pool = owned();
+		}
+
+		const create = () => host.createWebhook({
+			name,
+			...(avatarBuffer ? { avatar: avatarBuffer } : {}),
+			reason: 'papo bridge'
+		});
+		try {
+			return await create();
+		} catch (err) {
+			if (!this.isWebhookLimitError(err)) {
+				this.log.debug({ err, channelId: host.id }, 'webhook do usuário indisponível: envio pelo cartão do bot');
+				return null;
+			}
+			// Outros bots/usuários podem consumir os 15 slots. Só liberamos um slot nosso.
+			hooks = await host.fetchWebhooks().catch(() => null) ?? hooks;
+			pool = owned();
+			if (!(await removeOldest(pool))) {
+				this.log.debug({ err, channelId: host.id }, 'limite de webhooks atingido sem webhook próprio para rotacionar');
+				return null;
+			}
+			try {
+				return await create();
+			} catch (retryErr) {
+				this.log.debug({ err: retryErr, channelId: host.id }, 'webhook indisponível após rotação');
+				return null;
+			}
+		}
+	}
+
+	private isWebhookLimitError(err: unknown): boolean {
+		const value = err as { code?: number; rawError?: { code?: number } };
+		return value?.code === 30007 || value?.rawError?.code === 30007;
+	}
+
+	private webhookSnowflakeTime(webhookId: string): number {
+		try {
+			return Number((BigInt(webhookId) >> 22n) + 1_420_070_400_000n);
+		} catch {
+			return Date.now();
+		}
+	}
+
+	private rememberWebhook(webhook: Webhook): void {
+		if (!this.webhookCreatedAt.has(webhook.id)) {
+			this.webhookCreatedAt.set(webhook.id, this.webhookSnowflakeTime(webhook.id));
+		}
+	}
+
+	private forgetWebhook(webhookId: string): void {
+		this.webhookCreatedAt.delete(webhookId);
+		this.webhookById.delete(webhookId);
+		for (const [key, webhook] of this.webhooks) {
+			if (webhook.id === webhookId) this.webhooks.delete(key);
+		}
+	}
 	/**
 	 * Mantém nome/avatar do webhook sincronizados com a identidade Papo (apelido ou
 	 * avatar mudados editam o webhook) e registra a posse em `bridge_webhooks`.
@@ -426,6 +550,7 @@ export class DiscordBridge {
 		name: string,
 		identity: { userId: string; avatarSha?: string; avatarBuffer?: Buffer }
 	): Promise<void> {
+		this.rememberWebhook(webhook);
 		const row = this.opts.store?.getBridgeWebhookById(webhook.id);
 		const avatarChanged = identity.avatarBuffer !== undefined && (row?.avatar_sha ?? undefined) !== identity.avatarSha;
 		let appliedSha = row?.avatar_sha ?? null;
