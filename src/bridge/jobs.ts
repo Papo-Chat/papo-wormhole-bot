@@ -100,6 +100,12 @@ export interface EditJob {
 	revision?: string;
 	/** Keep source-provider links in Papo content instead of custom bridge-card text. */
 	contentMode?: boolean;
+	/** When true, replace the Papo copy so current Discord attachments are mirrored. */
+	refreshAttachments?: boolean;
+	/** Current source attachments, downloaded while the job runs. */
+	sources?: SourceRef[];
+	/** Original Discord reply; used when recreating a Papo message with changed attachments. */
+	replyRefDiscordId?: string;
 }
 
 export interface DeleteJob {
