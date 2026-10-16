@@ -1378,6 +1378,14 @@ export class Bridge {
 				sizeBytes: attachment.size,
 				url: attachment.url
 			}));
+			const hosted = new Set(fresh.attachments.map((attachment) => mediaKey(attachment.url)).filter(Boolean) as string[]);
+			if (link.bridge_embeds) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
+			this.addDiscordMediaSources(
+				fresh.id,
+				discordMediaLinksInContent(fresh.content ?? '').map((url) => ({ url, mime: mimeFromUrl(url) })),
+				sources,
+				hosted
+			);
 			const attachmentJob: EditJob = {
 				kind: 'edit',
 				side: 'discord',
@@ -2593,7 +2601,7 @@ export class Bridge {
 	 * reaponta os mapas e remove as mensagens anteriores/continuações que sobraram.
 	 */
 	private async replaceDiscordCopyAttachments(job: EditJob, maps: MessageMapRow[], mainMap: MessageMapRow): Promise<void> {
-		if (!mainMap.papo_message_id) throw new RetryableError('cópia do Papo ainda não mapeada');
+		if (!mainMap.papo_message_id || mainMap.chunk_index !== 0) throw new RetryableError('cópia principal do Papo ainda não mapeada');
 		if (mainMap.direction !== 'discord_to_papo') return;
 
 		const webhookMode = Boolean(mainMap.webhook_copy);
