@@ -511,6 +511,17 @@ export class Store {
 		this.db.prepare(`UPDATE message_map SET ${sets.join(', ')} WHERE id = ?`).run(...args);
 	}
 
+	/** Repoints an existing bridge mapping after a destination message is recreated. */
+	updateMapDestination(id: number, destination: 'papo' | 'discord', messageId: string): void {
+		const column = destination === 'papo' ? 'papo_message_id' : 'discord_message_id';
+		this.db.prepare(`UPDATE message_map SET ${column} = ?, deleted = 0 WHERE id = ?`).run(messageId, id);
+	}
+
+	/** Removes a mapping row when attachment continuation messages are no longer needed. */
+	deleteMap(id: number): void {
+		this.db.prepare('DELETE FROM message_map WHERE id = ?').run(id);
+	}
+
 	findMapByPapo(papoMessageId: string): MessageMapRow[] {
 		return rows<MessageMapRow>(
 			this.db

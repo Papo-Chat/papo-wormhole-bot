@@ -1197,11 +1197,28 @@ export class Bridge {
 		return viaBridge ?? this.discord.isSelf(m.author?.id);
 	}
 
+	private discordAttachmentSignature(message: DiscordMessage | PartialDiscordMessage): string {
+		return message.attachments
+			.map((attachment) => [attachment.id, attachment.name ?? '', attachment.size, attachment.contentType ?? '', attachment.url].join(':'))
+			.sort()
+			.join('\n');
+	}
+
+	private rememberDiscordAttachmentSignature(messageId: string, signature: string): void {
+		this.discordAttachmentSignatures.set(messageId, signature);
+		// Bound memory use in long-running bridge processes.
+		if (this.discordAttachmentSignatures.size > 5_000) {
+			const oldest = this.discordAttachmentSignatures.keys().next().value;
+			if (oldest) this.discordAttachmentSignatures.delete(oldest);
+		}
+	}
+
 	async onDiscordMessage(m: DiscordMessage): Promise<void> {
 		if (this.stopping) return;
 		if (await this.isSelfDiscordMessage(m)) return; // anti-loop
 		const link = this.linkForDiscordChannel(m.channelId);
 		if (!link) return;
+		this.rememberDiscordAttachmentSignature(m.id, this.discordAttachmentSignature(m));
 		if (this.store.findMapByDiscord(m.id).length) return;
 
 		const displayName = m.member?.displayName ?? m.author.displayName ?? m.author.username;
@@ -1327,7 +1344,6 @@ export class Bridge {
 	}
 
 	async onDiscordEdit(before: DiscordMessage | PartialDiscordMessage, after: DiscordMessage | PartialDiscordMessage): Promise<void> {
-		void before;
 		if (this.stopping) return;
 		const link = this.linkForDiscordChannel(after.channelId);
 		if (!link || (!link.bridge_edits && !link.bridge_embeds)) return;
@@ -1342,6 +1358,9 @@ export class Bridge {
 			this.log.debug({ messageId: fresh.id }, 'edição de embed ponte: eco ignorado');
 			return;
 		}
+		const previousAttachmentSignature = this.discordAttachmentSignatures.get(fresh.id) ?? this.discordAttachmentSignature(before);
+		const currentAttachmentSignature = this.discordAttachmentSignature(fresh);
+		this.rememberDiscordAttachmentSignature(fresh.id, currentAttachmentSignature);
 		const maps = this.store.findMapByDiscord(fresh.id);
 		if (!maps.length && Date.now() - fresh.createdTimestamp > EDIT_MAP_GRACE_MS) {
 			// mensagem antiga que nunca foi ponte: não há destino a atualizar
@@ -1363,6 +1382,49 @@ export class Bridge {
 					.map((m) => ({ chunkIndex: m.chunk_index, chunkTotal: Math.max(chunks.length, m.chunk_total) }))
 			: chunks.map((_, i) => ({ chunkIndex: i, chunkTotal: chunks.length }));
 		const revision = fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : new Date().toISOString();
+		const attachmentsChanged = Boolean(link.bridge_attachments && link.bridge_edits) &&
+			previousAttachmentSignature !== currentAttachmentSignature;
+		if (attachmentsChanged) {
+			const sources: SourceRef[] = fresh.attachments.map((attachment) => ({
+				side: 'discord',
+				id: attachment.id,
+				name: attachment.name ?? 'arquivo',
+				mime: attachment.contentType ?? undefined,
+				sizeBytes: attachment.size,
+				url: attachment.url
+			}));
+			const hosted = new Set(fresh.attachments.map((attachment) => mediaKey(attachment.url)).filter(Boolean) as string[]);
+			if (link.bridge_embeds) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
+			this.addDiscordMediaSources(
+				fresh.id,
+				discordMediaLinksInContent(fresh.content ?? '').map((url) => ({ url, mime: mimeFromUrl(url) })),
+				sources,
+				hosted
+			);
+			const attachmentJob: EditJob = {
+				kind: 'edit',
+				side: 'discord',
+				linkId: link.id,
+				sourceMessageId: fresh.id,
+				targetChannelId: link.papo_channel_id,
+				chunkIndex: 0,
+				chunkTotal: Math.max(1, chunks.length),
+				text: chunks[0] ?? '',
+				revision,
+				contentMode,
+				refreshAttachments: true,
+				sources,
+				replyRefDiscordId: fresh.reference?.messageId ?? undefined
+			};
+			this.outbox.enqueue({
+				linkId: link.id,
+				direction: 'to_papo',
+				kind: 'edit',
+				dedupeKey: `discord-attachment-edit:${fresh.id}`,
+				revision,
+				payload: { job: attachmentJob } satisfies Envelope
+			});
+		}
 		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
 		// e sem isso o cartão do Papo fica só com a URL escrita
 		const preview = link.bridge_embeds && !contentMode
@@ -1392,6 +1454,8 @@ export class Bridge {
 			}
 		}
 		for (const target of targets) {
+			// A dedicated job replaces the main copy and all attachment continuation messages.
+			if (attachmentsChanged && (target.chunkIndex === 0 || target.chunkIndex >= EXTRA_CHUNK_BASE)) continue;
 			if (link.bridge_edits) {
 				const job: EditJob = {
 					kind: 'edit',
@@ -1840,6 +1904,7 @@ export class Bridge {
 	 * Avatar do autor Discord já baixado neste processo (`hash` → bytes/sha). O hash é a chave:
 	 * avatar novo é baixado uma vez; falha tem janela de re-tentativa para não martelar o CDN.
 	 */
+	private discordAttachmentSignatures = new Map<string, string>();
 	private readonly discordAvatars = new Map<
 		string,
 		{ hash: string; sha?: string; buffer?: Buffer; format?: string; at: number }
@@ -2469,6 +2534,13 @@ export class Bridge {
 			return;
 		}
 
+		if (job.refreshAttachments) {
+			if (job.side !== 'discord') return;
+			const sourceMaps = this.store.findMapByDiscord(job.sourceMessageId);
+			const primary = sourceMaps.find((entry) => entry.chunk_index === 0) ?? map;
+			return this.replaceDiscordCopyAttachments(job, sourceMaps, primary);
+		}
+
 		if (job.side === 'papo') {
 			// direction discord_to_papo: a mensagem do Papo é cópia nossa e a do Discord é de
 			// outro autor — o Discord recusa a edição (50005).
@@ -2536,6 +2608,166 @@ export class Bridge {
 		const embed = await this.papoCopyEmbed(map, job.text);
 		await this.api.editMessage(map.papo_message_id, '', [embed, ...this.mapPreviews<PapoEmbedInput>(map)]);
 		this.store.updateMapSnapshot(map.id, { rendered: job.text, bridge_embed: embed, edit_revision: job.revision ?? null });
+	}
+
+
+	/**
+	 * O endpoint de edição do Papo aceita texto/embeds, mas não substitui anexos.
+	 * Quando a origem Discord troca os arquivos, recria a cópia com os anexos atuais,
+	 * reaponta os mapas e remove as mensagens anteriores/continuações que sobraram.
+	 */
+	private async replaceDiscordCopyAttachments(job: EditJob, maps: MessageMapRow[], mainMap: MessageMapRow): Promise<void> {
+		if (!mainMap.papo_message_id || mainMap.chunk_index !== 0) throw new RetryableError('cópia principal do Papo ainda não mapeada');
+		if (mainMap.direction !== 'discord_to_papo') return;
+
+		const webhookMode = Boolean(mainMap.webhook_copy);
+		const webhook = webhookMode ? this.papoWebhooks?.refFor(mainMap.webhook_id) : null;
+		if (webhookMode && !webhook) {
+			this.log.warn({ sourceMessageId: job.sourceMessageId, webhookId: mainMap.webhook_id }, 'anexos da cópia não atualizados: credencial do webhook indisponível');
+			return;
+		}
+
+		const plan = await prepareAttachments(this.sourcesToAttachments(job.sources ?? []), {
+			maxFileBytes: PAPO_LIMITS.attachmentMaxBytes,
+			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
+		});
+		const groups = plan.groups.length ? plan.groups : [[]];
+		const refreshedText = plan.notes.length
+			? `${job.text}${job.text ? '\n\n' : ''}${plan.notes.map((note) => `> ${note}`).join('\n')}`.trim()
+			: job.text;
+		const previousIds = new Map(maps.filter((entry) => entry.papo_message_id).map((entry) => [entry.id, entry.papo_message_id!]));
+		const created: { group: number; messageId: string; embed?: PapoEmbedInput }[] = [];
+		let mainEmbed: PapoEmbedInput | undefined;
+		let previousId: string | undefined;
+		const summary = await this.reactionSummaryForMap(mainMap, 'papo');
+		const content = this.webhookCopyContent(
+			mainMap.reply_note ?? '',
+			refreshedText,
+			summary,
+			PAPO_LIMITS.contentMax
+		);
+
+		try {
+			for (let group = 0; group < groups.length; group++) {
+				const attachments = groups[group]!.map((file) => ({ name: file.name, data: file.data, mime: file.mime }));
+				let message: PapoMessage;
+				let embed: PapoEmbedInput | undefined;
+				if (group === 0 && !webhookMode) {
+					embed = await this.papoCopyEmbed(mainMap, mainMap.content_mode || job.contentMode ? '' : refreshedText);
+					mainEmbed = embed;
+					const embeds = [embed, ...this.mapPreviews<PapoEmbedInput>(mainMap)];
+					message = await this.sendToPapoSafe({
+						channelId: job.targetChannelId,
+						content: mainMap.content_mode || job.contentMode ? clampText(refreshedText, PAPO_LIMITS.contentMax) : undefined,
+						replyTo: this.copyForDiscordMessage(job.replyRefDiscordId),
+						attachments,
+						embeds
+					});
+				} else if (group === 0) {
+					const sent = await this.papoWebhooks!.send(webhook!, job.targetChannelId, {
+						content,
+						...(job.replyRefDiscordId ? { replyTo: this.copyForDiscordMessage(job.replyRefDiscordId) } : {}),
+						attachments,
+						externalMessageId: `discord:${job.sourceMessageId}:attachment-refresh:${job.revision ?? Date.now()}:${group}`
+					});
+					if (!sent) throw new RetryableError('webhook do Papo não aceitou a substituição dos anexos');
+					message = sent;
+				} else if (webhookMode) {
+					const sent = await this.papoWebhooks!.send(webhook!, job.targetChannelId, {
+						...(previousId ? { replyTo: previousId } : {}),
+						attachments,
+						externalMessageId: `discord:${job.sourceMessageId}:attachment-refresh:${job.revision ?? Date.now()}:${group}`
+					});
+					if (!sent) throw new RetryableError('webhook do Papo não aceitou a continuação dos anexos');
+					message = sent;
+				} else {
+					embed = buildPapoBridgeEmbed({
+						authorName: mainMap.author_label || 'Discord',
+						description: `📎 continuação de anexos (${group + 1}/${groups.length})`,
+						footerText: clampText(`${mainMap.footer_base ?? 'Discord'} · 📎 ${group + 1}/${groups.length}`, PAPO_LIMITS.embedFooterMax),
+						colorHex: '#5865F2'
+					});
+					message = await this.sendToPapoSafe({
+						channelId: job.targetChannelId,
+						replyTo: previousId,
+						attachments,
+						embeds: [embed]
+					});
+				}
+				previousId = message.id;
+				created.push({ group, messageId: message.id, ...(embed ? { embed } : {}) });
+			}
+		} catch (err) {
+			await Promise.allSettled(created.map(async (item) => {
+				if (webhookMode && webhook) await this.papoWebhooks!.delete(webhook, item.messageId);
+				else await this.api.deleteMessage(item.messageId);
+			}));
+			throw err;
+		}
+
+		const mappedIds = new Set<number>();
+		const newIdByMapId = new Map<number, string>();
+		for (const item of created) {
+			const chunkIndex = item.group === 0 ? 0 : EXTRA_CHUNK_BASE + item.group;
+			let row = maps.find((entry) => entry.chunk_index === chunkIndex);
+			if (row) {
+				mappedIds.add(row.id);
+				newIdByMapId.set(row.id, item.messageId);
+				this.store.updateMapDestination(row.id, 'papo', item.messageId);
+				this.store.updateMapSnapshot(row.id, {
+					rendered: item.group === 0 ? refreshedText : null,
+					bridge_embed: webhookMode ? null : (item.group === 0 ? mainEmbed ?? null : item.embed ?? null),
+					footer_base: item.group === 0 ? mainMap.footer_base : null,
+					...(item.group === 0 ? {} : { link_embeds: null }),
+					edit_revision: job.revision ?? null,
+					content_mode: item.group === 0 && !webhookMode ? Boolean(mainMap.content_mode || job.contentMode) : false
+				});
+			} else {
+				this.store.mapMessage({
+					link_id: mainMap.link_id,
+					direction: 'discord_to_papo',
+					papo_message_id: item.messageId,
+					discord_message_id: mainMap.discord_message_id,
+					chunk_index: chunkIndex,
+					chunk_total: mainMap.chunk_total,
+					rendered: null,
+					bridge_embed: webhookMode ? undefined : item.embed,
+					footer_base: null,
+					link_embeds: null,
+					author_label: mainMap.author_label,
+					webhook_copy: webhookMode,
+					webhook_id: webhookMode ? mainMap.webhook_id : null
+				});
+				const inserted = this.store.findMapByPapo(item.messageId)[0];
+				if (inserted) mappedIds.add(inserted.id);
+			}
+		}
+
+		const obsolete = maps.filter((entry) => entry.id !== mainMap.id && entry.chunk_index >= EXTRA_CHUNK_BASE && !mappedIds.has(entry.id));
+		for (const entry of obsolete) {
+			if (entry.papo_message_id) {
+				try {
+					if (webhookMode && webhook) await this.papoWebhooks!.delete(webhook, entry.papo_message_id);
+					else await this.api.deleteMessage(entry.papo_message_id);
+				} catch (err) {
+					this.log.debug({ err, papoMessageId: entry.papo_message_id }, 'continuação antiga não pôde ser removida');
+				}
+			}
+			this.store.deleteMap(entry.id);
+		}
+
+		for (const [id, oldMessageId] of previousIds) {
+			const row = maps.find((entry) => entry.id === id);
+			const newMessageId = newIdByMapId.get(id);
+			if (!row || !newMessageId || oldMessageId === newMessageId) continue;
+			try {
+				if (webhookMode && webhook) await this.papoWebhooks!.delete(webhook, oldMessageId);
+				else await this.api.deleteMessage(oldMessageId);
+			} catch (err) {
+				this.log.debug({ err, papoMessageId: oldMessageId }, 'mensagem substituída não pôde ser removida');
+			}
+		}
+		this.log.debug({ sourceMessageId: job.sourceMessageId, attachments: job.sources?.length ?? 0 }, 'anexos editados sincronizados com o Papo');
 	}
 
 	/**

@@ -39,6 +39,8 @@ const EnvSchema = z.object({
 	/** Limite de upload assumido no lado Discord (bytes). Padrão: 20 MB (free). */
 	DISCORD_MAX_FILE_BYTES: z.coerce.number().int().min(1024).default(20 * 1024 * 1024),
 	DISCORD_MAX_MESSAGES_PER_5S: z.coerce.number().int().min(1).default(4),
+	/** Quantidade máxima de webhooks do bridge por canal (Discord permite até 15). */
+	WEBHOOK_BUDGET: z.coerce.number().int().min(1).max(15).default(15),
 
 	// ── Bridge ────────────────────────────────────────────
 	/** URL pública (HTTPS) do media server; sem ela o avatar do Papo não tem ícone no Discord. */
@@ -74,6 +76,7 @@ export interface Config {
 		guildId?: string;
 		maxFileBytes: number;
 		maxMessagesPer5s: number;
+		webhookBudget?: number;
 	};
 	bridge: {
 		dataDir: string;
@@ -121,7 +124,8 @@ export function loadConfig(): Config {
 			token: e.DISCORD_TOKEN,
 			guildId: e.DISCORD_GUILD_ID,
 			maxFileBytes: e.DISCORD_MAX_FILE_BYTES,
-			maxMessagesPer5s: e.DISCORD_MAX_MESSAGES_PER_5S
+			maxMessagesPer5s: e.DISCORD_MAX_MESSAGES_PER_5S,
+			webhookBudget: e.WEBHOOK_BUDGET
 		},
 		bridge: {
 			dataDir,
