@@ -466,7 +466,7 @@ export class Bridge {
 	private async warmPapoEmojis(...texts: (string | null | undefined)[]): Promise<void> {
 		const seen = new Set<string>();
 		for (const text of texts) {
-			for (const match of (text ?? '').matchAll(/<(a?):([A-Za-z0-9_]+):(\\d+)>/g)) {
+			for (const match of (text ?? '').matchAll(/<(a?):([A-Za-z0-9_]+):(\d+)>/g)) {
 				const [, animatedFlag, name, id] = match;
 				if (!name || !id || seen.has(name.toLowerCase())) continue;
 				seen.add(name.toLowerCase());
