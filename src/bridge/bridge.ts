@@ -426,7 +426,8 @@ export class Bridge {
 			discordRoleLabel: (id) => this.discord.roleName(id),
 			discordEmoji: (name) => ({
 				token: this.emojis.tokenForDiscord(name, this.guildEmojis, this.appEmojis)
-			})
+			}),
+			papoEmojiName: (name) => this.emojis.papoNameForDiscord(name)
 		};
 	}
 
