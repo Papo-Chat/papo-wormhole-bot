@@ -92,6 +92,9 @@ export class EmojiBridge {
 
 	/** Nome canônico conhecido pelo mapa persistente, disponível para o tradutor síncrono. */
 	papoNameForDiscord(name: string): string | undefined {
+		// O índice mantém o nome original do Papo; o mapa persistente normaliza tudo para lowercase.
+		const papoEmoji = this.papoIndex?.get(name.toLowerCase());
+		if (papoEmoji) return papoEmoji.name;
 		const known = this.store.getEmojiByName(name);
 		return known?.papo_emoji_id ? known.name : undefined;
 	}

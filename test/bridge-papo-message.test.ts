@@ -136,16 +136,16 @@ describe('mensagem no Papo sem content: o texto vai no embed', () => {
 		expect(sent[0]?.embeds?.[0]?.description).toBe('oi :papu:');
 	});
 
-	it('não faz upload quando o emoji já existe no Papo', async () => {
+	it('resolve o nome do emoji sem diferenciar maiúsculas e preserva o case do Papo', async () => {
 		const { bridge, sent, emojiUploads, settle } = fixture(true, [
-			{ id: 'papo-existing', name: 'papu', format: 'PNG' }
+			{ id: 'papo-existing', name: 'KEKW', format: 'PNG' }
 		]);
 
-		await bridge.onDiscordMessage(discordMessage('oi <:papu:123456789>') as never);
+		await bridge.onDiscordMessage(discordMessage('oi <:kekw:123456789>') as never);
 		await settle();
 
 		expect(emojiUploads).toHaveLength(0);
-		expect(sent[0]?.embeds?.[0]?.description).toBe('oi :papu:');
+		expect(sent[0]?.embeds?.[0]?.description).toBe('oi :KEKW:');
 	});
 
 	it('mensagem só com anexo continua sendo enviada (embed + anexo, sem content)', async () => {
