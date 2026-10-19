@@ -426,7 +426,8 @@ export class Bridge {
 			discordRoleLabel: (id) => this.discord.roleName(id),
 			discordEmoji: (name) => ({
 				token: this.emojis.tokenForDiscord(name, this.guildEmojis, this.appEmojis)
-			})
+			}),
+			papoEmojiName: (name) => this.emojis.papoNameForDiscord(name)
 		};
 	}
 
@@ -459,6 +460,23 @@ export class Bridge {
 		const names = new Set<string>();
 		for (const text of texts) for (const name of papoEmojiNames(text ?? '')) names.add(name);
 		for (const name of names) await this.emojis.ensureDiscordToken(name, this.guildEmojis, this.appEmojis);
+	}
+
+	/** Importa emojis custom do Discord ausentes no Papo antes da tradução da mensagem. */
+	private async warmPapoEmojis(...texts: (string | null | undefined)[]): Promise<void> {
+		const seen = new Set<string>();
+		for (const text of texts) {
+			for (const match of (text ?? '').matchAll(/<(a?):([A-Za-z0-9_]+):(\d+)>/g)) {
+				const [, animatedFlag, name, id] = match;
+				if (!name || !id || seen.has(name.toLowerCase())) continue;
+				seen.add(name.toLowerCase());
+				try {
+					await this.emojis.shortcodeForPapo(name, id, animatedFlag === 'a', this.guildEmojis);
+				} catch (err) {
+					this.log.debug({ err, emoji: name }, 'emoji Discord não pôde ser importado para o Papo');
+				}
+			}
+		}
 	}
 
 	private sourceRefs(msg: PapoMessage | PapoWsMessageEvent): SourceRef[] {
@@ -1236,6 +1254,7 @@ export class Bridge {
 		const gifSourceUrl = gifSourceUrlIn(m.content ?? '', rawEmbeds);
 		// O crawler do backend examina content. Se o Discord trouxe somente o link-preview,
 		// copie a URL da página (não a URL proxy da imagem), sem reescrevê-la.
+		await this.warmPapoEmojis(m.content ?? '');
 		const translated = discordToPapoContent(m.content ?? '', this.resolvers(link));
 		const crawlerText = gifSourceUrl ? withGifSourceUrl(translated, gifSourceUrl) : translated;
 		// Os links do CDN do Discord continuam passando pelo pipeline de anexos existente.
@@ -1372,6 +1391,7 @@ export class Bridge {
 		const previewEmbeds = rawDiscordEmbeds(fresh.embeds as APIEmbed[]);
 		const gifSourceUrl = gifSourceUrlIn(fresh.content ?? '', previewEmbeds);
 		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(gifSourceUrl);
+		await this.warmPapoEmojis(fresh.content ?? '');
 		const translated = discordToPapoContent(fresh.content ?? '', this.resolvers(link));
 		const edited = gifSourceUrl ? withGifSourceUrl(translated, gifSourceUrl) : translated;
 		const chunks = chunkText(link.bridge_attachments ? stripDiscordMediaLinks(edited) : edited, PAPO_EMBED_CHUNK_CHARS);

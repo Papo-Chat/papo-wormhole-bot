@@ -51,6 +51,8 @@ const discordToken = (emoji: GuildEmojiLike | ApplicationEmojiLike): string =>
 
 export class EmojiBridge {
 	private papoIndex?: Map<string, PapoEmoji>;
+	/** Importação em voo por nome: mensagens simultâneas não enviam o mesmo emoji duas vezes. */
+	private readonly importing = new Map<string, Promise<PapoEmoji | undefined>>();
 	/** Carga do índice de emojis da aplicação: uma por run (o cache do discord.js é o índice). */
 	private appIndex?: Promise<unknown>;
 	/** Criação em voo por nome: duas mensagens com o mesmo emoji novo criam um só emoji. */
@@ -86,6 +88,12 @@ export class EmojiBridge {
 	async papoByName(name: string): Promise<PapoEmoji | undefined> {
 		const index = await this.loadPapoIndex();
 		return index.get(name.toLowerCase());
+	}
+
+	/** Nome canônico conhecido pelo mapa persistente, disponível para o tradutor síncrono. */
+	papoNameForDiscord(name: string): string | undefined {
+		const known = this.store.getEmojiByName(name);
+		return known?.papo_emoji_id ? known.name : undefined;
 	}
 
 	/** Resolve emoji do Papo pelo id (usado ao converter reações). */
@@ -268,7 +276,19 @@ export class EmojiBridge {
 			});
 			return `:${existing.name}:`;
 		}
-		const imported = await this.importDiscordEmojiToPapo(name, emojiId, animated);
+
+		const key = name.toLowerCase();
+		let pending = this.importing.get(key);
+		if (!pending) {
+			pending = this.importDiscordEmojiToPapo(name, emojiId, animated);
+			this.importing.set(key, pending);
+		}
+		let imported: PapoEmoji | undefined;
+		try {
+			imported = await pending;
+		} finally {
+			if (this.importing.get(key) === pending) this.importing.delete(key);
+		}
 		if (imported) return `:${imported.name}:`;
 		void guild;
 		return `:${name.slice(0, PAPO_LIMITS.emojiNameMax)}:`;
