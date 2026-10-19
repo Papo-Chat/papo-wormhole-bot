@@ -92,11 +92,11 @@ export class EmojiBridge {
 
 	/** Nome canônico conhecido pelo mapa persistente, disponível para o tradutor síncrono. */
 	papoNameForDiscord(name: string): string | undefined {
-		// O índice mantém o nome original do Papo; o mapa persistente normaliza tudo para lowercase.
+		// A busca usa lowercase, mas o nome retornado preserva a caixa original.
 		const papoEmoji = this.papoIndex?.get(name.toLowerCase());
 		if (papoEmoji) return papoEmoji.name;
 		const known = this.store.getEmojiByName(name);
-		return known?.papo_emoji_id ? known.name : undefined;
+		return known?.papo_emoji_id ? (known.discord_emoji_name ?? name) : undefined;
 	}
 
 	/** Resolve emoji do Papo pelo id (usado ao converter reações). */
@@ -117,6 +117,7 @@ export class EmojiBridge {
 	 */
 	async importDiscordEmojiToPapo(name: string, emojiId: string, animated: boolean): Promise<PapoEmoji | undefined> {
 		if (!this.opts.autoImport) return undefined;
+		// Preserva a capitalização do emoji do Discord durante o upload.
 		const safeName = name.slice(0, PAPO_LIMITS.emojiNameMax);
 		if (!EMOJI_NAME_RE.test(safeName)) return undefined;
 
@@ -294,6 +295,7 @@ export class EmojiBridge {
 		}
 		if (imported) return `:${imported.name}:`;
 		void guild;
+		// Sem correspondência ou upload, mantém o nome original no shortcode literal.
 		return `:${name.slice(0, PAPO_LIMITS.emojiNameMax)}:`;
 	}
 }
