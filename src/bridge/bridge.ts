@@ -470,7 +470,11 @@ export class Bridge {
 				const [, animatedFlag, name, id] = match;
 				if (!name || !id || seen.has(name.toLowerCase())) continue;
 				seen.add(name.toLowerCase());
-				await this.emojis.shortcodeForPapo(name, id, animatedFlag === 'a', this.guildEmojis);
+				try {
+					await this.emojis.shortcodeForPapo(name, id, animatedFlag === 'a', this.guildEmojis);
+				} catch (err) {
+					this.log.debug({ err, emoji: name }, 'emoji Discord não pôde ser importado para o Papo');
+				}
 			}
 		}
 	}
