@@ -38,14 +38,17 @@ interface Sent {
 	embeds?: PapoEmbedInput[];
 }
 
-const fixture = (emojiAutoImport = false) => {
+const fixture = (
+	emojiAutoImport = false,
+	papoEmojis: { id: string; name: string; format: 'PNG' | 'GIF' }[] = []
+) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
 	const outbox = new Outbox(db, { maxAttempts: 5, baseMs: 20, maxMs: 60 });
 	const sent: Sent[] = [];
 	const emojiUploads: { name: string; imageBase64: string; format: string }[] = [];
 	const api = {
-		listAllEmojis: async () => [],
+		listAllEmojis: async () => papoEmojis,
 		createEmoji: async (name: string, imageBase64: string, format: string) => {
 			emojiUploads.push({ name, imageBase64, format });
 			return { id: 'papo-emoji-1', name, format: format as 'PNG' | 'GIF' };
@@ -108,7 +111,6 @@ describe('mensagem no Papo sem content: o texto vai no embed', () => {
 		expect(embed?.thumbnail).toBeUndefined();
 	});
 
-
 	it('faz upload de emoji custom ausente no Papo antes de enviar a mensagem', async () => {
 		const { bridge, sent, emojiUploads, settle } = fixture(true);
 		const originalFetch = globalThis.fetch;
@@ -131,6 +133,18 @@ describe('mensagem no Papo sem content: o texto vai no embed', () => {
 			imageBase64: image.toString('base64'),
 			format: 'PNG'
 		});
+		expect(sent[0]?.embeds?.[0]?.description).toBe('oi :papu:');
+	});
+
+	it('não faz upload quando o emoji já existe no Papo', async () => {
+		const { bridge, sent, emojiUploads, settle } = fixture(true, [
+			{ id: 'papo-existing', name: 'papu', format: 'PNG' }
+		]);
+
+		await bridge.onDiscordMessage(discordMessage('oi <:papu:123456789>') as never);
+		await settle();
+
+		expect(emojiUploads).toHaveLength(0);
 		expect(sent[0]?.embeds?.[0]?.description).toBe('oi :papu:');
 	});
 
