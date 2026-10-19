@@ -265,18 +265,6 @@ export class EmojiBridge {
 
 	/** Emoji do Discord → shortcode do Papo, importando quando possível. */
 	async shortcodeForPapo(name: string, emojiId: string, animated: boolean, guild?: GuildEmojiResolver): Promise<string> {
-		const known = this.store.getEmojiByName(name);
-		if (known?.papo_emoji_id) {
-			this.store.upsertEmoji({
-				name: known.name,
-				papo_emoji_id: known.papo_emoji_id,
-				discord_emoji_id: emojiId,
-				discord_emoji_name: name,
-				discord_animated: animated
-			});
-			return `:${known.name}:`;
-		}
-
 		const existing = await this.papoByName(name);
 		if (existing) {
 			this.store.upsertEmoji({
