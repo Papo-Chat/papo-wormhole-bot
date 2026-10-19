@@ -38,13 +38,18 @@ interface Sent {
 	embeds?: PapoEmbedInput[];
 }
 
-const fixture = () => {
+const fixture = (emojiAutoImport = false) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
 	const outbox = new Outbox(db, { maxAttempts: 5, baseMs: 20, maxMs: 60 });
 	const sent: Sent[] = [];
+	const emojiUploads: { name: string; imageBase64: string; format: string }[] = [];
 	const api = {
 		listAllEmojis: async () => [],
+		createEmoji: async (name: string, imageBase64: string, format: string) => {
+			emojiUploads.push({ name, imageBase64, format });
+			return { id: 'papo-emoji-1', name, format: format as 'PNG' | 'GIF' };
+		},
 		summariesBatch: async (ids: string[]) => ids.map((id) => ({ id, username: 'u' })),
 		profilesBatch: async (ids: string[]) => ids.map((id) => ({ id, username: 'u', nickname: null })),
 		sendMessage: async (input: Sent) => {
@@ -58,12 +63,13 @@ const fixture = () => {
 		findGuildEmoji: () => undefined,
 		send: async () => ({ id: 'd1' })
 	};
-	const bridge = new Bridge(cfg, store, outbox, api as never, {} as never, discord as never, {} as never);
+	const testCfg = { ...cfg, bridge: { ...cfg.bridge, emojiAutoImport } };
+	const bridge = new Bridge(testCfg, store, outbox, api as never, {} as never, discord as never, {} as never);
 	const link = store.upsertChannelLink({ papo_channel_id: 'chan-1', discord_channel_id: '111' });
 	const settle = async (): Promise<void> => {
 		await settleQueue(outbox);
 	};
-	return { store, outbox, bridge, link, sent, settle };
+	return { store, outbox, bridge, link, sent, emojiUploads, settle };
 };
 
 const discordMessage = (content: string) => ({
@@ -100,6 +106,32 @@ describe('mensagem no Papo sem content: o texto vai no embed', () => {
 		expect(embed?.author?.name).toBe('Jenga');
 		expect(embed?.author?.icon_url).toBe('https://cdn.discordapp.com/avatars/user-1/hash.png');
 		expect(embed?.thumbnail).toBeUndefined();
+	});
+
+
+	it('faz upload de emoji custom ausente no Papo antes de enviar a mensagem', async () => {
+		const { bridge, sent, emojiUploads, settle } = fixture(true);
+		const originalFetch = globalThis.fetch;
+		const image = Buffer.from('fake-png-image');
+		globalThis.fetch = async (input) => {
+			expect(String(input)).toContain('cdn.discordapp.com/emojis/123456789.png');
+			return new Response(image, { status: 200, headers: { 'content-type': 'image/png' } });
+		};
+
+		try {
+			await bridge.onDiscordMessage(discordMessage('oi <:papu:123456789>') as never);
+			await settle();
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+
+		expect(emojiUploads).toHaveLength(1);
+		expect(emojiUploads[0]).toEqual({
+			name: 'papu',
+			imageBase64: image.toString('base64'),
+			format: 'PNG'
+		});
+		expect(sent[0]?.embeds?.[0]?.description).toBe('oi :papu:');
 	});
 
 	it('mensagem só com anexo continua sendo enviada (embed + anexo, sem content)', async () => {
