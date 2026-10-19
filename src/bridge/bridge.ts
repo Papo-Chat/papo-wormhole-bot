@@ -462,6 +462,19 @@ export class Bridge {
 		for (const name of names) await this.emojis.ensureDiscordToken(name, this.guildEmojis, this.appEmojis);
 	}
 
+	/** Importa emojis custom do Discord ausentes no Papo antes da tradução da mensagem. */
+	private async warmPapoEmojis(...texts: (string | null | undefined)[]): Promise<void> {
+		const seen = new Set<string>();
+		for (const text of texts) {
+			for (const match of (text ?? '').matchAll(/<(a?):([A-Za-z0-9_]+):(\\d+)>/g)) {
+				const [, animatedFlag, name, id] = match;
+				if (!name || !id || seen.has(name.toLowerCase())) continue;
+				seen.add(name.toLowerCase());
+				await this.emojis.shortcodeForPapo(name, id, animatedFlag === 'a', this.guildEmojis);
+			}
+		}
+	}
+
 	private sourceRefs(msg: PapoMessage | PapoWsMessageEvent): SourceRef[] {
 		return (msg.attachments ?? []).map((a) => ({
 			side: 'papo',
@@ -1237,6 +1250,7 @@ export class Bridge {
 		const gifSourceUrl = gifSourceUrlIn(m.content ?? '', rawEmbeds);
 		// O crawler do backend examina content. Se o Discord trouxe somente o link-preview,
 		// copie a URL da página (não a URL proxy da imagem), sem reescrevê-la.
+		await this.warmPapoEmojis(m.content ?? '');
 		const translated = discordToPapoContent(m.content ?? '', this.resolvers(link));
 		const crawlerText = gifSourceUrl ? withGifSourceUrl(translated, gifSourceUrl) : translated;
 		// Os links do CDN do Discord continuam passando pelo pipeline de anexos existente.
@@ -1373,6 +1387,7 @@ export class Bridge {
 		const previewEmbeds = rawDiscordEmbeds(fresh.embeds as APIEmbed[]);
 		const gifSourceUrl = gifSourceUrlIn(fresh.content ?? '', previewEmbeds);
 		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(gifSourceUrl);
+		await this.warmPapoEmojis(fresh.content ?? '');
 		const translated = discordToPapoContent(fresh.content ?? '', this.resolvers(link));
 		const edited = gifSourceUrl ? withGifSourceUrl(translated, gifSourceUrl) : translated;
 		const chunks = chunkText(link.bridge_attachments ? stripDiscordMediaLinks(edited) : edited, PAPO_EMBED_CHUNK_CHARS);
