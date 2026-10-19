@@ -88,6 +88,12 @@ export class EmojiBridge {
 		return index.get(name.toLowerCase());
 	}
 
+	/** Nome canônico conhecido pelo mapa persistente, disponível para o tradutor síncrono. */
+	papoNameForDiscord(name: string): string | undefined {
+		const known = this.store.getEmojiByName(name);
+		return known?.papo_emoji_id ? known.name : undefined;
+	}
+
 	/** Resolve emoji do Papo pelo id (usado ao converter reações). */
 	async papoById(id: string): Promise<PapoEmoji | undefined> {
 		const known = this.store.getEmojiByPapoId(id);
