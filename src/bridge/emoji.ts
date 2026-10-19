@@ -117,7 +117,9 @@ export class EmojiBridge {
 	 */
 	async importDiscordEmojiToPapo(name: string, emojiId: string, animated: boolean): Promise<PapoEmoji | undefined> {
 		if (!this.opts.autoImport) return undefined;
-		const safeName = name.slice(0, PAPO_LIMITS.emojiNameMax);
+		// O frontend do Papo normaliza os shortcodes para lowercase. Usar o mesmo nome
+		// no upload garante que o shortcode preservado na mensagem aponte para o emoji criado.
+		const safeName = name.slice(0, PAPO_LIMITS.emojiNameMax).toLowerCase();
 		if (!EMOJI_NAME_RE.test(safeName)) return undefined;
 
 		const url = `https://cdn.discordapp.com/emojis/${encodeURIComponent(emojiId)}.${animated ? 'gif' : 'png'}`;
@@ -277,7 +279,7 @@ export class EmojiBridge {
 				discord_emoji_name: name,
 				discord_animated: animated
 			});
-			return `:${existing.name}:`;
+			return `:${existing.name.toLowerCase()}:`;
 		}
 
 		const key = name.toLowerCase();
@@ -292,8 +294,10 @@ export class EmojiBridge {
 		} finally {
 			if (this.importing.get(key) === pending) this.importing.delete(key);
 		}
-		if (imported) return `:${imported.name}:`;
+		if (imported) return `:${imported.name.toLowerCase()}:`;
 		void guild;
-		return `:${name.slice(0, PAPO_LIMITS.emojiNameMax)}:`;
+		// Shortcodes de emoji são normalizados para lowercase no Papo. Se a importação
+		// falhar, o fallback também precisa usar lowercase para renderizar o equivalente.
+		return `:${name.slice(0, PAPO_LIMITS.emojiNameMax).toLowerCase()}:`;
 	}
 }
