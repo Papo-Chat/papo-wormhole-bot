@@ -87,8 +87,8 @@ export interface PapoEmbedInput {
 	site_name?: string;
 	author?: { name?: string; url?: string; icon_url?: string };
 	footer?: { text?: string };
-	thumbnail?: { url: string; mime_type?: string };
-	image?: { url: string; mime_type?: string };
+	thumbnail?: { url?: string; attachment_name?: string; mime_type?: string };
+	image?: { url?: string; attachment_name?: string; mime_type?: string };
 	video?: { url: string; mime_type?: string };
 	fields?: { name: string; value: string; inline?: boolean }[];
 }
