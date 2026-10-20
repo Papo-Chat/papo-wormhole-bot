@@ -191,19 +191,21 @@ const papoMessage = (id: string, content = 'olá', extra: Record<string, unknown
 		...extra
 	}) as never;
 
-const discordMessage = (id: string, content: string, extra: Record<string, unknown> = {}) =>
-	({
+const discordMessage = (id: string, content: string, extra: Record<string, unknown> = {}) => {
+	const { authorBot = true, ...messageExtra } = extra;
+	return ({
 		id,
 		channelId: '111',
 		channel: { isThread: () => false },
-		author: { id: 'user-1', username: 'jenga', displayName: 'Jenga', displayAvatarURL: () => 'https://cdn.example.com/a.png' },
+		author: { id: 'user-1', username: 'jenga', displayName: 'Jenga', displayAvatarURL: () => 'https://cdn.example.com/a.png', bot: authorBot !== false },
 		member: { displayName: 'Jenga' },
 		content,
 		createdAt: new Date(),
 		attachments: [],
 		embeds: [],
-		...extra
+		...messageExtra
 	}) as never;
+};
 
 const linkPreview = (title: string, url = 'https://example.com/artigo') => ({
 	id: `e-${title}`,
@@ -241,21 +243,18 @@ const vxTwitterGif = () => ({
 });
 
 describe('preview no bridge Discord → Papo', () => {
-	it('texto + URL cria o cartão principal e um embed extra com o primeiro preview', async () => {
+	it('URL no conteúdo fica para o preview nativo do Papo, sem embed duplicado', async () => {
 		const { bridge, api, settle } = fixture();
 
 		await bridge.onDiscordMessage(discordMessage('dm-1', 'olá https://example.com/a', { embeds: [richPreview('primeiro'), richPreview('segundo')] }));
 		await settle();
 
 		const embeds = api.sent[0]!.embeds ?? [];
-		expect(embeds).toHaveLength(2);
-		// o cartão da ponte continua primeiro: autor, texto e rodapé da mensagem bridgeada
+		expect(embeds).toHaveLength(1);
+		// O cartão não replica o embed do Discord; o URL no content aciona o crawler nativo do Papo.
 		expect(embeds[0]!.author?.name).toBe('Jenga');
 		expect(embeds[0]!.description).toContain('olá');
-		// o preview entra atrás, sem substituir o cartão
-		expect(embeds[1]!.title).toBe('primeiro');
-		expect(embeds[1]!.url).toBe('https://example.com/primeiro');
-		expect(embeds[1]!.thumbnail?.url).toBe('https://example.com/primeiro/thumb.png');
+		expect(api.sent[0]!.content).toContain('https://example.com/a');
 	});
 
 	it('mensagem sem preview não ganha embed vazio', async () => {
@@ -287,7 +286,7 @@ describe('preview no bridge Discord → Papo', () => {
 		const { bridge, api, settle } = fixture();
 
 		await bridge.onDiscordMessage(
-			discordMessage('dm-1', 'https://fixvx.com/hardestgifs/status/2108436160964136985', { embeds: [vxTwitterGif()] })
+			discordMessage('dm-1', 'olha o gif', { embeds: [vxTwitterGif()] })
 		);
 		await settle();
 
