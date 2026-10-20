@@ -1353,7 +1353,7 @@ export class Bridge {
 				authorAvatarHash: m.author.avatar ?? undefined,
 				authorAvatarUrl: avatarUrl,
 				content: chunkContent,
-				contentMode: Boolean(gifSourceUrl),
+				contentMode: Boolean(gifSourceUrl && !convertCustomEmbeds),
 				footerBase: `🕒 ${formatDate(m.createdAt.toISOString(), this.cfg.bridge.timezone)} · Discord${chunkLabel(i, total)}`,
 				notes: [],
 				sources: i === 0 ? sources : [],
