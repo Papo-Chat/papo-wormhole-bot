@@ -1468,7 +1468,34 @@ export class Bridge {
 		const revision = fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : new Date().toISOString();
 		const attachmentsChanged = Boolean(link.bridge_attachments && link.bridge_edits) &&
 			previousAttachmentSignature !== currentAttachmentSignature;
-		if (attachmentsChanged) {
+
+		// O Discord pode adicionar a imagem do embed numa edição posterior. Se ela está no
+		// CDN, precisamos recriar a cópia com o arquivo anexado; PUT /messages não troca anexos.
+		const previewSelection = link.bridge_embeds && convertCustomEmbeds && !contentMode
+			? firstDiscordPreviewWithMedia(
+				previewEmbeds,
+				link.bridge_attachments ? fresh.attachments.map((a) => a.url) : []
+			)
+			: undefined;
+		const preview = previewSelection?.preview;
+		const previewImage = previewSelection?.image;
+		const previewImageUrl = previewImage?.origin ?? previewImage?.url;
+		let previewImageSource: SourceRef | undefined;
+		if (preview && previewImage && isDiscordCdnHostUrl(previewImageUrl)) {
+			if (link.bridge_attachments) {
+				previewImageSource = {
+					side: 'discord',
+					id: `${fresh.id}:embed-image`,
+					name: this.previewFileName(previewImageUrl!, 'embed-image'),
+					mime: previewImage.mime,
+					sizeBytes: 0,
+					url: previewImageUrl
+				};
+			}
+			preview.thumbnail = undefined;
+		}
+		const refreshAttachments = attachmentsChanged || Boolean(previewImageSource);
+		if (refreshAttachments) {
 			const sources: SourceRef[] = fresh.attachments.map((attachment) => ({
 				side: 'discord',
 				id: attachment.id,
@@ -1485,6 +1512,7 @@ export class Bridge {
 				sources,
 				hosted
 			);
+			if (previewImageSource) sources.push(previewImageSource);
 			const attachmentJob: EditJob = {
 				kind: 'edit',
 				side: 'discord',
@@ -1498,6 +1526,7 @@ export class Bridge {
 				contentMode,
 				refreshAttachments: true,
 				sources,
+				...(preview ? { linkEmbeds: [preview] } : {}),
 				replyRefDiscordId: fresh.reference?.messageId ?? undefined
 			};
 			this.outbox.enqueue({
@@ -1509,26 +1538,11 @@ export class Bridge {
 				payload: { job: attachmentJob } satisfies Envelope
 			});
 		}
-		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
-		// e sem isso o cartão do Papo fica só com a URL escrita
-		const preview = link.bridge_embeds && convertCustomEmbeds && !contentMode
-			? firstDiscordPreview(previewEmbeds, link.bridge_attachments ? fresh.attachments.map((a) => a.url) : [])
-			: undefined;
-		if (preview) await this.rehostDiscordCustomEmbedImage(preview, previewEmbeds, fresh.id);
-		if (preview && link.bridge_attachments && !convertCustomEmbeds) {
-			const attachmentKeys = new Set(fresh.attachments.map((a) => mediaKey(a.url)).filter(Boolean));
-			const stripped = discordHostedMedia(previewEmbeds).filter((m) => !attachmentKeys.has(mediaKey(discordMediaSourceUrl(m)) ?? ''));
-			if (stripped.length) {
-				// o preview chegou tarde e o Papo não aceita anexo em edição: a mídia do CDN do
-				// Discord fica fora do cartão em vez de virar um link que quebra
-				this.log.debug({ messageId: fresh.id, count: stripped.length }, 'mídia do Discord fora do preview: edição não anexa');
-			}
-		}
-		if (preview) {
+		// O embed textual pode ser atualizado sem recriar a mensagem quando não há mídia
+		// do CDN para anexar. Com mídia nova, o refresh de anexos já inclui o embed atualizado.
+		if (preview && !refreshAttachments) {
 			if (maps.length) this.enqueuePapoPreview(link, maps, fresh.id, preview, revision);
 			else {
-				// a cópia ainda está na fila de bridge: o preview espera o mapeamento em vez de
-				// queimar as tentativas de um job que não tem para onde ir
 				this.store.deferEvent({
 					source: 'discord',
 					sourceMessageId: fresh.id,
@@ -1539,8 +1553,8 @@ export class Bridge {
 			}
 		}
 		for (const target of targets) {
-			// A dedicated job replaces the main copy and all attachment continuation messages.
-			if (attachmentsChanged && (target.chunkIndex === 0 || target.chunkIndex >= EXTRA_CHUNK_BASE)) continue;
+			// O job dedicado recria a cópia principal e as continuações de anexos.
+			if (refreshAttachments && (target.chunkIndex === 0 || target.chunkIndex >= EXTRA_CHUNK_BASE)) continue;
 			if (link.bridge_edits || injectNativePreviewUrl) {
 				const job: EditJob = {
 					kind: 'edit',
