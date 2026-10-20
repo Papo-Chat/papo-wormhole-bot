@@ -1505,7 +1505,7 @@ export class Bridge {
 		const refreshAttachments = attachmentsChanged || Boolean(previewImageSource);
 		if (refreshAttachments) {
 			const previewMediaKey = mediaKey(previewImageSource?.url);
-			const sources: SourceRef[] = (link.bridge_attachments ? fresh.attachments : [])
+			const sources: SourceRef[] = (link.bridge_attachments ? [...fresh.attachments.values()] : [])
 				.filter((attachment) => !previewMediaKey || mediaKey(attachment.url) !== previewMediaKey)
 				.map((attachment) => ({
 					side: 'discord',
