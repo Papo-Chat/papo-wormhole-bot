@@ -1340,8 +1340,8 @@ export class Bridge {
 			}
 		}
 		// Em previews comuns, a mídia hospedada pelo Discord é reenviada como anexo porque a URL
-		// expira. Em embeds personalizados, a thumbnail/image selecionada também usa esse fluxo
-		// quando o host é o CDN do Discord; o campo thumbnail fica vazio para evitar fetch externo.
+		// expira. Em embeds personalizados, os bytes do CDN também são enviados como arquivo, mas
+		// o attachment_name da thumbnail faz o backend armazenar a mídia dentro do embed.
 		const hosted = new Set(attachmentUrls.map(mediaKey).filter(Boolean) as string[]);
 		if (bridgeFiles && link.bridge_embeds && !convertCustomEmbeds) {
 			this.addDiscordMediaSources(m.id, discordHostedMedia(rawEmbeds), sources, hosted);
