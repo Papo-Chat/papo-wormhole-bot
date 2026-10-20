@@ -386,9 +386,9 @@ describe('preview no bridge Discord → Papo', () => {
 	});
 
 	it(
-		'baixa imagem do CDN do Discord e re-hospeda antes de enviar embed customizado ao Papo',
+		'faz upload da image do CDN como attachment quando ela é fallback da thumbnail, sem media server',
 		async () => {
-			const { bridge, api, settle } = fixture({ mediaBaseUrl: 'https://bridge.example.com' });
+			const { bridge, api, settle } = fixture({ mediaBaseUrl: null });
 			const imageUrl = [
 				'https://cdn.discordapp.com/avatars/2065552277044035584/',
 				'b8624b4931b177ada37a361dfcdd83cc.png?size=1024'
@@ -399,7 +399,7 @@ describe('preview no bridge Discord → Papo', () => {
 				'?size=1024'
 			].join('');
 			const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-	
+
 			const { urls } = await withFetch(
 				async (url) =>
 					url === imageUrl
@@ -425,14 +425,14 @@ describe('preview no bridge Discord → Papo', () => {
 					await settle();
 				}
 			);
-	
+
 			expect(urls).toEqual([imageUrl]);
-			const converted = api.sent[0]!.embeds![1]!;
-			expect(converted.title).toBe('Sua imagem de perfil.');
-			const rehostedUrl = converted.thumbnail?.url ?? '';
-			expect(rehostedUrl).toMatch(/^https:\/\/bridge\.example\.com\/media\/[0-9a-f]{64}\.png$/);
-			expect(converted.thumbnail?.url).not.toContain('discordapp.com');
-			expect(converted.thumbnail?.mime_type).toBe('image/png');
+			const sent = api.sent[0]!;
+			expect(sent.embeds).toHaveLength(2);
+			expect(sent.embeds![1]!.title).toBe('Sua imagem de perfil.');
+			expect(sent.embeds![1]!.thumbnail).toBeUndefined();
+			expect(sent.attachments).toHaveLength(1);
+			expect(sent.attachments![0]!.name).toContain('b8624b4931b177ada37a361dfcdd83cc.png');
 		}
 	);
 
