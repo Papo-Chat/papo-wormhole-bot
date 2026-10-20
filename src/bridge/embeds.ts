@@ -197,14 +197,16 @@ export function preferredDiscordEmbedImage(embed: DiscordEmbedPayload): DiscordM
 	const supported = (media: DiscordMedia[]) =>
 		media.find((candidate) => PAPO_IMAGE_MIMES.includes(candidate.mime));
 
-	const fromThumbnail = supported(
-		discordEmbedMedia({ ...embed, image: undefined, components: undefined }).images
-	);
+	const thumbnailOnly = { ...embed };
+	delete thumbnailOnly.image;
+	delete thumbnailOnly.components;
+	const fromThumbnail = supported(discordEmbedMedia(thumbnailOnly).images);
 	if (fromThumbnail) return fromThumbnail;
 
-	const fromImage = supported(
-		discordEmbedMedia({ ...embed, thumbnail: undefined, components: undefined }).images
-	);
+	const imageOnly = { ...embed };
+	delete imageOnly.thumbnail;
+	delete imageOnly.components;
+	const fromImage = supported(discordEmbedMedia(imageOnly).images);
 	if (fromImage) return fromImage;
 
 	return supported(discordEmbedMedia(embed).images);
