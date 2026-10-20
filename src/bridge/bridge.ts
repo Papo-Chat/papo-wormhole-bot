@@ -2385,7 +2385,7 @@ export class Bridge {
 			const extra = g > 0;
 
 			if (webhook && webhookMode) {
-				if (!extra && !webhookContent && !attachments.length) {
+				if (!extra && !webhookContent && !attachments.length && !job.linkEmbeds?.length) {
 					this.log.debug({ discordMessageId: job.discordMessageId }, 'mensagem sem conteúdo ou anexo: nada a enviar');
 					continue;
 				}
