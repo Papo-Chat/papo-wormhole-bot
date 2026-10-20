@@ -303,7 +303,7 @@ describe('preview no bridge Discord → Papo', () => {
 	it('embed personalizado é enviado também no modo webhook do Papo', async () => {
 		const { bridge, webhookSends, settle } = fixture({ papoWebhookMode: true });
 		await bridge.onDiscordMessage(
-			discordMessage('dm-custom-webhook-mode', 'notificação do bot', {
+			discordMessage('dm-custom-webhook-mode', '', {
 				authorBot: true,
 				embeds: [richPreview('custom-no-webhook')]
 			})
