@@ -2405,6 +2405,26 @@ export class Bridge {
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
 		});
 
+		// Se o arquivo de imagem foi omitido (por exemplo, porque excede o limite do destino),
+		// não envie uma referência attachment_name inexistente: o backend validaria o multipart
+		// e rejeitaria a mensagem toda. O texto/embed restante continua sendo enviado.
+		const uploadedNames = new Set(plan.groups.flatMap((group) => group.map((file) => file.name)));
+		job.linkEmbeds = job.linkEmbeds?.map((sourceEmbed) => {
+			let embed = sourceEmbed;
+			for (const key of ['thumbnail', 'image'] as const) {
+				const media = embed[key];
+				if (media?.attachment_name && !uploadedNames.has(media.attachment_name)) {
+					this.log.warn(
+						{ discordMessageId: job.discordMessageId, attachmentName: media.attachment_name },
+						'a mídia do embed não foi enviada; removendo a referência para não rejeitar a mensagem'
+					);
+					const { attachment_name: _omitted, ...rest } = media;
+					embed = { ...embed, [key]: rest.url ? rest : undefined };
+				}
+			}
+			return embed;
+		});
+
 		// modo webhook: o texto vai no `content` da mensagem (o teto é o da mensagem). Sem
 		// webhook o texto vai no `description` do embed, que é o card da mensagem.
 		const notes = [...job.notes, ...plan.notes];
