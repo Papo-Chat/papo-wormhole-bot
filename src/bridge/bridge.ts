@@ -1337,7 +1337,7 @@ export class Bridge {
 		for (let i = 0; i < total; i++) {
 			// sem texto mas com anexo/embed o card já mostra a mídia: não precisa de marcador
 			const fallback = sources.length || linkEmbeds.length ? '' : '[mensagem sem texto]';
-			const chunkContent = chunks[i] ?? (i === 0 ? (linkEmbeds[0]?.url ?? fallback) : '');
+			const chunkContent = chunks[i] ?? (i === 0 ? fallback : '');
 			const job: ToPapoMessageJob = {
 				kind: 'message',
 				linkId: link.id,
