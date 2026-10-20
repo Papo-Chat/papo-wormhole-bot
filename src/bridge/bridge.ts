@@ -67,6 +67,7 @@ import { copySignatures, signedFooter } from './signature.js';
 import {
 	discordHostedMedia,
 	discordMediaLinksInContent,
+	firstDiscordLinkUrl,
 	firstDiscordPreview,
 	hasHyperlinkInContent,
 	firstPapoPreview,
@@ -217,8 +218,12 @@ function gifSourceUrlIn(content: string, embeds: readonly { url?: string | null 
 	return embeds.find((embed) => isGifSourceUrl(embed.url))?.url ?? undefined;
 }
 
+function withContentUrl(content: string, sourceUrl: string): string {
+	return content.trim() ? content + '\n' + sourceUrl : sourceUrl;
+}
+
 function withGifSourceUrl(content: string, sourceUrl: string): string {
-	return gifSourceUrlIn(content) ? content : content.trim() ? content + '\n' + sourceUrl : sourceUrl;
+	return gifSourceUrlIn(content) ? content : withContentUrl(content, sourceUrl);
 }
 
 export class Bridge {
@@ -1258,12 +1263,17 @@ export class Bridge {
 		const bridgeFiles = Boolean(link.bridge_attachments);
 		const rawEmbeds = rawDiscordEmbeds(m.embeds as APIEmbed[]);
 		const convertCustomEmbeds = shouldConvertCustomDiscordEmbeds(m);
+		const nativePreviewUrl = link.bridge_embeds && !convertCustomEmbeds ? firstDiscordLinkUrl(rawEmbeds) : undefined;
 		const gifSourceUrl = gifSourceUrlIn(m.content ?? '', rawEmbeds);
 		// O crawler do backend examina content. Se o Discord trouxe somente o link-preview,
 		// copie a URL da página (não a URL proxy da imagem), sem reescrevê-la.
 		await this.warmPapoEmojis(m.content ?? '');
 		const translated = discordToPapoContent(m.content ?? '', this.resolvers(link));
-		const crawlerText = gifSourceUrl ? withGifSourceUrl(translated, gifSourceUrl) : translated;
+		const crawlerText = gifSourceUrl
+			? withGifSourceUrl(translated, gifSourceUrl)
+			: nativePreviewUrl && !hasHyperlinkInContent(m.content ?? '')
+				? withContentUrl(translated, nativePreviewUrl)
+				: translated;
 		// Os links do CDN do Discord continuam passando pelo pipeline de anexos existente.
 		const content = bridgeFiles ? stripDiscordMediaLinks(crawlerText) : crawlerText;
 		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
@@ -1287,7 +1297,7 @@ export class Bridge {
 		// expira junto com a mensagem original e o hotlink é bloqueado. Ela vira anexo baixado
 		// e re-enviado, nunca URL dentro de embed.
 		const hosted = new Set(attachmentUrls.map(mediaKey).filter(Boolean) as string[]);
-		if (bridgeFiles && link.bridge_embeds && (convertCustomEmbeds || Boolean(gifSourceUrl))) {
+		if (bridgeFiles && link.bridge_embeds) {
 			this.addDiscordMediaSources(m.id, discordHostedMedia(rawEmbeds), sources, hosted);
 		}
 		if (bridgeFiles) {
@@ -1397,11 +1407,16 @@ export class Bridge {
 		if (this.propagatesMentions(link) && /@/.test(fresh.content ?? '')) await this.ensurePapoNameIndex();
 		const previewEmbeds = rawDiscordEmbeds(fresh.embeds as APIEmbed[]);
 		const convertCustomEmbeds = shouldConvertCustomDiscordEmbeds(fresh);
+		const nativePreviewUrl = link.bridge_embeds && !convertCustomEmbeds ? firstDiscordLinkUrl(previewEmbeds) : undefined;
 		const gifSourceUrl = gifSourceUrlIn(fresh.content ?? '', previewEmbeds);
 		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(gifSourceUrl);
 		await this.warmPapoEmojis(fresh.content ?? '');
 		const translated = discordToPapoContent(fresh.content ?? '', this.resolvers(link));
-		const edited = gifSourceUrl ? withGifSourceUrl(translated, gifSourceUrl) : translated;
+		const edited = gifSourceUrl
+			? withGifSourceUrl(translated, gifSourceUrl)
+			: nativePreviewUrl && !hasHyperlinkInContent(fresh.content ?? '')
+				? withContentUrl(translated, nativePreviewUrl)
+				: translated;
 		const chunks = chunkText(link.bridge_attachments ? stripDiscordMediaLinks(edited) : edited, PAPO_EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
@@ -1422,7 +1437,7 @@ export class Bridge {
 				url: attachment.url
 			}));
 			const hosted = new Set(fresh.attachments.map((attachment) => mediaKey(attachment.url)).filter(Boolean) as string[]);
-			if (link.bridge_embeds && (convertCustomEmbeds || Boolean(gifSourceUrl))) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
+			if (link.bridge_embeds) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
 			this.addDiscordMediaSources(
 				fresh.id,
 				discordMediaLinksInContent(fresh.content ?? '').map((url) => ({ url, mime: mimeFromUrl(url) })),
