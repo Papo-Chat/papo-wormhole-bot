@@ -190,6 +190,29 @@ function walkComponents(nodes?: DiscordComponentNode[]): DiscordComponentNode[] 
 }
 
 /**
+ * Imagem principal preferida para converter um embed ao Papo: use thumbnail quando existe;
+ * image é fallback. Mídia de componentes fica como último recurso.
+ */
+export function preferredDiscordEmbedImage(embed: DiscordEmbedPayload): DiscordMedia | undefined {
+	const supported = (media: DiscordMedia[]) =>
+		media.find((candidate) => PAPO_IMAGE_MIMES.includes(candidate.mime));
+
+	const thumbnailOnly = { ...embed };
+	delete thumbnailOnly.image;
+	delete thumbnailOnly.components;
+	const fromThumbnail = supported(discordEmbedMedia(thumbnailOnly).images);
+	if (fromThumbnail) return fromThumbnail;
+
+	const imageOnly = { ...embed };
+	delete imageOnly.thumbnail;
+	delete imageOnly.components;
+	const fromImage = supported(discordEmbedMedia(imageOnly).images);
+	if (fromImage) return fromImage;
+
+	return supported(discordEmbedMedia(embed).images);
+}
+
+/**
  * Toda mídia de um embed do Discord: embed simples (`image`/`thumbnail`/`video`) ou o preview
  * novo em componentes, que aninha mídia em `accessory`/`items`. Imagens vêm da maior para a menor.
  */
@@ -415,7 +438,14 @@ export function discordEmbedsToPapo(embeds: DiscordEmbedPayload[], opts: Discord
 		// O Papo renderiza a imagem da thumbnail; a imagem principal vira thumbnail quando é a única.
 		// Só os formatos que o backend decodifica: um avif seria baixado e descartado (o preview
 		// chegaria sem imagem), e um vídeo fora da allowlist faz o backend recusar a mensagem inteira.
-		const image = previewImageOf({ images: images.filter((m) => PAPO_IMAGE_MIMES.includes(m.mime)), videos });
+		const preferredImage = preferredDiscordEmbedImage(e);
+		const image =
+			preferredImage && (!opts.rehostDiscordMedia || !isDiscordHostedMedia(preferredImage))
+				? preferredImage
+				: previewImageOf({
+						images: images.filter((m) => PAPO_IMAGE_MIMES.includes(m.mime)),
+						videos
+					});
 		if (image) {
 			input.thumbnail = { url: clampText(image.url, PAPO_LIMITS.embedUrlMax) };
 			if (image.mime === 'image/gif') input.thumbnail.mime_type = 'image/gif';

@@ -5,6 +5,7 @@ import {
 	discordEmbedsToPapo,
 	discordMediaSourceUrl,
 	isDiscordHostedMedia,
+	preferredDiscordEmbedImage,
 	isDiscordMediaUrl,
 	papoEmbedsToDiscord,
 	type DiscordEmbedPayload,
@@ -63,11 +64,17 @@ export function rawDiscordEmbeds(embeds: readonly APIEmbed[] | undefined): APIEm
  * vai no destino como arquivo, e um embed atrás dele seria a mesma coisa duplicada.
  * `rehostDiscordMedia`: mídia hospedada pelo Discord sai do embed (vai como anexo baixado).
  */
-export function firstDiscordPreview(
+export interface DiscordPreviewSelection {
+	preview: PapoEmbedInput;
+	image?: DiscordMedia;
+}
+
+/** Primeiro preview convertível e a imagem escolhida (thumbnail; image só como fallback). */
+export function firstDiscordPreviewWithMedia(
 	embeds: readonly APIEmbed[] | undefined,
 	attachmentUrls: readonly string[] = [],
 	opts: DiscordToPapoOptions = {}
-): PapoEmbedInput | undefined {
+): DiscordPreviewSelection | undefined {
 	const bridged = new Set(attachmentUrls.map(mediaKey).filter(Boolean));
 	for (const e of embeds ?? []) {
 		if (e.type && !DISCORD_PREVIEW_TYPES.has(e.type)) continue;
@@ -79,8 +86,6 @@ export function firstDiscordPreview(
 		if (keys.some((key) => key && bridged.has(key))) continue;
 		const [converted] = discordEmbedsToPapo([payload], opts);
 		if (!converted || !Object.keys(converted).length) continue;
-		// preview que só existia pela mídia do CDN: re-hospedada como anexo, o card não acrescenta
-		// nada além de uma URL que quebra
 		if (
 			opts.rehostDiscordMedia &&
 			!converted.thumbnail &&
@@ -89,9 +94,20 @@ export function firstDiscordPreview(
 			isDiscordMediaUrl(converted.url)
 		)
 			continue;
-		return converted;
+		return {
+			preview: converted,
+			image: opts.rehostDiscordMedia ? undefined : preferredDiscordEmbedImage(payload)
+		};
 	}
 	return undefined;
+}
+
+export function firstDiscordPreview(
+	embeds: readonly APIEmbed[] | undefined,
+	attachmentUrls: readonly string[] = [],
+	opts: DiscordToPapoOptions = {}
+): PapoEmbedInput | undefined {
+	return firstDiscordPreviewWithMedia(embeds, attachmentUrls, opts)?.preview;
 }
 
 /**

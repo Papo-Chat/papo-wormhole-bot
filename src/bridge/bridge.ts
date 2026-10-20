@@ -56,7 +56,13 @@ import {
 	type DiscordMedia,
 	type PreviewMedia
 } from './embeds.js';
-import { prepareAttachments, sanitizeName, SourceGoneError, type SourceAttachment } from './attachments.js';
+import {
+	prepareAttachments,
+	sanitizeName,
+	SourceGoneError,
+	type PreparedAttachment,
+	type SourceAttachment
+} from './attachments.js';
 import { mergeReactionCounts, reactionSummaryText, type ReactionDisplay } from './reactions.js';
 import { EMBED_CHUNK_CHARS, PAPO_LIMITS, PAPO_EMBED_CHUNK_CHARS, DISCORD_LIMITS, PAPO_VIDEO_MIMES, clampText } from './limits.js';
 import { EmojiBridge, type ApplicationEmojiResolver, type GuildEmojiResolver } from './emoji.js';
@@ -68,7 +74,7 @@ import {
 	discordHostedMedia,
 	discordMediaLinksInContent,
 	firstDiscordLinkUrl,
-	firstDiscordPreview,
+	firstDiscordPreviewWithMedia,
 	hasHyperlinkInContent,
 	firstPapoPreview,
 	mediaKey,
@@ -127,6 +133,25 @@ const MENTION_LOOKUP_LIMIT = 10;
 /** Só converte embeds personalizados de bots/webhooks sem URL no conteúdo da mensagem. */
 function shouldConvertCustomDiscordEmbeds(message: { content?: string | null; webhookId?: string | null; author?: { bot?: boolean } | null }): boolean {
 	return Boolean(message.author?.bot || message.webhookId) && !hasHyperlinkInContent(message.content);
+}
+
+function isDiscordCdnHostUrl(rawUrl?: string | null): boolean {
+	if (!rawUrl) return false;
+	try {
+		const url = new URL(rawUrl);
+		return (
+			url.protocol === 'https:' &&
+			([
+				'cdn.discordapp.com',
+				'cdn.discordapp.net',
+				'media.discordapp.com',
+				'media.discordapp.net'
+			].includes(url.hostname.toLowerCase()) ||
+				/^images-ext-\d+\.discordapp\.net$/i.test(url.hostname))
+		);
+	} catch {
+		return false;
+	}
 }
 
 /** Identidade de uma reação do Papo, estável entre o evento WS e a execução do job. */
@@ -1291,12 +1316,38 @@ export class Bridge {
 		const attachmentUrls = m.attachments.map((a) => a.url);
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
-		const preview = link.bridge_embeds && convertCustomEmbeds
-			? firstDiscordPreview(rawEmbeds, bridgeFiles ? attachmentUrls : [])
+		const previewSelection = link.bridge_embeds && convertCustomEmbeds
+			? firstDiscordPreviewWithMedia(rawEmbeds)
 			: undefined;
-		// Em previews comuns, a mídia hospedada pelo Discord é re-enviada como anexo porque a URL
-		// expira. Embeds personalizados convertidos são exceção: preservamos a mídia no próprio
-		// embed para o backend do Papo re-hospedá-la e não perder o visual do cartão.
+		const preview = previewSelection?.preview;
+		const previewImage = previewSelection?.image;
+		const previewImageUrl =
+			[previewImage?.origin, previewImage?.url].find(isDiscordCdnHostUrl) ??
+			previewImage?.origin ??
+			previewImage?.url;
+		if (preview && previewImage && isDiscordCdnHostUrl(previewImageUrl)) {
+			const imageKey = mediaKey(previewImageUrl);
+			if (imageKey) {
+				for (let i = sources.length - 1; i >= 0; i--) {
+					if (mediaKey(sources[i]!.url) === imageKey) sources.splice(i, 1);
+				}
+			}
+			// A imagem faz parte do embed customizado, então é enviada mesmo se o link
+			// desativar o espelhamento de attachments comuns.
+			const name = this.discordEmbedAttachmentName(m.id, previewImageUrl!);
+			sources.unshift({
+				side: 'discord',
+				id: `${m.id}:embed-image`,
+				name,
+				mime: previewImage.mime,
+				sizeBytes: 0,
+				url: previewImageUrl!
+			});
+			preview.thumbnail = { attachment_name: name, mime_type: previewImage.mime };
+		}
+		// Em previews comuns, a mídia hospedada pelo Discord é reenviada como anexo porque a URL
+		// expira. Em embeds personalizados, os bytes do CDN também são enviados como arquivo, mas
+		// o attachment_name da thumbnail faz o backend armazenar a mídia dentro do embed.
 		const hosted = new Set(attachmentUrls.map(mediaKey).filter(Boolean) as string[]);
 		if (bridgeFiles && link.bridge_embeds && !convertCustomEmbeds) {
 			this.addDiscordMediaSources(m.id, discordHostedMedia(rawEmbeds), sources, hosted);
@@ -1429,9 +1480,35 @@ export class Bridge {
 		const revision = fresh.editedTimestamp ? new Date(fresh.editedTimestamp).toISOString() : new Date().toISOString();
 		const attachmentsChanged = Boolean(link.bridge_attachments && link.bridge_edits) &&
 			previousAttachmentSignature !== currentAttachmentSignature;
-		if (attachmentsChanged) {
-			const sources: SourceRef[] = fresh.attachments.map((attachment) => ({
+
+		// O Discord pode adicionar a imagem do embed numa edição posterior. Se ela está no
+		// CDN, precisamos recriar a cópia com o arquivo anexado; PUT /messages não troca anexos.
+		const previewSelection = link.bridge_embeds && convertCustomEmbeds && !contentMode
+			? firstDiscordPreviewWithMedia(previewEmbeds)
+			: undefined;
+		const preview = previewSelection?.preview;
+		const previewImage = previewSelection?.image;
+		const previewImageUrl = previewImage?.origin ?? previewImage?.url;
+		let previewImageSource: SourceRef | undefined;
+		if (preview && previewImage && isDiscordCdnHostUrl(previewImageUrl)) {
+			const name = this.discordEmbedAttachmentName(fresh.id, previewImageUrl!);
+			previewImageSource = {
 				side: 'discord',
+				id: `${fresh.id}:embed-image`,
+				name,
+				mime: previewImage.mime,
+				sizeBytes: 0,
+				url: previewImageUrl!
+			};
+			preview.thumbnail = { attachment_name: name, mime_type: previewImage.mime };
+		}
+		const refreshAttachments = attachmentsChanged || Boolean(previewImageSource);
+		if (refreshAttachments) {
+			const previewMediaKey = mediaKey(previewImageSource?.url);
+			const sources: SourceRef[] = (link.bridge_attachments ? fresh.attachments : [])
+				.filter((attachment) => !previewMediaKey || mediaKey(attachment.url) !== previewMediaKey)
+				.map((attachment) => ({
+					side: 'discord',
 				id: attachment.id,
 				name: attachment.name ?? 'arquivo',
 				mime: attachment.contentType ?? undefined,
@@ -1439,13 +1516,21 @@ export class Bridge {
 				url: attachment.url
 			}));
 			const hosted = new Set(fresh.attachments.map((attachment) => mediaKey(attachment.url)).filter(Boolean) as string[]);
-			if (link.bridge_embeds && !convertCustomEmbeds) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
-			this.addDiscordMediaSources(
-				fresh.id,
-				discordMediaLinksInContent(fresh.content ?? '').map((url) => ({ url, mime: mimeFromUrl(url) })),
-				sources,
-				hosted
-			);
+			if (link.bridge_attachments && link.bridge_embeds && !convertCustomEmbeds) {
+				this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
+			}
+			if (link.bridge_attachments) {
+				this.addDiscordMediaSources(
+					fresh.id,
+					discordMediaLinksInContent(fresh.content ?? '').map((url) => ({
+						url,
+						mime: mimeFromUrl(url)
+					})),
+					sources,
+					hosted
+				);
+			}
+			if (previewImageSource) sources.unshift(previewImageSource);
 			const attachmentJob: EditJob = {
 				kind: 'edit',
 				side: 'discord',
@@ -1459,6 +1544,7 @@ export class Bridge {
 				contentMode,
 				refreshAttachments: true,
 				sources,
+				linkEmbeds: preview ? [preview] : [],
 				replyRefDiscordId: fresh.reference?.messageId ?? undefined
 			};
 			this.outbox.enqueue({
@@ -1470,25 +1556,11 @@ export class Bridge {
 				payload: { job: attachmentJob } satisfies Envelope
 			});
 		}
-		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
-		// e sem isso o cartão do Papo fica só com a URL escrita
-		const preview = link.bridge_embeds && convertCustomEmbeds && !contentMode
-			? firstDiscordPreview(previewEmbeds, link.bridge_attachments ? fresh.attachments.map((a) => a.url) : [])
-			: undefined;
-		if (preview && link.bridge_attachments && !convertCustomEmbeds) {
-			const attachmentKeys = new Set(fresh.attachments.map((a) => mediaKey(a.url)).filter(Boolean));
-			const stripped = discordHostedMedia(previewEmbeds).filter((m) => !attachmentKeys.has(mediaKey(discordMediaSourceUrl(m)) ?? ''));
-			if (stripped.length) {
-				// o preview chegou tarde e o Papo não aceita anexo em edição: a mídia do CDN do
-				// Discord fica fora do cartão em vez de virar um link que quebra
-				this.log.debug({ messageId: fresh.id, count: stripped.length }, 'mídia do Discord fora do preview: edição não anexa');
-			}
-		}
-		if (preview) {
+		// O embed textual pode ser atualizado sem recriar a mensagem quando não há mídia
+		// do CDN para anexar. Com mídia nova, o refresh de anexos já inclui o embed atualizado.
+		if (preview && !refreshAttachments) {
 			if (maps.length) this.enqueuePapoPreview(link, maps, fresh.id, preview, revision);
 			else {
-				// a cópia ainda está na fila de bridge: o preview espera o mapeamento em vez de
-				// queimar as tentativas de um job que não tem para onde ir
 				this.store.deferEvent({
 					source: 'discord',
 					sourceMessageId: fresh.id,
@@ -1499,8 +1571,10 @@ export class Bridge {
 			}
 		}
 		for (const target of targets) {
-			// A dedicated job replaces the main copy and all attachment continuation messages.
-			if (attachmentsChanged && (target.chunkIndex === 0 || target.chunkIndex >= EXTRA_CHUNK_BASE)) continue;
+			// O job dedicado recria a cópia principal e as continuações de anexos.
+			if (refreshAttachments && (target.chunkIndex === 0 || target.chunkIndex >= EXTRA_CHUNK_BASE)) {
+				continue;
+			}
 			if (link.bridge_edits || injectNativePreviewUrl) {
 				const job: EditJob = {
 					kind: 'edit',
@@ -1841,6 +1915,44 @@ export class Bridge {
 		} catch {
 			return fallback;
 		}
+	}
+
+	/** Nome estável e único para anexos que são usados como mídia de um embed. */
+	private discordEmbedAttachmentName(messageId: string, url: string): string {
+		const prefix = `discord-embed-${messageId}-`;
+		const suffix = this.previewFileName(url, 'image.png').slice(-Math.max(1, 120 - prefix.length));
+		return sanitizeName(`${prefix}${suffix}`).slice(0, 128);
+	}
+
+	/** Remove attachment_name sem upload para não fazer o backend rejeitar a mensagem inteira. */
+	private removeMissingEmbedAttachments(
+		embeds: PapoEmbedInput[] | undefined,
+		groups: PreparedAttachment[][],
+		messageId: string
+	): PapoEmbedInput[] | undefined {
+		if (!embeds?.length) return embeds;
+		const uploadedNames = new Set(groups.flatMap((group) => group.map((file) => file.name)));
+		let changed = false;
+		const result = embeds.map((sourceEmbed) => {
+			let embed = sourceEmbed;
+			for (const key of ['thumbnail', 'image'] as const) {
+				const media = embed[key];
+				if (!media?.attachment_name || uploadedNames.has(media.attachment_name)) continue;
+				changed = true;
+				this.log.warn(
+					{ messageId, attachmentName: media.attachment_name },
+					'a mídia do embed não foi enviada; removendo a referência para não rejeitar a mensagem'
+				);
+				embed = {
+					...embed,
+					[key]: media.url
+						? { url: media.url, ...(media.mime_type ? { mime_type: media.mime_type } : {}) }
+						: undefined
+				};
+			}
+			return embed;
+		});
+		return changed ? result : embeds;
 	}
 
 	/**
@@ -2340,6 +2452,12 @@ export class Bridge {
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
 		});
 
+		job.linkEmbeds = this.removeMissingEmbedAttachments(
+			job.linkEmbeds,
+			plan.groups,
+			job.discordMessageId
+		);
+
 		// modo webhook: o texto vai no `content` da mensagem (o teto é o da mensagem). Sem
 		// webhook o texto vai no `description` do embed, que é o card da mensagem.
 		const notes = [...job.notes, ...plan.notes];
@@ -2677,6 +2795,11 @@ export class Bridge {
 			maxFileBytes: PAPO_LIMITS.attachmentMaxBytes,
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
 		});
+		job.linkEmbeds = this.removeMissingEmbedAttachments(
+			job.linkEmbeds,
+			plan.groups,
+			job.sourceMessageId
+		);
 		const groups = plan.groups.length ? plan.groups : [[]];
 		const refreshedText = plan.notes.length
 			? `${job.text}${job.text ? '\n\n' : ''}${plan.notes.map((note) => `> ${note}`).join('\n')}`.trim()
@@ -2686,6 +2809,7 @@ export class Bridge {
 		let mainEmbed: PapoEmbedInput | undefined;
 		let previousId: string | undefined;
 		const summary = await this.reactionSummaryForMap(mainMap, 'papo');
+		const previewEmbeds = job.linkEmbeds ?? this.mapPreviews<PapoEmbedInput>(mainMap);
 		const content = this.webhookCopyContent(
 			mainMap.reply_note ?? '',
 			refreshedText,
@@ -2701,7 +2825,7 @@ export class Bridge {
 				if (group === 0 && !webhookMode) {
 					embed = await this.papoCopyEmbed(mainMap, mainMap.content_mode || job.contentMode ? '' : refreshedText);
 					mainEmbed = embed;
-					const embeds = [embed, ...this.mapPreviews<PapoEmbedInput>(mainMap)];
+					const embeds = [embed, ...previewEmbeds];
 					message = await this.sendToPapoSafe({
 						channelId: job.targetChannelId,
 						content: mainMap.content_mode || job.contentMode ? clampText(refreshedText, PAPO_LIMITS.contentMax) : undefined,
@@ -2714,6 +2838,7 @@ export class Bridge {
 						content,
 						...(job.replyRefDiscordId ? { replyTo: this.copyForDiscordMessage(job.replyRefDiscordId) } : {}),
 						attachments,
+						...(previewEmbeds.length ? { embeds: previewEmbeds } : {}),
 						externalMessageId: `discord:${job.sourceMessageId}:attachment-refresh:${job.revision ?? Date.now()}:${group}`
 					});
 					if (!sent) throw new RetryableError('webhook do Papo não aceitou a substituição dos anexos');
@@ -2766,6 +2891,7 @@ export class Bridge {
 					footer_base: item.group === 0 ? mainMap.footer_base : null,
 					...(item.group === 0 ? {} : { link_embeds: null }),
 					edit_revision: job.revision ?? null,
+					...(item.group === 0 && job.linkEmbeds !== undefined ? { link_embeds: job.linkEmbeds } : {}),
 					content_mode: item.group === 0 && !webhookMode ? Boolean(mainMap.content_mode || job.contentMode) : false
 				});
 			} else {

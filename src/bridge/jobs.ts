@@ -104,6 +104,8 @@ export interface EditJob {
 	refreshAttachments?: boolean;
 	/** Current source attachments, downloaded while the job runs. */
 	sources?: SourceRef[];
+	/** Updated custom previews to persist when recreating the Papo message for new attachments. */
+	linkEmbeds?: PapoEmbedInput[];
 	/** Original Discord reply; used when recreating a Papo message with changed attachments. */
 	replyRefDiscordId?: string;
 }
