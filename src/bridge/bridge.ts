@@ -1307,13 +1307,19 @@ export class Bridge {
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
 		const previewSelection = link.bridge_embeds && convertCustomEmbeds
-			? firstDiscordPreviewWithMedia(rawEmbeds, bridgeFiles ? attachmentUrls : [])
+			? firstDiscordPreviewWithMedia(rawEmbeds)
 			: undefined;
 		const preview = previewSelection?.preview;
 		const previewImage = previewSelection?.image;
 		const previewImageUrl = previewImage?.origin ?? previewImage?.url;
 		if (preview && previewImage && isDiscordCdnHostUrl(previewImageUrl)) {
 			if (bridgeFiles) {
+				const imageKey = mediaKey(previewImageUrl);
+				if (imageKey) {
+					for (let i = sources.length - 1; i >= 0; i--) {
+						if (mediaKey(sources[i]!.url) === imageKey) sources.splice(i, 1);
+					}
+				}
 				const name = this.discordEmbedAttachmentName(m.id, previewImageUrl!);
 				// Priorize a imagem do embed para que ela esteja no primeiro grupo enviado.
 				sources.unshift({
@@ -1472,10 +1478,7 @@ export class Bridge {
 		// O Discord pode adicionar a imagem do embed numa edição posterior. Se ela está no
 		// CDN, precisamos recriar a cópia com o arquivo anexado; PUT /messages não troca anexos.
 		const previewSelection = link.bridge_embeds && convertCustomEmbeds && !contentMode
-			? firstDiscordPreviewWithMedia(
-				previewEmbeds,
-				link.bridge_attachments ? fresh.attachments.map((a) => a.url) : []
-			)
+			? firstDiscordPreviewWithMedia(previewEmbeds)
 			: undefined;
 		const preview = previewSelection?.preview;
 		const previewImage = previewSelection?.image;
@@ -1499,8 +1502,11 @@ export class Bridge {
 		}
 		const refreshAttachments = attachmentsChanged || Boolean(previewImageSource);
 		if (refreshAttachments) {
-			const sources: SourceRef[] = fresh.attachments.map((attachment) => ({
-				side: 'discord',
+			const previewMediaKey = mediaKey(previewImageSource?.url);
+			const sources: SourceRef[] = fresh.attachments
+				.filter((attachment) => !previewMediaKey || mediaKey(attachment.url) !== previewMediaKey)
+				.map((attachment) => ({
+					side: 'discord',
 				id: attachment.id,
 				name: attachment.name ?? 'arquivo',
 				mime: attachment.contentType ?? undefined,
