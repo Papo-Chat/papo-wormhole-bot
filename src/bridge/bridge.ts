@@ -1269,7 +1269,7 @@ export class Bridge {
 		// copie a URL da página (não a URL proxy da imagem), sem reescrevê-la.
 		await this.warmPapoEmojis(m.content ?? '');
 		const translated = discordToPapoContent(m.content ?? '', this.resolvers(link));
-		const crawlerText = gifSourceUrl
+		const crawlerText = !convertCustomEmbeds && gifSourceUrl
 			? withGifSourceUrl(translated, gifSourceUrl)
 			: nativePreviewUrl && !hasHyperlinkInContent(m.content ?? '')
 				? withContentUrl(translated, nativePreviewUrl)
@@ -1290,7 +1290,7 @@ export class Bridge {
 		const attachmentUrls = m.attachments.map((a) => a.url);
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
-		const preview = link.bridge_embeds && convertCustomEmbeds && !gifSourceUrl
+		const preview = link.bridge_embeds && convertCustomEmbeds
 			? firstDiscordPreview(rawEmbeds, attachmentUrls, { rehostDiscordMedia: bridgeFiles })
 			: undefined;
 		// mídia que o Discord hospeda (`cdn.discordapp.com`, `media.discordapp.net`) é volátil:
@@ -1409,10 +1409,10 @@ export class Bridge {
 		const convertCustomEmbeds = shouldConvertCustomDiscordEmbeds(fresh);
 		const nativePreviewUrl = link.bridge_embeds && !convertCustomEmbeds ? firstDiscordLinkUrl(previewEmbeds) : undefined;
 		const gifSourceUrl = gifSourceUrlIn(fresh.content ?? '', previewEmbeds);
-		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(gifSourceUrl);
+		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(gifSourceUrl && !convertCustomEmbeds);
 		await this.warmPapoEmojis(fresh.content ?? '');
 		const translated = discordToPapoContent(fresh.content ?? '', this.resolvers(link));
-		const edited = gifSourceUrl
+		const edited = !convertCustomEmbeds && gifSourceUrl
 			? withGifSourceUrl(translated, gifSourceUrl)
 			: nativePreviewUrl && !hasHyperlinkInContent(fresh.content ?? '')
 				? withContentUrl(translated, nativePreviewUrl)
