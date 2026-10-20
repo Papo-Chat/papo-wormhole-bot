@@ -320,7 +320,8 @@ describe('preview do Papo → Discord: mídia', () => {
 				]
 			})
 		});
-		expect(payload.thumbnail?.url).toBe('attachment://media-aaaa.webp');
+		expect(payload.image?.url).toBe('attachment://media-aaaa.webp');
+		expect(payload.thumbnail).toBeUndefined();
 		expect(payload.media_refs).toHaveLength(2);
 		// o Discord não aceita gravar vídeo em embed: o que leva o player é o anexo
 		expect(payload.video).toBeUndefined();
@@ -340,7 +341,8 @@ describe('preview do Papo → Discord: mídia', () => {
 		expect(payload).toHaveProperty('media_refs');
 		const sent = discordApiEmbed(payload);
 		expect(sent).not.toHaveProperty('media_refs');
-		expect(sent.thumbnail?.url).toBe('attachment://media-cccc.webp');
+		expect(sent.image?.url).toBe('attachment://media-cccc.webp');
+		expect(sent.thumbnail).toBeUndefined();
 		expect(discordApiEmbed(asEmbed(ogInstagramComponents()))).not.toHaveProperty('components');
 	});
 
