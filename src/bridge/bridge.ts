@@ -860,7 +860,9 @@ export class Bridge {
 		const candidates = embeds.flatMap((embed) =>
 			discordEmbedMedia(embed as unknown as DiscordEmbedPayload).images
 		);
-		const image = candidates.find((candidate) => candidate.url === imageUrl || candidate.origin === imageUrl);
+		const image = candidates.find(
+			(candidate) => candidate.url === imageUrl || candidate.origin === imageUrl
+		);
 		const sourceUrl = image?.origin ?? image?.url;
 		if (!image || !sourceUrl) return;
 
@@ -880,16 +882,25 @@ export class Bridge {
 
 		const publicBase = this.cfg.bridge.mediaBaseUrl;
 		if (!publicBase || !publicBase.trim()) {
-			this.log.warn({ messageId, sourceUrl }, 'imagem do embed customizado precisa de mediaBaseUrl público para ser re-hospedada');
+			this.log.warn(
+				{ messageId, sourceUrl },
+				'imagem do embed customizado precisa de mediaBaseUrl público para ser re-hospedada'
+			);
 			return;
 		}
 		try {
 			if (new URL(publicBase).protocol !== 'https:') {
-				this.log.warn({ messageId, publicBase }, 'mediaBaseUrl do bridge precisa usar HTTPS para mídia de embed');
+				this.log.warn(
+				{ messageId, publicBase },
+				'mediaBaseUrl do bridge precisa usar HTTPS para mídia de embed'
+			);
 				return;
 			}
 		} catch {
-			this.log.warn({ messageId, publicBase }, 'mediaBaseUrl inválido para re-hospedar imagem do embed');
+			this.log.warn(
+				{ messageId, publicBase },
+				'mediaBaseUrl inválido para re-hospedar imagem do embed'
+			);
 			return;
 		}
 
@@ -917,7 +928,10 @@ export class Bridge {
 			return;
 		}
 		if (data.length > 5 * 1024 * 1024) {
-			this.log.warn({ messageId, bytes: data.length }, 'imagem de embed customizado excede o limite de download do backend');
+			this.log.warn(
+				{ messageId, bytes: data.length },
+				'imagem de embed customizado excede o limite de download do backend'
+			);
 			return;
 		}
 		const sniffed = this.media.sniffImage(data);
@@ -931,7 +945,10 @@ export class Bridge {
 		if (!publicUrl) return;
 		preview.thumbnail!.url = publicUrl;
 		preview.thumbnail!.mime_type = sniffed.mime;
-		this.log.debug({ messageId, sha: saved.sha256 }, 'imagem do embed do Discord re-hospedada pelo bridge');
+		this.log.debug(
+			{ messageId, sha: saved.sha256 },
+			'imagem do embed do Discord re-hospedada pelo bridge'
+		);
 	}
 
 	/**
