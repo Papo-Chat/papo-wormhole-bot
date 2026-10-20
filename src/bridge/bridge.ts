@@ -1527,7 +1527,7 @@ export class Bridge {
 		this.scheduleLink(link.id);
 	}
 
-	/** Enfileira o preview de link do Discord para cada cópia do Papo. Sincrono: cabe no flush transacional. */
+	/** Enfileira um embed personalizado convertido do Discord para cada cópia do Papo. */
 	private enqueuePapoPreview(
 		link: ChannelLink,
 		maps: MessageMapRow[],
@@ -2317,10 +2317,10 @@ export class Bridge {
 		}
 
 		// modo webhook (espelho do modo webhook do Discord): cada usuário Discord tem um webhook
-		// próprio no canal Papo, com nick + avatar fixos no webhook. `content` = texto do
-		// Discord e os únicos embeds são os previews de link que vieram com a mensagem; a data é
-		// o timestamp nativo do Papo. Sem pool de webhooks (bot sem `manage_webhooks`) o envio
-		// continua pelo cartão do bot — e o avatar nem chega a ser baixado.
+		// próprio no canal Papo, com nick + avatar fixos no webhook. `content` = texto do Discord;
+		// links ficam para o crawler nativo e embeds personalizados de bots/webhooks são enviados
+		// explicitamente. Sem pool de webhooks (bot sem `manage_webhooks`) o envio continua pelo
+		// cartão do bot — e o avatar nem chega a ser baixado.
 		const avatar = this.papoWebhooks && job.authorId ? await this.discordAvatarFor(job) : undefined;
 		const webhook =
 			this.papoWebhooks && job.authorId
@@ -2358,9 +2358,9 @@ export class Bridge {
 		// Discord, o webhook do Papo responde mensagem: a referência do reply é nativa e não
 		// precisa virar nota no texto. Sem cartão, sem rodapé, sem embed de continuação.
 		//
-		// O preview de link também é nativo: o `content` carrega a URL e o backend faz o crawl
-		// dela em background. Reenviar o preview como embed customizado duplicaria o mesmo link
-		// — o crawler do Papo não deduplica contra os embeds da mensagem.
+		// O preview de link é nativo: o `content` carrega a URL e o backend faz o crawl em
+		// background. `job.linkEmbeds` só contém embeds personalizados convertidos; converter
+		// também o preview de hyperlink duplicaria o mesmo link, pois o crawler não deduplica embeds.
 		const webhookContent = this.webhookCopyContent('', text, summary, PAPO_LIMITS.contentMax);
 
 		const signedBase = signedFooter(job.footerBase, signatures[0]!, PAPO_LIMITS.embedFooterMax);
@@ -2861,7 +2861,7 @@ export class Bridge {
 		this.store.updateMapSnapshot(map.id, { link_embeds: previews, embed_revision: job.revision ?? null });
 	}
 
-	/** Preview de link do Discord aplicado à cópia do Papo: o preview do Discord chega atrasado. */
+	/** Aplica um embed personalizado convertido do Discord à cópia do Papo. */
 	private async applyPapoPreviewEdit(env: Envelope, job: EditJob, map: MessageMapRow): Promise<void> {
 		if (map.direction !== 'discord_to_papo') {
 			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'preview ignorado: a cópia editável não está no Papo');
