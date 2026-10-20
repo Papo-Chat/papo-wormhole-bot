@@ -323,17 +323,16 @@ No fluxo Discord → Papo, a política de conversão é: se `content` contém hy
 | `footer.text` | `footer.text` | usado também para data/origem |
 | `fields[]` | `fields[]` | 25 fields, name 256 / value 1024 nos dois |
 
-**Exceção — mídia hospedada pelo Discord.** `thumbnail`/`image`/`video` cuja URL é do CDN do Discord
-(`cdn.discordapp.com` / `media.discordapp.net` em `/attachments/…`, `/embeds/…`) não entram no embed
-do Papo: a URL expira junto com a mensagem original e o hotlink é bloqueado, e o backend do Papo
-não consegue re-servi-la depois. O bridge baixa e re-envia como **anexo** da mensagem
-(`discordHostedMedia` e `discordMediaLinksInContent`, em `previews.ts`) — inclusive o link de
-arquivo colado no texto, que é removido do texto nesse caso (`stripDiscordMediaLinks`, §7). O
-preview que só existia por essa mídia sai do card. Avatar e banner
-(`author.icon_url`) ficam fora da regra: são imagem de identidade, caminho `/avatars/…`, e o
-backend do Papo já re-serva (`author_media`). Preview que chega tarde (`message_edit`) é o único
-caso em que a mídia não pode ser anexada — o Papo não aceita anexo em `PUT /messages/{id}` — então
-ela sai do card e a URL da página continua como link.
+**Exceção — mídia hospedada pelo Discord.** Em previews comuns, `thumbnail`/`image`/`video`
+do CDN do Discord (`cdn.discordapp.com` / `media.discordapp.net`) continuam passando pelo fluxo
+de anexos (`discordHostedMedia` e `discordMediaLinksInContent`, em `previews.ts`), já que a URL
+pode expirar. Há uma exceção para embeds personalizados convertidos de bots/webhooks sem hyperlink
+no `content`: a mídia principal fica no próprio embed para o backend do Papo baixá-la e re-servi-la,
+em vez de aparecer só como um anexo separado. Quando a imagem não declara MIME e a URL não tem
+extensão, o bridge trata o campo `image`/`thumbnail` como imagem para não perdê-la na conversão.
+Links de arquivo colados no texto ainda são baixados como anexo e removidos do texto
+(`stripDiscordMediaLinks`, §7). Avatar e banner (`author.icon_url`) continuam fora da regra:
+são imagens de identidade e o backend do Papo já as re-serve (`author_media`).
 
 Mapeamento Papo Embed → Discord Embed: espelho do acima; `source_type='link'` (preview
 automático do Papo) é recriado no Discord **deixando a URL nua no `content`** — o Discord gera o
