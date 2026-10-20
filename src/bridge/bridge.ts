@@ -68,6 +68,7 @@ import {
 	discordHostedMedia,
 	discordMediaLinksInContent,
 	firstDiscordPreview,
+	hasHyperlinkInContent,
 	firstPapoPreview,
 	mediaKey,
 	rawDiscordEmbeds,
@@ -121,6 +122,11 @@ const replyNoteFor = (link?: string | null, author?: string | null): string => {
 
 /** Buscas no Discord por menção que o payload não trouxe, por mensagem. */
 const MENTION_LOOKUP_LIMIT = 10;
+
+/** Só converte embeds personalizados de bots/webhooks sem URL no conteúdo da mensagem. */
+function shouldConvertCustomDiscordEmbeds(message: { content?: string | null; webhookId?: string | null; author?: { bot?: boolean } | null }): boolean {
+	return Boolean(message.author?.bot || message.webhookId) && !hasHyperlinkInContent(message.content);
+}
 
 /** Identidade de uma reação do Papo, estável entre o evento WS e a execução do job. */
 const papoReactionKey = (e: { emoji_id: string | null; unicode: string | null }): string =>
@@ -1251,6 +1257,7 @@ export class Bridge {
 
 		const bridgeFiles = Boolean(link.bridge_attachments);
 		const rawEmbeds = rawDiscordEmbeds(m.embeds as APIEmbed[]);
+		const convertCustomEmbeds = shouldConvertCustomDiscordEmbeds(m);
 		const gifSourceUrl = gifSourceUrlIn(m.content ?? '', rawEmbeds);
 		// O crawler do backend examina content. Se o Discord trouxe somente o link-preview,
 		// copie a URL da página (não a URL proxy da imagem), sem reescrevê-la.
@@ -1273,14 +1280,14 @@ export class Bridge {
 		const attachmentUrls = m.attachments.map((a) => a.url);
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
-		const preview = link.bridge_embeds && !gifSourceUrl
+		const preview = link.bridge_embeds && convertCustomEmbeds && !gifSourceUrl
 			? firstDiscordPreview(rawEmbeds, attachmentUrls, { rehostDiscordMedia: bridgeFiles })
 			: undefined;
 		// mídia que o Discord hospeda (`cdn.discordapp.com`, `media.discordapp.net`) é volátil:
 		// expira junto com a mensagem original e o hotlink é bloqueado. Ela vira anexo baixado
 		// e re-enviado, nunca URL dentro de embed.
 		const hosted = new Set(attachmentUrls.map(mediaKey).filter(Boolean) as string[]);
-		if (bridgeFiles && link.bridge_embeds) {
+		if (bridgeFiles && link.bridge_embeds && (convertCustomEmbeds || Boolean(gifSourceUrl))) {
 			this.addDiscordMediaSources(m.id, discordHostedMedia(rawEmbeds), sources, hosted);
 		}
 		if (bridgeFiles) {
@@ -1389,6 +1396,7 @@ export class Bridge {
 		await this.cacheMentionedDiscordUsers(fresh);
 		if (this.propagatesMentions(link) && /@/.test(fresh.content ?? '')) await this.ensurePapoNameIndex();
 		const previewEmbeds = rawDiscordEmbeds(fresh.embeds as APIEmbed[]);
+		const convertCustomEmbeds = shouldConvertCustomDiscordEmbeds(fresh);
 		const gifSourceUrl = gifSourceUrlIn(fresh.content ?? '', previewEmbeds);
 		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(gifSourceUrl);
 		await this.warmPapoEmojis(fresh.content ?? '');
@@ -1414,7 +1422,7 @@ export class Bridge {
 				url: attachment.url
 			}));
 			const hosted = new Set(fresh.attachments.map((attachment) => mediaKey(attachment.url)).filter(Boolean) as string[]);
-			if (link.bridge_embeds) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
+			if (link.bridge_embeds && (convertCustomEmbeds || Boolean(gifSourceUrl))) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
 			this.addDiscordMediaSources(
 				fresh.id,
 				discordMediaLinksInContent(fresh.content ?? '').map((url) => ({ url, mime: mimeFromUrl(url) })),
@@ -1447,7 +1455,7 @@ export class Bridge {
 		}
 		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
 		// e sem isso o cartão do Papo fica só com a URL escrita
-		const preview = link.bridge_embeds && !contentMode
+		const preview = link.bridge_embeds && convertCustomEmbeds && !contentMode
 			? firstDiscordPreview(previewEmbeds, fresh.attachments.map((a) => a.url), { rehostDiscordMedia: true })
 			: undefined;
 		if (preview && link.bridge_attachments) {
