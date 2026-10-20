@@ -1292,13 +1292,13 @@ export class Bridge {
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
 		const preview = link.bridge_embeds && convertCustomEmbeds
-			? firstDiscordPreview(rawEmbeds, attachmentUrls, { rehostDiscordMedia: bridgeFiles })
+			? firstDiscordPreview(rawEmbeds, attachmentUrls)
 			: undefined;
 		// mídia que o Discord hospeda (`cdn.discordapp.com`, `media.discordapp.net`) é volátil:
 		// expira junto com a mensagem original e o hotlink é bloqueado. Ela vira anexo baixado
 		// e re-enviado, nunca URL dentro de embed.
 		const hosted = new Set(attachmentUrls.map(mediaKey).filter(Boolean) as string[]);
-		if (bridgeFiles && link.bridge_embeds) {
+		if (bridgeFiles && link.bridge_embeds && !convertCustomEmbeds) {
 			this.addDiscordMediaSources(m.id, discordHostedMedia(rawEmbeds), sources, hosted);
 		}
 		if (bridgeFiles) {
@@ -1439,7 +1439,7 @@ export class Bridge {
 				url: attachment.url
 			}));
 			const hosted = new Set(fresh.attachments.map((attachment) => mediaKey(attachment.url)).filter(Boolean) as string[]);
-			if (link.bridge_embeds) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
+			if (link.bridge_embeds && !convertCustomEmbeds) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
 			this.addDiscordMediaSources(
 				fresh.id,
 				discordMediaLinksInContent(fresh.content ?? '').map((url) => ({ url, mime: mimeFromUrl(url) })),
@@ -1473,9 +1473,9 @@ export class Bridge {
 		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
 		// e sem isso o cartão do Papo fica só com a URL escrita
 		const preview = link.bridge_embeds && convertCustomEmbeds && !contentMode
-			? firstDiscordPreview(previewEmbeds, fresh.attachments.map((a) => a.url), { rehostDiscordMedia: true })
+			? firstDiscordPreview(previewEmbeds, fresh.attachments.map((a) => a.url))
 			: undefined;
-		if (preview && link.bridge_attachments) {
+		if (preview && link.bridge_attachments && !convertCustomEmbeds) {
 			const attachmentKeys = new Set(fresh.attachments.map((a) => mediaKey(a.url)).filter(Boolean));
 			const stripped = discordHostedMedia(previewEmbeds).filter((m) => !attachmentKeys.has(mediaKey(discordMediaSourceUrl(m)) ?? ''));
 			if (stripped.length) {
