@@ -297,6 +297,21 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(api.sent[0]!.embeds![1]!.title).toBe('webhook');
 	});
 
+	it('embed personalizado de bot com content vazio não aciona um segundo preview nativo', async () => {
+		const { bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(
+			discordMessage('dm-bot-empty', '', {
+				authorBot: true,
+				embeds: [richPreview('custom-vazio')]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.embeds).toHaveLength(2);
+		expect(api.sent[0]!.embeds![1]!.title).toBe('custom-vazio');
+		expect(api.sent[0]!.content ?? '').toBe('');
+	});
+
 	it('embed de usuário sem hyperlink não é convertido e sua URL vai para o crawler nativo', async () => {
 		const { bridge, api, settle } = fixture();
 		await bridge.onDiscordMessage(
