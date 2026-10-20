@@ -1314,24 +1314,21 @@ export class Bridge {
 		const previewImageUrl = previewImage?.origin ?? previewImage?.url;
 		if (preview && previewImage && isDiscordCdnHostUrl(previewImageUrl)) {
 			if (bridgeFiles) {
-				const key = mediaKey(previewImageUrl);
-				const alreadyAttached = key && sources.some((source) => mediaKey(source.url) === key);
-				if (!alreadyAttached) {
-					sources.push({
-						side: 'discord',
-						id: `${m.id}:embed-image`,
-						name: this.previewFileName(previewImageUrl!, 'embed-image'),
-						mime: previewImage.mime,
-						sizeBytes: 0,
-						url: previewImageUrl!
-					});
-				}
+				const name = this.discordEmbedAttachmentName(m.id, previewImageUrl!);
+				// Priorize a imagem do embed para que ela esteja no primeiro grupo enviado.
+				sources.unshift({
+					side: 'discord',
+					id: `${m.id}:embed-image`,
+					name,
+					mime: previewImage.mime,
+					sizeBytes: 0,
+					url: previewImageUrl!
+				});
+				preview.thumbnail = { attachment_name: name, mime_type: previewImage.mime };
 			} else {
 				this.log.debug({ messageId: m.id }, 'mídia do embed não copiada: anexos estão desativados no link');
+				preview.thumbnail = undefined;
 			}
-			// Se houver upload, a imagem vai como attachment binário do Papo. Sem upload,
-			// omita a thumbnail de CDN para não pedir ao backend que a baixe.
-			preview.thumbnail = undefined;
 		}
 		// Em previews comuns, a mídia hospedada pelo Discord é reenviada como anexo porque a URL
 		// expira. Em embeds personalizados, a thumbnail/image selecionada também usa esse fluxo
@@ -1483,16 +1480,19 @@ export class Bridge {
 		let previewImageSource: SourceRef | undefined;
 		if (preview && previewImage && isDiscordCdnHostUrl(previewImageUrl)) {
 			if (link.bridge_attachments) {
+				const name = this.discordEmbedAttachmentName(fresh.id, previewImageUrl!);
 				previewImageSource = {
 					side: 'discord',
 					id: `${fresh.id}:embed-image`,
-					name: this.previewFileName(previewImageUrl!, 'embed-image'),
+					name,
 					mime: previewImage.mime,
 					sizeBytes: 0,
 					url: previewImageUrl!
 				};
+				preview.thumbnail = { attachment_name: name, mime_type: previewImage.mime };
+			} else {
+				preview.thumbnail = undefined;
 			}
-			preview.thumbnail = undefined;
 		}
 		const refreshAttachments = attachmentsChanged || Boolean(previewImageSource);
 		if (refreshAttachments) {
@@ -1512,7 +1512,7 @@ export class Bridge {
 				sources,
 				hosted
 			);
-			if (previewImageSource) sources.push(previewImageSource);
+			if (previewImageSource) sources.unshift(previewImageSource);
 			const attachmentJob: EditJob = {
 				kind: 'edit',
 				side: 'discord',
@@ -1895,6 +1895,13 @@ export class Bridge {
 		} catch {
 			return fallback;
 		}
+	}
+
+	/** Nome estável e único para anexos que são usados como mídia de um embed. */
+	private discordEmbedAttachmentName(messageId: string, url: string): string {
+		const prefix = `discord-embed-${messageId}-`;
+		const suffix = this.previewFileName(url, 'image.png').slice(-Math.max(1, 120 - prefix.length));
+		return sanitizeName(`${prefix}${suffix}`).slice(0, 128);
 	}
 
 	/**
