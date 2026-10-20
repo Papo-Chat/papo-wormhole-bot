@@ -68,7 +68,6 @@ import {
 	discordHostedMedia,
 	discordMediaLinksInContent,
 	firstDiscordLinkUrl,
-	firstDiscordPreview,
 	firstDiscordPreviewWithMedia,
 	hasHyperlinkInContent,
 	firstPapoPreview,
@@ -1313,21 +1312,25 @@ export class Bridge {
 		const preview = previewSelection?.preview;
 		const previewImage = previewSelection?.image;
 		const previewImageUrl = previewImage?.origin ?? previewImage?.url;
-		if (preview && previewImage && bridgeFiles && isDiscordCdnHostUrl(previewImageUrl)) {
-			const key = mediaKey(previewImageUrl);
-			const alreadyAttached = key && sources.some((source) => mediaKey(source.url) === key);
-			if (!alreadyAttached) {
-				sources.push({
-					side: 'discord',
-					id: `${m.id}:embed-image`,
-					name: this.previewFileName(previewImageUrl!, 'embed-image'),
-					mime: previewImage.mime,
-					sizeBytes: 0,
-					url: previewImageUrl
-				});
+		if (preview && previewImage && isDiscordCdnHostUrl(previewImageUrl)) {
+			if (bridgeFiles) {
+				const key = mediaKey(previewImageUrl);
+				const alreadyAttached = key && sources.some((source) => mediaKey(source.url) === key);
+				if (!alreadyAttached) {
+					sources.push({
+						side: 'discord',
+						id: `${m.id}:embed-image`,
+						name: this.previewFileName(previewImageUrl!, 'embed-image'),
+						mime: previewImage.mime,
+						sizeBytes: 0,
+						url: previewImageUrl
+					});
+				}
+			} else {
+				this.log.debug({ messageId: m.id }, 'mídia do embed não copiada: anexos estão desativados no link');
 			}
-			// A imagem vai como attachment binário do Papo. Não entregue o URL do CDN
-			// ao backend, que não tem acesso garantido a esses hosts.
+			// Se houver upload, a imagem vai como attachment binário do Papo. Sem upload,
+			// omita a thumbnail de CDN para não pedir ao backend que a baixe.
 			preview.thumbnail = undefined;
 		}
 		// Em previews comuns, a mídia hospedada pelo Discord é re-enviada como anexo porque a URL
