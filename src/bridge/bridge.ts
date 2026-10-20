@@ -2740,6 +2740,7 @@ export class Bridge {
 		let mainEmbed: PapoEmbedInput | undefined;
 		let previousId: string | undefined;
 		const summary = await this.reactionSummaryForMap(mainMap, 'papo');
+		const previewEmbeds = job.linkEmbeds ?? this.mapPreviews<PapoEmbedInput>(mainMap);
 		const content = this.webhookCopyContent(
 			mainMap.reply_note ?? '',
 			refreshedText,
@@ -2755,7 +2756,7 @@ export class Bridge {
 				if (group === 0 && !webhookMode) {
 					embed = await this.papoCopyEmbed(mainMap, mainMap.content_mode || job.contentMode ? '' : refreshedText);
 					mainEmbed = embed;
-					const embeds = [embed, ...this.mapPreviews<PapoEmbedInput>(mainMap)];
+					const embeds = [embed, ...previewEmbeds];
 					message = await this.sendToPapoSafe({
 						channelId: job.targetChannelId,
 						content: mainMap.content_mode || job.contentMode ? clampText(refreshedText, PAPO_LIMITS.contentMax) : undefined,
@@ -2768,6 +2769,7 @@ export class Bridge {
 						content,
 						...(job.replyRefDiscordId ? { replyTo: this.copyForDiscordMessage(job.replyRefDiscordId) } : {}),
 						attachments,
+						...(previewEmbeds.length ? { embeds: previewEmbeds } : {}),
 						externalMessageId: `discord:${job.sourceMessageId}:attachment-refresh:${job.revision ?? Date.now()}:${group}`
 					});
 					if (!sent) throw new RetryableError('webhook do Papo não aceitou a substituição dos anexos');
@@ -2820,6 +2822,7 @@ export class Bridge {
 					footer_base: item.group === 0 ? mainMap.footer_base : null,
 					...(item.group === 0 ? {} : { link_embeds: null }),
 					edit_revision: job.revision ?? null,
+					...(item.group === 0 && job.linkEmbeds !== undefined ? { link_embeds: job.linkEmbeds } : {}),
 					content_mode: item.group === 0 && !webhookMode ? Boolean(mainMap.content_mode || job.contentMode) : false
 				});
 			} else {
