@@ -359,14 +359,16 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(api.sent[0]!.content ?? '').toBe('');
 	});
 
-	it('imagem em embed personalizado de bot vira thumbnail do embed do Papo mesmo sem MIME/extensão', async () => {
-		const { bridge, api, settle } = fixture();
+	it('imagem em embed personalizado de bot vira thumbnail mesmo sem MIME/extensão ou anexo bridgeado', async () => {
+		const { bridge, api, link, store, settle } = fixture();
+		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
 		const imageUrl = 'https://cdn.discordapp.com/attachments/111/222/imagem-sem-extensao';
 		const proxyUrl = 'https://media.discordapp.net/attachments/111/222/imagem-sem-extensao?width=480&height=480';
 
 		await bridge.onDiscordMessage(
 			discordMessage('dm-bot-image', '', {
 				authorBot: true,
+				attachments: [{ id: 'attachment-1', name: 'imagem-sem-extensao', size: 128, url: imageUrl }],
 				embeds: [{
 					type: 'rich',
 					title: 'Sua imagem de perfil.',
