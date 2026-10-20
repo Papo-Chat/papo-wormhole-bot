@@ -144,7 +144,7 @@ function isDiscordCdnHostUrl(rawUrl?: string | null): boolean {
 			'cdn.discordapp.net',
 			'media.discordapp.com',
 			'media.discordapp.net'
-		].includes(url.hostname.toLowerCase());
+		].includes(url.hostname.toLowerCase()) || /^images-ext-\d+\.discordapp\.net$/i.test(url.hostname);
 	} catch {
 		return false;
 	}
@@ -1317,7 +1317,10 @@ export class Bridge {
 			: undefined;
 		const preview = previewSelection?.preview;
 		const previewImage = previewSelection?.image;
-		const previewImageUrl = previewImage?.origin ?? previewImage?.url;
+		const previewImageUrl =
+			[previewImage?.origin, previewImage?.url].find(isDiscordCdnHostUrl) ??
+			previewImage?.origin ??
+			previewImage?.url;
 		if (preview && previewImage && isDiscordCdnHostUrl(previewImageUrl)) {
 			const imageKey = mediaKey(previewImageUrl);
 			if (imageKey) {
