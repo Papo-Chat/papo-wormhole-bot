@@ -436,10 +436,14 @@ export function discordEmbedsToPapo(embeds: DiscordEmbedPayload[], opts: Discord
 		// O Papo renderiza a imagem da thumbnail; a imagem principal vira thumbnail quando é a única.
 		// Só os formatos que o backend decodifica: um avif seria baixado e descartado (o preview
 		// chegaria sem imagem), e um vídeo fora da allowlist faz o backend recusar a mensagem inteira.
-		const image = preferredDiscordEmbedImage(e) ?? previewImageOf({
-			images: images.filter((m) => PAPO_IMAGE_MIMES.includes(m.mime)),
-			videos
-		});
+		const preferredImage = preferredDiscordEmbedImage(e);
+		const image =
+			preferredImage && (!opts.rehostDiscordMedia || !isDiscordHostedMedia(preferredImage))
+				? preferredImage
+				: previewImageOf({
+						images: images.filter((m) => PAPO_IMAGE_MIMES.includes(m.mime)),
+						videos
+					});
 		if (image) {
 			input.thumbnail = { url: clampText(image.url, PAPO_LIMITS.embedUrlMax) };
 			if (image.mime === 'image/gif') input.thumbnail.mime_type = 'image/gif';
