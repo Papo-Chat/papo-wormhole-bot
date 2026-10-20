@@ -388,51 +388,51 @@ describe('preview no bridge Discord → Papo', () => {
 	it(
 		'baixa imagem do CDN do Discord e re-hospeda antes de enviar embed customizado ao Papo',
 		async () => {
-		const { bridge, api, settle } = fixture({ mediaBaseUrl: 'https://bridge.example.com' });
-		const imageUrl = [
-			'https://cdn.discordapp.com/avatars/2065552277044035584/',
-			'b8624b4931b177ada37a361dfcdd83cc.png?size=1024'
-		].join('');
-		const proxyUrl = [
-			'https://images-ext-1.discordapp.net/external/signature/cdn.discordapp.com',
-			new URL(imageUrl).pathname,
-			'?size=1024'
-		].join('');
-		const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
-		const { urls } = await withFetch(
-			async (url) =>
-				url === imageUrl
-					? new Response(pngHeader, { status: 200, headers: { 'content-type': 'image/png' } })
-					: new Response('not found', { status: 404 }),
-			async () => {
-				await bridge.onDiscordMessage(
-					discordMessage('dm-bot-cdn-avatar', '', {
-						authorBot: true,
-						embeds: [{
-							type: 'rich',
-							title: 'Sua imagem de perfil.',
-							image: {
-								url: imageUrl,
-								proxy_url: proxyUrl,
-								content_type: 'image/png',
-								width: 1024,
-								height: 1024
-							}
-						}]
-					})
-				);
-				await settle();
-			}
-		);
-
-		expect(urls).toEqual([imageUrl]);
-		const converted = api.sent[0]!.embeds![1]!;
-		expect(converted.title).toBe('Sua imagem de perfil.');
-		const rehostedUrl = converted.thumbnail?.url ?? '';
-		expect(rehostedUrl).toMatch(/^https:\/\/bridge\.example\.com\/media\/[0-9a-f]{64}\.png$/);
-		expect(converted.thumbnail?.url).not.toContain('discordapp.com');
-		expect(converted.thumbnail?.mime_type).toBe('image/png');
+			const { bridge, api, settle } = fixture({ mediaBaseUrl: 'https://bridge.example.com' });
+			const imageUrl = [
+				'https://cdn.discordapp.com/avatars/2065552277044035584/',
+				'b8624b4931b177ada37a361dfcdd83cc.png?size=1024'
+			].join('');
+			const proxyUrl = [
+				'https://images-ext-1.discordapp.net/external/signature/cdn.discordapp.com',
+				new URL(imageUrl).pathname,
+				'?size=1024'
+			].join('');
+			const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+	
+			const { urls } = await withFetch(
+				async (url) =>
+					url === imageUrl
+						? new Response(pngHeader, { status: 200, headers: { 'content-type': 'image/png' } })
+						: new Response('not found', { status: 404 }),
+				async () => {
+					await bridge.onDiscordMessage(
+						discordMessage('dm-bot-cdn-avatar', '', {
+							authorBot: true,
+							embeds: [{
+								type: 'rich',
+								title: 'Sua imagem de perfil.',
+								image: {
+									url: imageUrl,
+									proxy_url: proxyUrl,
+									content_type: 'image/png',
+									width: 1024,
+									height: 1024
+								}
+							}]
+						})
+					);
+					await settle();
+				}
+			);
+	
+			expect(urls).toEqual([imageUrl]);
+			const converted = api.sent[0]!.embeds![1]!;
+			expect(converted.title).toBe('Sua imagem de perfil.');
+			const rehostedUrl = converted.thumbnail?.url ?? '';
+			expect(rehostedUrl).toMatch(/^https:\/\/bridge\.example\.com\/media\/[0-9a-f]{64}\.png$/);
+			expect(converted.thumbnail?.url).not.toContain('discordapp.com');
+			expect(converted.thumbnail?.mime_type).toBe('image/png');
 		}
 	);
 
