@@ -385,6 +385,34 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(sent.attachments ?? []).toHaveLength(0);
 	});
 
+	it('imagem de embed components de bot também é preservada sem MIME explícito', async () => {
+		const { bridge, api, settle } = fixture();
+		const imageUrl = 'https://cdn.discordapp.com/attachments/111/222/component-image';
+		const proxyUrl = 'https://media.discordapp.net/attachments/111/222/component-image?width=480';
+
+		await bridge.onDiscordMessage(
+			discordMessage('dm-bot-components', '', {
+				authorBot: true,
+				embeds: [{
+					type: 'components',
+					title: 'Imagem do bot',
+					url: 'https://example.com/profile',
+					components: [{
+						type: 17,
+						components: [{
+							type: 12,
+							items: [{ media: { url: imageUrl, proxy_url: proxyUrl, width: 480, height: 480 } }]
+						}]
+					}]
+				}]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.embeds).toHaveLength(2);
+		expect(api.sent[0]!.embeds![1]!.thumbnail?.url).toBe(proxyUrl);
+	});
+
 	it('embed de GIF de bot sem URL no content continua sendo convertido', async () => {
 		const { bridge, api, link, store, settle } = fixture();
 		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
