@@ -385,10 +385,19 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(sent.attachments ?? []).toHaveLength(0);
 	});
 
-	it('baixa imagem do CDN do Discord e re-hospeda antes de enviar embed customizado ao Papo', async () => {
+	it(
+		'baixa imagem do CDN do Discord e re-hospeda antes de enviar embed customizado ao Papo',
+		async () => {
 		const { bridge, api, settle } = fixture({ mediaBaseUrl: 'https://bridge.example.com' });
-		const imageUrl = 'https://cdn.discordapp.com/avatars/2065552277044035584/b8624b4931b177ada37a361dfcdd83cc.png?size=1024';
-		const proxyUrl = 'https://images-ext-1.discordapp.net/external/signature/cdn.discordapp.com/avatars/2065552277044035584/b8624b4931b177ada37a361dfcdd83cc.png?size=1024';
+		const imageUrl = [
+			'https://cdn.discordapp.com/avatars/2065552277044035584/',
+			'b8624b4931b177ada37a361dfcdd83cc.png?size=1024'
+		].join('');
+		const proxyUrl = [
+			'https://images-ext-1.discordapp.net/external/signature/cdn.discordapp.com',
+			new URL(imageUrl).pathname,
+			'?size=1024'
+		].join('');
 		const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 		const { urls } = await withFetch(
@@ -420,10 +429,12 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(urls).toEqual([imageUrl]);
 		const converted = api.sent[0]!.embeds![1]!;
 		expect(converted.title).toBe('Sua imagem de perfil.');
-		expect(converted.thumbnail?.url).toMatch(/^https:\/\/bridge\.example\.com\/media\/[0-9a-f]{64}\.png$/);
+		const rehostedUrl = converted.thumbnail?.url ?? '';
+		expect(rehostedUrl).toMatch(/^https:\/\/bridge\.example\.com\/media\/[0-9a-f]{64}\.png$/);
 		expect(converted.thumbnail?.url).not.toContain('discordapp.com');
 		expect(converted.thumbnail?.mime_type).toBe('image/png');
-	});
+		}
+	);
 
 	it('imagem de embed components de bot também é preservada sem MIME explícito', async () => {
 		const { bridge, api, settle } = fixture();
