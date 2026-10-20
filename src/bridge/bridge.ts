@@ -1323,7 +1323,7 @@ export class Bridge {
 						name: this.previewFileName(previewImageUrl!, 'embed-image'),
 						mime: previewImage.mime,
 						sizeBytes: 0,
-						url: previewImageUrl
+						url: previewImageUrl!
 					});
 				}
 			} else {
@@ -1489,7 +1489,7 @@ export class Bridge {
 					name: this.previewFileName(previewImageUrl!, 'embed-image'),
 					mime: previewImage.mime,
 					sizeBytes: 0,
-					url: previewImageUrl
+					url: previewImageUrl!
 				};
 			}
 			preview.thumbnail = undefined;
