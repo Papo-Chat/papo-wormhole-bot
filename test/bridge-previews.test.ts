@@ -1101,7 +1101,8 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://cdn.discordapp.com/attachments/111/222/clipe.mp4'));
 		await settle();
 
-		expect(api.sent[0]!.embeds![0]!.description).toBe('https://cdn.discordapp.com/attachments/111/222/clipe.mp4');
+		expect(api.sent[0]!.embeds![0]!.description).toBe('');
+		expect(api.sent[0]!.content).toContain('https://cdn.discordapp.com/attachments/111/222/clipe.mp4');
 	});
 
 	it('a mesma mídia servida por outro host não é baixada duas vezes', async () => {
@@ -1299,9 +1300,10 @@ describe('link de anexo do Discord com assinatura vencida', () => {
 
 		const sent = api.sent[0]!;
 		expect(sent.attachments ?? []).toHaveLength(0);
-		expect(sent.embeds![0]!.description).toContain('olha o gif');
-		expect(sent.embeds![0]!.description).toContain('morto.gif');
-		expect(sent.embeds![0]!.description).toContain('não está mais disponível');
+		expect(sent.embeds![0]!.description).toBe('');
+		expect(sent.content).toContain('olha o gif');
+		expect(sent.content).toContain('morto.gif');
+		expect(sent.content).toContain('não está mais disponível');
 		// o job não vai para `dead`: perder um arquivo não é motivo para perder a mensagem
 		expect(outbox.counts().dead).toBe(0);
 	});
