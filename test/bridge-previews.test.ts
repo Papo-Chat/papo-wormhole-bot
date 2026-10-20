@@ -263,7 +263,7 @@ describe('preview no bridge Discord → Papo', () => {
 	it('URL no conteúdo fica para o preview nativo do Papo, sem embed duplicado', async () => {
 		const { bridge, api, settle } = fixture();
 
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'olá https://example.com/a', { embeds: [richPreview('primeiro'), richPreview('segundo')] }));
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'olá https://example.com/a', { authorBot: true, embeds: [richPreview('primeiro'), richPreview('segundo')] }));
 		await settle();
 
 		const embeds = api.sent[0]!.embeds ?? [];
