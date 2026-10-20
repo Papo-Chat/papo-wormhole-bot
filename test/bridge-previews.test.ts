@@ -388,7 +388,7 @@ describe('preview no bridge Discord → Papo', () => {
 	it(
 		'faz upload da image do CDN e usa o attachment como thumbnail do embed, sem media server',
 		async () => {
-			const { bridge, api, settle } = fixture({ mediaBaseUrl: null });
+			const { bridge, api, settle } = fixture();
 			const imageUrl = [
 				'https://cdn.discordapp.com/avatars/2065552277044035584/',
 				'b8624b4931b177ada37a361dfcdd83cc.png?size=1024'
@@ -440,7 +440,7 @@ describe('preview no bridge Discord → Papo', () => {
 	);
 
 	it('recria a cópia e anexa a imagem se o embed do bot ganha mídia numa edição', async () => {
-		const { bridge, api, settle } = fixture({ mediaBaseUrl: null });
+		const { bridge, api, settle } = fixture();
 		const imageUrl = 'https://cdn.discordapp.com/avatars/123456789/edited-image.png?size=1024';
 		const proxyUrl = 'https://images-ext-1.discordapp.net/external/signature/edited-image.png';
 		const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -485,7 +485,7 @@ describe('preview no bridge Discord → Papo', () => {
 	});
 
 	it('prefere thumbnail do Discord e usa image apenas quando thumbnail falta', async () => {
-		const { bridge, api, settle } = fixture({ mediaBaseUrl: null });
+		const { bridge, api, settle } = fixture();
 		const thumbnailUrl = 'https://images.example.com/thumb.png';
 		const imageUrl = 'https://cdn.discordapp.com/avatars/123456789/image.png?size=1024';
 
