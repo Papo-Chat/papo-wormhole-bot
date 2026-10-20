@@ -1313,31 +1313,24 @@ export class Bridge {
 		const previewImage = previewSelection?.image;
 		const previewImageUrl = previewImage?.origin ?? previewImage?.url;
 		if (preview && previewImage && isDiscordCdnHostUrl(previewImageUrl)) {
-			if (bridgeFiles) {
-				const imageKey = mediaKey(previewImageUrl);
-				if (imageKey) {
-					for (let i = sources.length - 1; i >= 0; i--) {
-						if (mediaKey(sources[i]!.url) === imageKey) sources.splice(i, 1);
-					}
+			const imageKey = mediaKey(previewImageUrl);
+			if (imageKey) {
+				for (let i = sources.length - 1; i >= 0; i--) {
+					if (mediaKey(sources[i]!.url) === imageKey) sources.splice(i, 1);
 				}
-				const name = this.discordEmbedAttachmentName(m.id, previewImageUrl!);
-				// Priorize a imagem do embed para que ela esteja no primeiro grupo enviado.
-				sources.unshift({
-					side: 'discord',
-					id: `${m.id}:embed-image`,
-					name,
-					mime: previewImage.mime,
-					sizeBytes: 0,
-					url: previewImageUrl!
-				});
-				preview.thumbnail = { attachment_name: name, mime_type: previewImage.mime };
-			} else {
-				this.log.debug(
-					{ messageId: m.id },
-					'mídia do embed não copiada: anexos estão desativados no link'
-				);
-				preview.thumbnail = undefined;
 			}
+			// A imagem faz parte do embed customizado, então é enviada mesmo se o link
+			// desativar o espelhamento de attachments comuns.
+			const name = this.discordEmbedAttachmentName(m.id, previewImageUrl!);
+			sources.unshift({
+				side: 'discord',
+				id: `${m.id}:embed-image`,
+				name,
+				mime: previewImage.mime,
+				sizeBytes: 0,
+				url: previewImageUrl!
+			});
+			preview.thumbnail = { attachment_name: name, mime_type: previewImage.mime };
 		}
 		// Em previews comuns, a mídia hospedada pelo Discord é reenviada como anexo porque a URL
 		// expira. Em embeds personalizados, os bytes do CDN também são enviados como arquivo, mas
@@ -1485,25 +1478,21 @@ export class Bridge {
 		const previewImageUrl = previewImage?.origin ?? previewImage?.url;
 		let previewImageSource: SourceRef | undefined;
 		if (preview && previewImage && isDiscordCdnHostUrl(previewImageUrl)) {
-			if (link.bridge_attachments) {
-				const name = this.discordEmbedAttachmentName(fresh.id, previewImageUrl!);
-				previewImageSource = {
-					side: 'discord',
-					id: `${fresh.id}:embed-image`,
-					name,
-					mime: previewImage.mime,
-					sizeBytes: 0,
-					url: previewImageUrl!
-				};
-				preview.thumbnail = { attachment_name: name, mime_type: previewImage.mime };
-			} else {
-				preview.thumbnail = undefined;
-			}
+			const name = this.discordEmbedAttachmentName(fresh.id, previewImageUrl!);
+			previewImageSource = {
+				side: 'discord',
+				id: `${fresh.id}:embed-image`,
+				name,
+				mime: previewImage.mime,
+				sizeBytes: 0,
+				url: previewImageUrl!
+			};
+			preview.thumbnail = { attachment_name: name, mime_type: previewImage.mime };
 		}
 		const refreshAttachments = attachmentsChanged || Boolean(previewImageSource);
 		if (refreshAttachments) {
 			const previewMediaKey = mediaKey(previewImageSource?.url);
-			const sources: SourceRef[] = fresh.attachments
+			const sources: SourceRef[] = (link.bridge_attachments ? fresh.attachments : [])
 				.filter((attachment) => !previewMediaKey || mediaKey(attachment.url) !== previewMediaKey)
 				.map((attachment) => ({
 					side: 'discord',
@@ -1514,13 +1503,17 @@ export class Bridge {
 				url: attachment.url
 			}));
 			const hosted = new Set(fresh.attachments.map((attachment) => mediaKey(attachment.url)).filter(Boolean) as string[]);
-			if (link.bridge_embeds && !convertCustomEmbeds) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
-			this.addDiscordMediaSources(
-				fresh.id,
-				discordMediaLinksInContent(fresh.content ?? '').map((url) => ({ url, mime: mimeFromUrl(url) })),
-				sources,
-				hosted
-			);
+			if (link.bridge_attachments && link.bridge_embeds && !convertCustomEmbeds) {
+				this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
+			}
+			if (link.bridge_attachments) {
+				this.addDiscordMediaSources(
+					fresh.id,
+					discordMediaLinksInContent(fresh.content ?? '').map((url) => ({ url, mime: mimeFromUrl(url) })),
+					sources,
+					hosted
+				);
+			}
 			if (previewImageSource) sources.unshift(previewImageSource);
 			const attachmentJob: EditJob = {
 				kind: 'edit',
