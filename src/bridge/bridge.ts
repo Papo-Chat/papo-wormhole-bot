@@ -45,7 +45,6 @@ import {
 	buildDiscordBridgeEmbed,
 	buildPapoBridgeEmbed,
 	discordApiEmbed,
-	discordEmbedMedia,
 	discordLinkIsStale,
 	discordMediaSourceUrl,
 	discordSignatureExpiry,
@@ -70,6 +69,7 @@ import {
 	discordMediaLinksInContent,
 	firstDiscordLinkUrl,
 	firstDiscordPreview,
+	firstDiscordPreviewWithMedia,
 	hasHyperlinkInContent,
 	firstPapoPreview,
 	mediaKey,
@@ -128,6 +128,21 @@ const MENTION_LOOKUP_LIMIT = 10;
 /** Só converte embeds personalizados de bots/webhooks sem URL no conteúdo da mensagem. */
 function shouldConvertCustomDiscordEmbeds(message: { content?: string | null; webhookId?: string | null; author?: { bot?: boolean } | null }): boolean {
 	return Boolean(message.author?.bot || message.webhookId) && !hasHyperlinkInContent(message.content);
+}
+
+function isDiscordCdnHostUrl(rawUrl?: string | null): boolean {
+	if (!rawUrl) return false;
+	try {
+		const url = new URL(rawUrl);
+		return url.protocol === 'https:' && [
+			'cdn.discordapp.com',
+			'cdn.discordapp.net',
+			'media.discordapp.com',
+			'media.discordapp.net'
+		].includes(url.hostname.toLowerCase());
+	} catch {
+		return false;
+	}
 }
 
 /** Identidade de uma reação do Papo, estável entre o evento WS e a execução do job. */
@@ -845,116 +860,6 @@ export class Bridge {
 	}
 
 	/**
-	 * O backend do Papo não consegue baixar mídia do CDN do Discord. Baixe a imagem no bot,
-	 * salve no MediaStore e entregue ao backend uma URL pública do próprio bridge para que ele
-	 * faça o download autorizado e persista a mídia no embed.
-	 */
-	private async rehostDiscordCustomEmbedImage(
-		preview: PapoEmbedInput,
-		embeds: readonly APIEmbed[],
-		messageId: string
-	): Promise<void> {
-		const imageUrl = preview.thumbnail?.url;
-		if (!imageUrl) return;
-
-		const candidates = embeds.flatMap((embed) =>
-			discordEmbedMedia(embed as unknown as DiscordEmbedPayload).images
-		);
-		const image = candidates.find(
-			(candidate) => candidate.url === imageUrl || candidate.origin === imageUrl
-		);
-		const sourceUrl = image?.origin ?? image?.url;
-		if (!image || !sourceUrl) return;
-
-		let parsed: URL;
-		try {
-			parsed = new URL(sourceUrl);
-		} catch {
-			return;
-		}
-		const discordCdnHosts = new Set([
-			'cdn.discordapp.com',
-			'cdn.discordapp.net',
-			'media.discordapp.com',
-			'media.discordapp.net'
-		]);
-		if (parsed.protocol !== 'https:' || !discordCdnHosts.has(parsed.hostname.toLowerCase())) return;
-
-		const publicBase = this.cfg.bridge.mediaBaseUrl;
-		if (!publicBase || !publicBase.trim()) {
-			this.log.warn(
-				{ messageId, sourceUrl },
-				'imagem do embed customizado precisa de mediaBaseUrl público para ser re-hospedada'
-			);
-			return;
-		}
-		try {
-			if (new URL(publicBase).protocol !== 'https:') {
-				this.log.warn(
-				{ messageId, publicBase },
-				'mediaBaseUrl do bridge precisa usar HTTPS para mídia de embed'
-			);
-				return;
-			}
-		} catch {
-			this.log.warn(
-				{ messageId, publicBase },
-				'mediaBaseUrl inválido para re-hospedar imagem do embed'
-			);
-			return;
-		}
-
-		let data: Buffer | undefined;
-		try {
-			if (/^\/(?:embed\/)?attachments\//i.test(parsed.pathname)) {
-				data = await this.downloadDiscordFile({
-					side: 'discord',
-					id: `${messageId}:embed-image`,
-					name: this.previewFileName(sourceUrl, 'embed-image'),
-					mime: image.mime,
-					sizeBytes: 0,
-					url: sourceUrl
-				});
-			} else {
-				data = await this.fetchDiscordFile(sourceUrl);
-			}
-		} catch (err) {
-			if (err instanceof RetryableError) throw err;
-			this.log.debug({ err, messageId, sourceUrl }, 'download da imagem de embed customizado falhou');
-			return;
-		}
-		if (!data?.length) {
-			this.log.debug(
-				{ messageId, sourceUrl },
-				'imagem de embed customizado não está disponível no CDN'
-			);
-			return;
-		}
-		if (data.length > 5 * 1024 * 1024) {
-			this.log.warn(
-				{ messageId, bytes: data.length },
-				'imagem de embed customizado excede o limite de download do backend'
-			);
-			return;
-		}
-		const sniffed = this.media.sniffImage(data);
-		if (!sniffed) {
-			this.log.warn({ messageId, sourceUrl }, 'imagem de embed customizado tem formato não suportado');
-			return;
-		}
-
-		const saved = this.media.save(data, sniffed.mime, `discord-embed:${messageId}`);
-		const publicUrl = this.media.urlFor(saved.sha256, publicBase);
-		if (!publicUrl) return;
-		preview.thumbnail!.url = publicUrl;
-		preview.thumbnail!.mime_type = sniffed.mime;
-		this.log.debug(
-			{ messageId, sha: saved.sha256 },
-			'imagem do embed do Discord re-hospedada pelo bridge'
-		);
-	}
-
-	/**
 	 * Mídia do preview de link, materializada no cache do bridge.
 	 *
 	 * Imagem: o payload do Papo não traz URL — só mime/medidas; os bytes vêm de
@@ -1402,10 +1307,29 @@ export class Bridge {
 		const attachmentUrls = m.attachments.map((a) => a.url);
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
-		const preview = link.bridge_embeds && convertCustomEmbeds
-			? firstDiscordPreview(rawEmbeds, bridgeFiles ? attachmentUrls : [])
+		const previewSelection = link.bridge_embeds && convertCustomEmbeds
+			? firstDiscordPreviewWithMedia(rawEmbeds, bridgeFiles ? attachmentUrls : [])
 			: undefined;
-		if (preview) await this.rehostDiscordCustomEmbedImage(preview, rawEmbeds, m.id);
+		const preview = previewSelection?.preview;
+		const previewImage = previewSelection?.image;
+		const previewImageUrl = previewImage?.origin ?? previewImage?.url;
+		if (preview && previewImage && bridgeFiles && isDiscordCdnHostUrl(previewImageUrl)) {
+			const key = mediaKey(previewImageUrl);
+			const alreadyAttached = key && sources.some((source) => mediaKey(source.url) === key);
+			if (!alreadyAttached) {
+				sources.push({
+					side: 'discord',
+					id: `${m.id}:embed-image`,
+					name: this.previewFileName(previewImageUrl!, 'embed-image'),
+					mime: previewImage.mime,
+					sizeBytes: 0,
+					url: previewImageUrl
+				});
+			}
+			// A imagem vai como attachment binário do Papo. Não entregue o URL do CDN
+			// ao backend, que não tem acesso garantido a esses hosts.
+			preview.thumbnail = undefined;
+		}
 		// Em previews comuns, a mídia hospedada pelo Discord é re-enviada como anexo porque a URL
 		// expira. Embeds personalizados convertidos são exceção: preservamos a mídia no próprio
 		// embed para o backend do Papo re-hospedá-la e não perder o visual do cartão.
