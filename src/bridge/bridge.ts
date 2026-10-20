@@ -1354,7 +1354,7 @@ export class Bridge {
 				authorAvatarHash: m.author.avatar ?? undefined,
 				authorAvatarUrl: avatarUrl,
 				content: chunkContent,
-				contentMode: Boolean(gifSourceUrl && !convertCustomEmbeds),
+				contentMode: Boolean(!convertCustomEmbeds && (gifSourceUrl || (link.bridge_embeds && (hasHyperlinkInContent(m.content ?? '') || injectNativePreviewUrl)))),
 				footerBase: `🕒 ${formatDate(m.createdAt.toISOString(), this.cfg.bridge.timezone)} · Discord${chunkLabel(i, total)}`,
 				notes: [],
 				sources: i === 0 ? sources : [],
@@ -1411,7 +1411,7 @@ export class Bridge {
 		const nativePreviewUrl = link.bridge_embeds && !convertCustomEmbeds ? firstDiscordLinkUrl(previewEmbeds) : undefined;
 		const injectNativePreviewUrl = Boolean(nativePreviewUrl && !hasHyperlinkInContent(fresh.content ?? ''));
 		const gifSourceUrl = gifSourceUrlIn(fresh.content ?? '', previewEmbeds);
-		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(gifSourceUrl && !convertCustomEmbeds);
+		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(!convertCustomEmbeds && (gifSourceUrl || (link.bridge_embeds && (hasHyperlinkInContent(fresh.content ?? '') || injectNativePreviewUrl))));
 		await this.warmPapoEmojis(fresh.content ?? '');
 		const translated = discordToPapoContent(fresh.content ?? '', this.resolvers(link));
 		const edited = !convertCustomEmbeds && gifSourceUrl
