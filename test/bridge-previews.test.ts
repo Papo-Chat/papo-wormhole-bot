@@ -386,7 +386,7 @@ describe('preview no bridge Discord → Papo', () => {
 	});
 
 	it(
-		'faz upload da image do CDN como attachment quando ela é fallback da thumbnail, sem media server',
+		'faz upload da image do CDN e usa o attachment como thumbnail do embed, sem media server',
 		async () => {
 			const { bridge, api, settle } = fixture({ mediaBaseUrl: null });
 			const imageUrl = [
@@ -430,7 +430,10 @@ describe('preview no bridge Discord → Papo', () => {
 			const sent = api.sent[0]!;
 			expect(sent.embeds).toHaveLength(2);
 			expect(sent.embeds![1]!.title).toBe('Sua imagem de perfil.');
-			expect(sent.embeds![1]!.thumbnail).toBeUndefined();
+			const thumbnail = sent.embeds![1]!.thumbnail!;
+			expect(thumbnail.url).toBeUndefined();
+			expect(thumbnail.attachment_name).toBe(sent.attachments![0]!.name);
+			expect(thumbnail.mime_type).toBe('image/png');
 			expect(sent.attachments).toHaveLength(1);
 			expect(sent.attachments![0]!.name).toContain('b8624b4931b177ada37a361dfcdd83cc.png');
 		}
@@ -501,6 +504,7 @@ describe('preview no bridge Discord → Papo', () => {
 
 		const sent = api.sent[0]!;
 		expect(sent.embeds![1]!.thumbnail?.url).toBe(thumbnailUrl);
+		expect(sent.embeds![1]!.thumbnail?.attachment_name).toBeUndefined();
 		expect(sent.attachments ?? []).toHaveLength(0);
 	});
 
