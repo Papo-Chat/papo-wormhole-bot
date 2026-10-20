@@ -1333,9 +1333,9 @@ export class Bridge {
 			// omita a thumbnail de CDN para não pedir ao backend que a baixe.
 			preview.thumbnail = undefined;
 		}
-		// Em previews comuns, a mídia hospedada pelo Discord é re-enviada como anexo porque a URL
-		// expira. Embeds personalizados convertidos são exceção: preservamos a mídia no próprio
-		// embed para o backend do Papo re-hospedá-la e não perder o visual do cartão.
+		// Em previews comuns, a mídia hospedada pelo Discord é reenviada como anexo porque a URL
+		// expira. Em embeds personalizados, a thumbnail/image selecionada também usa esse fluxo
+		// quando o host é o CDN do Discord; o campo thumbnail fica vazio para evitar fetch externo.
 		const hosted = new Set(attachmentUrls.map(mediaKey).filter(Boolean) as string[]);
 		if (bridgeFiles && link.bridge_embeds && !convertCustomEmbeds) {
 			this.addDiscordMediaSources(m.id, discordHostedMedia(rawEmbeds), sources, hosted);
