@@ -655,82 +655,96 @@ const withFetch = async <T>(handler: (url: string) => Promise<Response>, run: ()
 };
 
 describe('preview do Discord que chega depois da mensagem', () => {
-	it('MESSAGE_UPDATE com o link-preview aplica o preview à cópia do Papo', async () => {
+	it('MESSAGE_UPDATE com hyperlink mantém o preview nativo e não converte o embed', async () => {
 		const { bridge, api, settle } = fixture();
+		const url = 'https://www.oginstagram.com/reel/DeSKFT8BTKO/';
 
-		// o Discord cria a mensagem sem o preview: a cópia sai só com o cartão
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
+		await bridge.onDiscordMessage(discordMessage('dm-1', url, { authorBot: false }));
 		await settle();
 		expect(api.sent[0]!.embeds).toHaveLength(1);
 
 		await bridge.onDiscordEdit(
 			{} as never,
-			discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] })
+			discordMessage('dm-1', url, { authorBot: false, embeds: [ogInstagramPreview()] })
+		);
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(1);
+		expect(last.embeds[0]!.author?.name).toBe('Jenga');
+		expect(last.embeds[0]!.description).toContain(url);
+		expect(last.embeds.some((e) => e.title === 'South America Memes')).toBe(false);
+	});
+
+	it('hyperlink do Discord não é persistido como embed do bridge nas edições', async () => {
+		const { store, bridge, api, settle } = fixture();
+		const url = 'https://www.oginstagram.com/reel/DeSKFT8BTKO/';
+		await bridge.onDiscordMessage(discordMessage('dm-1', url, { authorBot: false }));
+		await settle();
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', url, { authorBot: false, embeds: [ogInstagramPreview()] }));
+		await settle();
+
+		expect(store.findMapByDiscord('dm-1')[0]!.link_embeds).toBeFalsy();
+
+		await bridge.onDiscordEdit(
+			{} as never,
+			discordMessage('dm-1', 'texto corrigido', { authorBot: false, embeds: [ogInstagramPreview()] })
+		);
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(1);
+		expect(last.embeds[0]!.description).toContain('texto corrigido');
+		expect(last.embeds[0]!.description).toContain(url);
+	});
+
+	it('MESSAGE_UPDATE repetido não duplica o hyperlink como embed', async () => {
+		const { bridge, api, settle } = fixture();
+		const url = 'https://www.oginstagram.com/reel/DeSKFT8BTKO/';
+		await bridge.onDiscordMessage(discordMessage('dm-1', url, { authorBot: false }));
+		await settle();
+
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', url, { authorBot: false, embeds: [ogInstagramPreview()] }));
+		await settle();
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', url, { authorBot: false, embeds: [ogInstagramPreview()] }));
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(1);
+		expect(last.embeds.some((e) => e.title === 'South America Memes')).toBe(false);
+	});
+
+	it('hyperlink recebido antes do mapeamento não gera embed adiado', async () => {
+		const { store, bridge, api, outbox, settle } = fixture({ bridgeEdits: false });
+		const url = 'https://www.oginstagram.com/reel/DeSKFT8BTKO/';
+
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', url, { authorBot: false, embeds: [ogInstagramPreview()] }));
+		expect(store.peekDeferredEvents('discord', 'dm-1')).toEqual([]);
+
+		await bridge.onDiscordMessage(discordMessage('dm-1', url, { authorBot: false }));
+		await settle();
+
+		expect(store.peekDeferredEvents('discord', 'dm-1')).toEqual([]);
+		expect(api.sent[0]!.embeds).toHaveLength(1);
+		expect(outbox.counts().dead).toBe(0);
+	});
+
+	it('embed personalizado de bot sem hyperlink é convertido quando chega por edição', async () => {
+		const { bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'status do serviço', { authorBot: true }));
+		await settle();
+
+		await bridge.onDiscordEdit(
+			{} as never,
+			discordMessage('dm-1', 'status do serviço', { authorBot: true, embeds: [ogInstagramPreview()] })
 		);
 		await settle();
 
 		const last = api.edits.at(-1)!;
 		expect(last.embeds).toHaveLength(2);
-		// o cartão continua primeiro e intacto; o preview entra atrás
-		expect(last.embeds[0]!.author?.name).toBe('Jenga');
-		expect(last.embeds[0]!.description).toContain('oginstagram');
-		expect(last.embeds[1]!.title).toBe('South America Memes');
-		expect(last.embeds[1]!.description).toContain('ligando pra nada');
-		// o mp4 do carrossel vira vídeo no Papo: é o que faz o preview ter player
-		expect(last.embeds[1]!.video?.mime_type).toBe('video/mp4');
-		expect(last.embeds[1]!.video?.url).toContain('oginstagram.com/offload/DeSKFT8BTKO/1');
-	});
-
-	it('preview do Discord fica no mapa e sobrevive às edições seguintes', async () => {
-		const { store, bridge, api, settle } = fixture();
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
-		await settle();
-		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
-		await settle();
-
-		expect(JSON.parse(store.findMapByDiscord('dm-1')[0]!.link_embeds!) as EmbedLike[]).toHaveLength(1);
-
-		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'texto corrigido', { embeds: [ogInstagramPreview()] }));
-		await settle();
-
-		const last = api.edits.at(-1)!;
-		expect(last.embeds).toHaveLength(2);
-		expect(last.embeds[0]!.description).toContain('texto corrigido');
 		expect(last.embeds[1]!.title).toBe('South America Memes');
 	});
-
-	it('MESSAGE_UPDATE repetido não duplica o preview', async () => {
-		const { bridge, api, settle } = fixture();
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
-		await settle();
-
-		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
-		await settle();
-		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
-		await settle();
-
-		const last = api.edits.at(-1)!;
-		expect(last.embeds.filter((e) => e.title === 'South America Memes')).toHaveLength(1);
-	});
-
-	it('preview que chega antes do mapeamento espera a cópia em vez de se perder', async () => {
-		const { store, bridge, api, outbox, settle } = fixture({ bridgeEdits: false });
-
-		// o MESSAGE_UPDATE chega antes do MESSAGE_CREATE bridgeado: sem destino, o preview fica
-		// adiado e é enfileirado pelo flush que acompanha a criação do mapeamento
-		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
-		expect(store.peekDeferredEvents('discord', 'dm-1').map((e) => e.kind)).toEqual(['embeds']);
-
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
-		await settle();
-
-		expect(store.peekDeferredEvents('discord', 'dm-1')).toEqual([]);
-		const last = api.edits.at(-1)!;
-		expect(last.embeds).toHaveLength(2);
-		expect(last.embeds[1]!.title).toBe('South America Memes');
-		expect(outbox.counts().dead).toBe(0);
-	});
-
+	
 	it.each([
 		['Tenor', 'https://tenor.com/view/funny-gif-1234567890', 'https://media.tenor.com/abc/tenor.gif'],
 		['Giphy', 'https://giphy.com/gifs/lkdH8FmImcGoylv3t3', 'https://media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif'],
