@@ -758,6 +758,23 @@ describe('preview do Discord que chega depois da mensagem', () => {
 		expect(last.embeds.some((e) => e.title === 'South America Memes')).toBe(false);
 	});
 
+	it('URL de preview que chega tarde é inserida mesmo com edições de texto desligadas', async () => {
+		const { bridge, api, settle } = fixture({ bridgeEdits: false });
+		const content = 'abrindo uma página';
+		await bridge.onDiscordMessage(discordMessage('dm-late-native', content, { authorBot: false }));
+		await settle();
+
+		await bridge.onDiscordEdit(
+			{} as never,
+			discordMessage('dm-late-native', content, { authorBot: false, embeds: [richPreview('nativo-tardio')] })
+		);
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(1);
+		expect(last.embeds[0]!.description).toContain('https://example.com/nativo-tardio');
+	});
+
 	it('hyperlink recebido antes do mapeamento não gera embed adiado', async () => {
 		const { store, bridge, api, outbox, settle } = fixture({ bridgeEdits: false });
 		const url = 'https://www.oginstagram.com/reel/DeSKFT8BTKO/';
