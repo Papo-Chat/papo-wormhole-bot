@@ -436,6 +436,51 @@ describe('preview no bridge Discord → Papo', () => {
 		}
 	);
 
+	it('recria a cópia e anexa a imagem se o embed do bot ganha mídia numa edição', async () => {
+		const { bridge, api, settle } = fixture({ mediaBaseUrl: null });
+		const imageUrl = 'https://cdn.discordapp.com/avatars/123456789/edited-image.png?size=1024';
+		const proxyUrl = 'https://images-ext-1.discordapp.net/external/signature/edited-image.png';
+		const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+		const { urls } = await withFetch(
+			async (url) =>
+				url === imageUrl
+					? new Response(pngHeader, { status: 200, headers: { 'content-type': 'image/png' } })
+					: new Response('not found', { status: 404 }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-late-bot-image', 'status do bot', { authorBot: true })
+				);
+				await settle();
+
+				await bridge.onDiscordEdit(
+					{} as never,
+					discordMessage('dm-late-bot-image', 'status do bot', {
+						authorBot: true,
+						embeds: [{
+							type: 'rich',
+							title: 'Imagem recebida depois',
+							image: {
+								url: imageUrl,
+								proxy_url: proxyUrl,
+								content_type: 'image/png',
+								width: 1024,
+								height: 1024
+							}
+						}]
+					})
+				);
+				await settle();
+			}
+		);
+
+		expect(urls).toEqual([imageUrl]);
+		expect(api.sent).toHaveLength(2);
+		expect(api.sent[1]!.embeds![1]!.title).toBe('Imagem recebida depois');
+		expect(api.sent[1]!.embeds![1]!.thumbnail).toBeUndefined();
+		expect(api.sent[1]!.attachments).toHaveLength(1);
+	});
+
 	it('prefere thumbnail do Discord e usa image apenas quando thumbnail falta', async () => {
 		const { bridge, api, settle } = fixture({ mediaBaseUrl: null });
 		const thumbnailUrl = 'https://images.example.com/thumb.png';
