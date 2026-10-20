@@ -1567,6 +1567,7 @@ export class Bridge {
 		const preview = link.bridge_embeds && convertCustomEmbeds && !contentMode
 			? firstDiscordPreview(previewEmbeds, link.bridge_attachments ? fresh.attachments.map((a) => a.url) : [])
 			: undefined;
+		if (preview) await this.rehostDiscordCustomEmbedImage(preview, previewEmbeds, fresh.id);
 		if (preview && link.bridge_attachments && !convertCustomEmbeds) {
 			const attachmentKeys = new Set(fresh.attachments.map((a) => mediaKey(a.url)).filter(Boolean));
 			const stripped = discordHostedMedia(previewEmbeds).filter((m) => !attachmentKeys.has(mediaKey(discordMediaSourceUrl(m)) ?? ''));
