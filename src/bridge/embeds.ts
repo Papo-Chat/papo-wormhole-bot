@@ -552,11 +552,7 @@ export function papoEmbedsToDiscord(
 		}
 		const media = opts.mediaFor?.(e);
 		const image = e.image?.url ?? e.thumbnail?.url ?? opts.thumbnailUrlFor?.(e) ?? media?.thumbnailUrl;
-		if (image) {
-			payload.image = { url: image };
-			const mime = e.image?.mime_type ?? e.thumbnail?.mime_type;
-			if (mime === 'image/gif') payload.image.content_type = mime;
-		}
+		if (image) payload.image = { url: image };
 		if (media?.refs?.length) payload.media_refs = media.refs;
 		if (Object.keys(payload).length) out.push(payload);
 	}
