@@ -924,7 +924,10 @@ export class Bridge {
 			return;
 		}
 		if (!data?.length) {
-			this.log.debug({ messageId, sourceUrl }, 'imagem de embed customizado não está disponível no CDN');
+			this.log.debug(
+				{ messageId, sourceUrl },
+				'imagem de embed customizado não está disponível no CDN'
+			);
 			return;
 		}
 		if (data.length > 5 * 1024 * 1024) {
