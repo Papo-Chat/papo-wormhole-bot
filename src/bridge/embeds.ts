@@ -551,8 +551,8 @@ export function papoEmbedsToDiscord(
 			}));
 		}
 		const media = opts.mediaFor?.(e);
-		const thumb = e.thumbnail?.url ?? e.image?.url ?? opts.thumbnailUrlFor?.(e) ?? media?.thumbnailUrl;
-		if (thumb) payload.thumbnail = { url: thumb };
+		const image = e.image?.url ?? e.thumbnail?.url ?? opts.thumbnailUrlFor?.(e) ?? media?.thumbnailUrl;
+		if (image) payload.image = { url: image };
 		if (media?.refs?.length) payload.media_refs = media.refs;
 		if (Object.keys(payload).length) out.push(payload);
 	}
