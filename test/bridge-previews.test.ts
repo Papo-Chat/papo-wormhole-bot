@@ -209,7 +209,7 @@ const papoMessage = (id: string, content = 'olá', extra: Record<string, unknown
 	}) as never;
 
 const discordMessage = (id: string, content: string, extra: Record<string, unknown> = {}) => {
-	const { authorBot = true, ...messageExtra } = extra;
+	const { authorBot = false, ...messageExtra } = extra;
 	return ({
 		id,
 		channelId: '111',
@@ -400,7 +400,7 @@ describe('preview no bridge Discord → Papo', () => {
 		const { bridge, api, settle } = fixture();
 
 		await bridge.onDiscordMessage(
-			discordMessage('dm-1', 'olha o gif', { embeds: [vxTwitterGif()] })
+			discordMessage('dm-1', 'olha o gif', { authorBot: true, embeds: [vxTwitterGif()] })
 		);
 		await settle();
 
@@ -421,6 +421,7 @@ describe('preview no bridge Discord → Papo', () => {
 			const { bridge, api, settle } = fixture();
 			await bridge.onDiscordMessage(
 				discordMessage('dm-1', 'com anexo', {
+					authorBot: false,
 					attachments: [{ id: 'a1', name: 'nota.txt', contentType: 'text/plain', size: 9, url: 'https://cdn.example.com/nota.txt' }],
 					embeds: [richPreview('artigo')]
 				})
@@ -428,7 +429,9 @@ describe('preview no bridge Discord → Papo', () => {
 			await settle();
 
 			expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['nota.txt']);
-			expect(api.sent[0]!.embeds).toHaveLength(2);
+			expect(api.sent[0]!.embeds).toHaveLength(1);
+			expect(api.sent[0]!.content).toContain('com anexo');
+			expect(api.sent[0]!.content).toContain('https://example.com/artigo');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
@@ -441,6 +444,7 @@ describe('preview no bridge Discord → Papo', () => {
 			const { bridge, api, settle } = fixture();
 			await bridge.onDiscordMessage(
 				discordMessage('dm-1', '', {
+					authorBot: false,
 					attachments: [{ id: 'a1', name: 'gif.gif', contentType: 'image/gif', size: 3, url: 'https://cdn.discordapp.com/attachments/111/222/gif.gif' }],
 					embeds: [
 						{
@@ -465,7 +469,7 @@ describe('preview no bridge Discord → Papo', () => {
 	it('o preview fica guardado no mapa: re-render posterior não o perde', async () => {
 		const { bridge, store, settle } = fixture();
 
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'olá', { embeds: [richPreview('artigo')] }));
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'olá', { authorBot: true, embeds: [richPreview('artigo')] }));
 		await settle();
 
 		const map = store.findMapByDiscord('dm-1')[0]!;
@@ -1043,6 +1047,7 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 			async () => {
 				await bridge.onDiscordMessage(
 					discordMessage('dm-1', 'olha a foto', {
+						authorBot: false,
 						embeds: [
 							{
 								type: 'image',
@@ -1069,7 +1074,8 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 		expect(urls).toContain('https://cdn.discordapp.com/attachments/111/222/foto.png');
 		// o card da ponte é o único embed: o preview não acrescenta nada além de uma URL que quebra
 		expect(sent.embeds ?? []).toHaveLength(1);
-		expect(sent.embeds![0]!.description).toBe('olha a foto');
+		expect(sent.embeds![0]!.description).toBe('');
+		expect(sent.content).toContain('olha a foto');
 	});
 
 	it('link de arquivo do Discord colado no texto também vira anexo, e sai do texto', async () => {
@@ -1105,6 +1111,7 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 			async () => {
 				await bridge.onDiscordMessage(
 					discordMessage('dm-1', 'gif', {
+						authorBot: false,
 						attachments: [{ id: 'att-1', name: 'gif.gif', url: 'https://cdn.discordapp.com/attachments/111/222/gif.gif', size: 12, contentType: 'image/gif' }],
 						embeds: [
 							{
@@ -1130,6 +1137,7 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 			async () => {
 				await bridge.onDiscordMessage(
 					discordMessage('dm-1', 'olha o gif', {
+						authorBot: false,
 						embeds: [
 							{
 								type: 'image',
@@ -1152,6 +1160,7 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
 		await bridge.onDiscordMessage(
 			discordMessage('dm-1', 'olha a foto', {
+				authorBot: false,
 				embeds: [
 					{
 						type: 'image',
@@ -1166,8 +1175,8 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 
 		const sent = api.sent[0]!;
 		expect(sent.attachments ?? []).toHaveLength(0);
-		expect(sent.embeds ?? []).toHaveLength(2);
-		expect(sent.embeds![1]!.thumbnail?.url).toBe('https://cdn.discordapp.com/attachments/111/222/foto.png');
+		expect(sent.embeds ?? []).toHaveLength(1);
+		expect(sent.content).toContain('https://cdn.discordapp.com/attachments/111/222/foto.png');
 	});
 });
 
