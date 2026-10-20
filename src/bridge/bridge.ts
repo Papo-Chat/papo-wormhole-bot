@@ -1929,7 +1929,9 @@ export class Bridge {
 				);
 				embed = {
 					...embed,
-					[key]: media.url ? { url: media.url, mime_type: media.mime_type } : undefined
+					[key]: media.url
+						? { url: media.url, ...(media.mime_type ? { mime_type: media.mime_type } : {}) }
+						: undefined
 				};
 			}
 			return embed;
