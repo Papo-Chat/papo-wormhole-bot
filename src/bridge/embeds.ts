@@ -199,12 +199,12 @@ export function discordEmbedMedia(embed: DiscordEmbedPayload): { images: Discord
 	// o tipo é o que o Discord desenhou: player. Autoriza aceitar um `video` sem tipo declarado
 	// nem extensão desde que o Discord re-serva o arquivo
 	const player = embed.type === 'video' || embed.type === 'gifv' || embed.type === 'gif';
+	const push = (media: DiscordMedia | undefined): void => {
+		if (!media) return;
+		if (media.mime.startsWith('video/')) videos.push(media);
+		else if (media.mime.startsWith('image/')) images.push(media);
+	};
 	const add = (m?: DiscordEmbedMedia | null, allowPlayerFallback = false): void => {
-		const push = (media: DiscordMedia | undefined): void => {
-			if (!media) return;
-			if (media.mime.startsWith('video/')) videos.push(media);
-			else if (media.mime.startsWith('image/')) images.push(media);
-		};
 		push(discordMediaOf(m, allowPlayerFallback));
 		// o URL entregue pode ser um conversor carregando o arquivo no query: o de dentro também
 		// entra, e é ele que costuma ser reproduzível
@@ -214,8 +214,34 @@ export function discordEmbedMedia(embed: DiscordEmbedPayload): { images: Discord
 			push({ url, origin: url, mime, width: m?.width ?? undefined, height: m?.height ?? undefined });
 		}
 	};
-	add(embed.image);
-	add(embed.thumbnail);
+	/** Algumas embeds de bots omitem content_type e usam URL sem extensão no campo image. */
+	const addImage = (m?: DiscordEmbedMedia | null): void => {
+		if (!m?.url && !m?.proxy_url) return;
+		const url = m.proxy_url ?? m.url!;
+		const media = discordMediaOf(m);
+		if (media?.mime.startsWith('image/')) push(media);
+		else {
+			const declared = (m.content_type ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
+			const extMime = mimeFromUrl(url);
+			if (declared.startsWith('video/') || extMime.startsWith('video/')) {
+				if (media) push(media);
+			} else {
+				push({
+					url,
+					origin: m.url ?? undefined,
+					mime: declared.startsWith('image/') ? declared : extMime.startsWith('image/') ? extMime : 'image/webp',
+					width: m.width ?? undefined,
+					height: m.height ?? undefined
+				});
+			}
+		}
+		for (const embeddedUrl of embeddedMediaUrls(m)) {
+			const mime = mimeFromUrl(embeddedUrl);
+			if (mime) push({ url: embeddedUrl, origin: embeddedUrl, mime, width: m.width ?? undefined, height: m.height ?? undefined });
+		}
+	};
+	addImage(embed.image);
+	addImage(embed.thumbnail);
 	add(embed.video, player);
 	for (const node of walkComponents(embed.components)) {
 		add(node.media);
