@@ -59,6 +59,7 @@ interface DiscordSend {
 
 interface PapoSend {
 	channelId: string;
+	content?: string;
 	embeds?: PapoEmbedInput[];
 	attachments?: { name: string }[];
 }
@@ -139,8 +140,8 @@ const fixture = (opts: {
 			api.sent.push(input);
 			return { id: `pm${api.sent.length}`, channel_id: input.channelId, author_id: 'bot', content: null, created_at: new Date().toISOString() };
 		},
-		edits: [] as { id: string; embeds: EmbedLike[] }[],
-		editMessage: async (id: string, _content: string, embeds: EmbedLike[]) => void api.edits.push({ id, embeds }),
+		edits: [] as { id: string; content: string; embeds: EmbedLike[] }[],
+		editMessage: async (id: string, content: string, embeds: EmbedLike[]) => void api.edits.push({ id, content, embeds }),
 		listMessages: async () => ({ messages: [] })
 	};
 
@@ -253,7 +254,8 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(embeds).toHaveLength(1);
 		// O cartão não replica o embed do Discord; o URL no content aciona o crawler nativo do Papo.
 		expect(embeds[0]!.author?.name).toBe('Jenga');
-		expect(embeds[0]!.description).toContain('olá');
+		expect(embeds[0]!.description).toBe('');
+		expect(api.sent[0]!.content).toContain('olá');
 		expect(api.sent[0]!.content).toContain('https://example.com/a');
 	});
 
@@ -344,6 +346,8 @@ describe('preview no bridge Discord → Papo', () => {
 		await settle();
 
 		expect(api.sent[0]!.embeds).toHaveLength(1);
+		expect(api.sent[0]!.embeds![0]!.description).toBe('');
+		expect(api.sent[0]!.content).toContain('mensagem com preview');
 		expect(api.sent[0]!.content).toContain('https://example.com/nativo');
 	});
 
@@ -737,7 +741,8 @@ describe('preview do Discord que chega depois da mensagem', () => {
 		const last = api.edits.at(-1)!;
 		expect(last.embeds).toHaveLength(1);
 		expect(last.embeds[0]!.author?.name).toBe('Jenga');
-		expect(last.embeds[0]!.description).toContain(url);
+		expect(last.embeds[0]!.description).toBe('');
+		expect(last.content).toContain(url);
 		expect(last.embeds.some((e) => e.title === 'South America Memes')).toBe(false);
 	});
 
@@ -759,8 +764,9 @@ describe('preview do Discord que chega depois da mensagem', () => {
 
 		const last = api.edits.at(-1)!;
 		expect(last.embeds).toHaveLength(1);
-		expect(last.embeds[0]!.description).toContain('texto corrigido');
-		expect(last.embeds[0]!.description).toContain(url);
+		expect(last.embeds[0]!.description).toBe('');
+		expect(last.content).toContain('texto corrigido');
+		expect(last.content).toContain(url);
 	});
 
 	it('MESSAGE_UPDATE repetido não duplica o hyperlink como embed', async () => {
@@ -793,7 +799,9 @@ describe('preview do Discord que chega depois da mensagem', () => {
 
 		const last = api.edits.at(-1)!;
 		expect(last.embeds).toHaveLength(1);
-		expect(last.embeds[0]!.description).toContain('https://example.com/nativo-tardio');
+		expect(last.embeds[0]!.description).toBe('');
+		expect(last.content).toContain('abrindo uma página');
+		expect(last.content).toContain('https://example.com/nativo-tardio');
 	});
 
 	it('hyperlink recebido antes do mapeamento não gera embed adiado', async () => {
