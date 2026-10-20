@@ -1294,9 +1294,9 @@ export class Bridge {
 		const preview = link.bridge_embeds && convertCustomEmbeds
 			? firstDiscordPreview(rawEmbeds, bridgeFiles ? attachmentUrls : [])
 			: undefined;
-		// mídia que o Discord hospeda (`cdn.discordapp.com`, `media.discordapp.net`) é volátil:
-		// expira junto com a mensagem original e o hotlink é bloqueado. Ela vira anexo baixado
-		// e re-enviado, nunca URL dentro de embed.
+		// Em previews comuns, a mídia hospedada pelo Discord é re-enviada como anexo porque a URL
+		// expira. Embeds personalizados convertidos são exceção: preservamos a mídia no próprio
+		// embed para o backend do Papo re-hospedá-la e não perder o visual do cartão.
 		const hosted = new Set(attachmentUrls.map(mediaKey).filter(Boolean) as string[]);
 		if (bridgeFiles && link.bridge_embeds && !convertCustomEmbeds) {
 			this.addDiscordMediaSources(m.id, discordHostedMedia(rawEmbeds), sources, hosted);
