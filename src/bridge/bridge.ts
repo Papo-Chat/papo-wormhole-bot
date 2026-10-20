@@ -1473,7 +1473,7 @@ export class Bridge {
 		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
 		// e sem isso o cartão do Papo fica só com a URL escrita
 		const preview = link.bridge_embeds && convertCustomEmbeds && !contentMode
-			? firstDiscordPreview(previewEmbeds, fresh.attachments.map((a) => a.url))
+			? firstDiscordPreview(previewEmbeds, link.bridge_attachments ? fresh.attachments.map((a) => a.url) : [])
 			: undefined;
 		if (preview && link.bridge_attachments && !convertCustomEmbeds) {
 			const attachmentKeys = new Set(fresh.attachments.map((a) => mediaKey(a.url)).filter(Boolean));
