@@ -313,7 +313,8 @@ describe('preview no bridge Discord → Papo', () => {
 	});
 
 	it('embed de GIF de bot sem URL no content continua sendo convertido', async () => {
-		const { bridge, api, settle } = fixture();
+		const { bridge, api, link, store, settle } = fixture();
+		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
 		await bridge.onDiscordMessage(
 			discordMessage('dm-bot-gif', '', {
 				authorBot: true,
