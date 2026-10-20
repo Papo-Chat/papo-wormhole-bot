@@ -216,28 +216,28 @@ export function discordEmbedMedia(embed: DiscordEmbedPayload): { images: Discord
 	};
 	/** Algumas embeds de bots omitem content_type e usam URL sem extensão no campo image. */
 	const addImage = (m?: DiscordEmbedMedia | null): void => {
-		if (!m?.url && !m?.proxy_url) return;
-		const url = m.proxy_url ?? m.url!;
+		const url = m?.proxy_url ?? m?.url;
+		if (!url) return;
 		const media = discordMediaOf(m);
 		if (media?.mime.startsWith('image/')) push(media);
 		else {
-			const declared = (m.content_type ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
+			const declared = (m?.content_type ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
 			const extMime = mimeFromUrl(url);
 			if (declared.startsWith('video/') || extMime.startsWith('video/')) {
 				if (media) push(media);
 			} else {
 				push({
 					url,
-					origin: m.url ?? undefined,
+					origin: m?.url ?? undefined,
 					mime: declared.startsWith('image/') ? declared : extMime.startsWith('image/') ? extMime : 'image/webp',
-					width: m.width ?? undefined,
-					height: m.height ?? undefined
+					width: m?.width ?? undefined,
+					height: m?.height ?? undefined
 				});
 			}
 		}
 		for (const embeddedUrl of embeddedMediaUrls(m)) {
 			const mime = mimeFromUrl(embeddedUrl);
-			if (mime) push({ url: embeddedUrl, origin: embeddedUrl, mime, width: m.width ?? undefined, height: m.height ?? undefined });
+			if (mime) push({ url: embeddedUrl, origin: embeddedUrl, mime, width: m?.width ?? undefined, height: m?.height ?? undefined });
 		}
 	};
 	addImage(embed.image);
