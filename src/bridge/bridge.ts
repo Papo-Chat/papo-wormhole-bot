@@ -1264,6 +1264,7 @@ export class Bridge {
 		const rawEmbeds = rawDiscordEmbeds(m.embeds as APIEmbed[]);
 		const convertCustomEmbeds = shouldConvertCustomDiscordEmbeds(m);
 		const nativePreviewUrl = link.bridge_embeds && !convertCustomEmbeds ? firstDiscordLinkUrl(rawEmbeds) : undefined;
+		const injectNativePreviewUrl = Boolean(nativePreviewUrl && !hasHyperlinkInContent(m.content ?? ''));
 		const gifSourceUrl = gifSourceUrlIn(m.content ?? '', rawEmbeds);
 		// O crawler do backend examina content. Se o Discord trouxe somente o link-preview,
 		// copie a URL da página (não a URL proxy da imagem), sem reescrevê-la.
@@ -1271,8 +1272,8 @@ export class Bridge {
 		const translated = discordToPapoContent(m.content ?? '', this.resolvers(link));
 		const crawlerText = !convertCustomEmbeds && gifSourceUrl
 			? withGifSourceUrl(translated, gifSourceUrl)
-			: nativePreviewUrl && !hasHyperlinkInContent(m.content ?? '')
-				? withContentUrl(translated, nativePreviewUrl)
+			: injectNativePreviewUrl
+				? withContentUrl(translated, nativePreviewUrl!)
 				: translated;
 		// Os links do CDN do Discord continuam passando pelo pipeline de anexos existente.
 		const content = bridgeFiles ? stripDiscordMediaLinks(crawlerText) : crawlerText;
@@ -1408,14 +1409,15 @@ export class Bridge {
 		const previewEmbeds = rawDiscordEmbeds(fresh.embeds as APIEmbed[]);
 		const convertCustomEmbeds = shouldConvertCustomDiscordEmbeds(fresh);
 		const nativePreviewUrl = link.bridge_embeds && !convertCustomEmbeds ? firstDiscordLinkUrl(previewEmbeds) : undefined;
+		const injectNativePreviewUrl = Boolean(nativePreviewUrl && !hasHyperlinkInContent(fresh.content ?? ''));
 		const gifSourceUrl = gifSourceUrlIn(fresh.content ?? '', previewEmbeds);
 		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(gifSourceUrl && !convertCustomEmbeds);
 		await this.warmPapoEmojis(fresh.content ?? '');
 		const translated = discordToPapoContent(fresh.content ?? '', this.resolvers(link));
 		const edited = !convertCustomEmbeds && gifSourceUrl
 			? withGifSourceUrl(translated, gifSourceUrl)
-			: nativePreviewUrl && !hasHyperlinkInContent(fresh.content ?? '')
-				? withContentUrl(translated, nativePreviewUrl)
+			: injectNativePreviewUrl
+				? withContentUrl(translated, nativePreviewUrl!)
 				: translated;
 		const chunks = chunkText(link.bridge_attachments ? stripDiscordMediaLinks(edited) : edited, PAPO_EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
@@ -1499,7 +1501,7 @@ export class Bridge {
 		for (const target of targets) {
 			// A dedicated job replaces the main copy and all attachment continuation messages.
 			if (attachmentsChanged && (target.chunkIndex === 0 || target.chunkIndex >= EXTRA_CHUNK_BASE)) continue;
-			if (link.bridge_edits) {
+			if (link.bridge_edits || injectNativePreviewUrl) {
 				const job: EditJob = {
 					kind: 'edit',
 					side: 'discord',
