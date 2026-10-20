@@ -244,9 +244,9 @@ export function discordEmbedMedia(embed: DiscordEmbedPayload): { images: Discord
 	addImage(embed.thumbnail);
 	add(embed.video, player);
 	for (const node of walkComponents(embed.components)) {
-		add(node.media);
-		add(node.accessory?.media);
-		for (const item of node.items ?? []) add(item.media);
+		addImage(node.media);
+		addImage(node.accessory?.media);
+		for (const item of node.items ?? []) addImage(item.media);
 	}
 	images.sort((a, b) => areaOf(b) - areaOf(a));
 	return { images, videos };
