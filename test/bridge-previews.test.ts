@@ -365,18 +365,27 @@ describe('preview no bridge Discord → Papo', () => {
 		const imageUrl = 'https://cdn.discordapp.com/attachments/111/222/imagem-sem-extensao';
 		const proxyUrl = 'https://media.discordapp.net/attachments/111/222/imagem-sem-extensao?width=480&height=480';
 
-		await bridge.onDiscordMessage(
-			discordMessage('dm-bot-image', '', {
-				authorBot: true,
-				attachments: [{ id: 'attachment-1', name: 'imagem-sem-extensao', size: 128, url: imageUrl }],
-				embeds: [{
-					type: 'rich',
-					title: 'Sua imagem de perfil.',
-					image: { url: imageUrl, proxy_url: proxyUrl, width: 480, height: 480 }
-				}]
-			})
+		const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+		await withFetch(
+			async (url) =>
+				url === imageUrl
+					? new Response(pngHeader, { status: 200, headers: { 'content-type': 'image/png' } })
+					: new Response('not found', { status: 404 }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-bot-image', '', {
+						authorBot: true,
+						attachments: [{ id: 'attachment-1', name: 'imagem-sem-extensao', size: 128, url: imageUrl }],
+						embeds: [{
+							type: 'rich',
+							title: 'Sua imagem de perfil.',
+							image: { url: imageUrl, proxy_url: proxyUrl, width: 480, height: 480 }
+						}]
+					})
+				);
+				await settle();
+			}
 		);
-		await settle();
 
 		const sent = api.sent[0]!;
 		expect(sent.embeds).toHaveLength(2);
@@ -515,24 +524,33 @@ describe('preview no bridge Discord → Papo', () => {
 		const imageUrl = 'https://cdn.discordapp.com/attachments/111/222/component-image';
 		const proxyUrl = 'https://media.discordapp.net/attachments/111/222/component-image?width=480';
 
-		await bridge.onDiscordMessage(
-			discordMessage('dm-bot-components', '', {
-				authorBot: true,
-				embeds: [{
-					type: 'components',
-					title: 'Imagem do bot',
-					url: 'https://example.com/profile',
-					components: [{
-						type: 17,
-						components: [{
-							type: 12,
-							items: [{ media: { url: imageUrl, proxy_url: proxyUrl, width: 480, height: 480 } }]
+		const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+		await withFetch(
+			async (url) =>
+				url === imageUrl
+					? new Response(pngHeader, { status: 200, headers: { 'content-type': 'image/png' } })
+					: new Response('not found', { status: 404 }),
+			async () => {
+				await bridge.onDiscordMessage(
+					discordMessage('dm-bot-components', '', {
+						authorBot: true,
+						embeds: [{
+							type: 'components',
+							title: 'Imagem do bot',
+							url: 'https://example.com/profile',
+							components: [{
+								type: 17,
+								components: [{
+									type: 12,
+									items: [{ media: { url: imageUrl, proxy_url: proxyUrl, width: 480, height: 480 } }]
+								}]
+							}]
 						}]
-					}]
-				}]
-			})
+					})
+				);
+				await settle();
+			}
 		);
-		await settle();
 
 		expect(api.sent[0]!.embeds).toHaveLength(2);
 		expect(api.sent[0]!.embeds![1]!.thumbnail?.url).toBeUndefined();
