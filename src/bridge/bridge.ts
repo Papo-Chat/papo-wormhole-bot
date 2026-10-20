@@ -139,12 +139,16 @@ function isDiscordCdnHostUrl(rawUrl?: string | null): boolean {
 	if (!rawUrl) return false;
 	try {
 		const url = new URL(rawUrl);
-		return url.protocol === 'https:' && [
-			'cdn.discordapp.com',
-			'cdn.discordapp.net',
-			'media.discordapp.com',
-			'media.discordapp.net'
-		].includes(url.hostname.toLowerCase()) || /^images-ext-\d+\.discordapp\.net$/i.test(url.hostname);
+		return (
+			url.protocol === 'https:' &&
+			([
+				'cdn.discordapp.com',
+				'cdn.discordapp.net',
+				'media.discordapp.com',
+				'media.discordapp.net'
+			].includes(url.hostname.toLowerCase()) ||
+				/^images-ext-\d+\.discordapp\.net$/i.test(url.hostname))
+		);
 	} catch {
 		return false;
 	}
