@@ -2392,6 +2392,7 @@ export class Bridge {
 				markAttempt();
 				const created = await this.sendWebhookSafe(webhook, job, g, extra, lastPapoId, {
 					...(extra ? {} : { content: webhookContent }),
+					...(extra ? {} : { embeds: job.linkEmbeds ?? [] }),
 					attachments
 				});
 				if (!created)
@@ -2505,9 +2506,9 @@ export class Bridge {
 			// seria lido como cartão pelo refresh de rodapé)
 			bridge_embed: extra || webhookCopy || mainEmbed == null ? undefined : mainEmbed,
 			footer_base: extra || webhookCopy ? null : footerBase,
-			// cópia de webhook não tem embed do bridge: o único embed da mensagem é o
-			// link-preview que o Papo faz a partir das URLs do próprio `content`
-			link_embeds: extra || webhookCopy ? null : (job.linkEmbeds ?? []),
+			// Cópias de webhook não têm cartão do bridge, mas guardam embeds personalizados
+			// convertidos para que atualizações posteriores também sejam espelhadas.
+			link_embeds: extra ? null : (job.linkEmbeds ?? []),
 			// autor Discord de origem: é ele que a nota de reply de uma cópia aponta
 			author_label: job.authorName || null,
 			webhook_copy: webhookCopy,
@@ -2874,13 +2875,21 @@ export class Bridge {
 			);
 			return;
 		}
+		const previews = env.papoPreviews ?? [];
 		if (map.webhook_copy) {
-			// cópia de webhook: o preview não é embed do bridge. O `content` carrega a URL e o
-			// Papo faz o link-preview dele mesmo (crawl em background) — não há o que escrever.
-			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'preview ignorado: cópia de webhook tem preview nativo');
+			// Previews nativos não chegam aqui; quando chega um embed personalizado convertido,
+			// atualize-o com o token do webhook sem tocar no conteúdo nem no resumo de reações.
+			const content = this.webhookCopyContent(
+				'',
+				map.rendered ?? '',
+				await this.reactionSummaryForMap(map, 'papo'),
+				PAPO_LIMITS.contentMax
+			);
+			if (await this.editPapoWebhookCopy(map, content, previews)) {
+				this.store.updateMapSnapshot(map.id, { link_embeds: previews, embed_revision: job.revision ?? null });
+			}
 			return;
 		}
-		const previews = env.papoPreviews ?? [];
 		const card = map.bridge_embed ? (JSON.parse(map.bridge_embed) as PapoEmbedInput) : undefined;
 		if (card) {
 			card.description = this.withReactionSummary(
