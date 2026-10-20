@@ -70,6 +70,7 @@ const fixture = (opts: {
 	maxFileBytes?: number;
 	bridgeEdits?: boolean;
 	avatar?: boolean;
+	papoWebhookMode?: boolean;
 } = {}) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
@@ -173,11 +174,26 @@ const fixture = (opts: {
 		destroy: async () => {}
 	};
 
-	const bridge = new Bridge(config, store, outbox, api as never, { close: () => {}, connect: () => {} } as never, discord as never, media as never);
+	const webhookSends: { content?: string; embeds?: PapoEmbedInput[] }[] = [];
+	const webhookEdits: { id: string; content: string; embeds?: PapoEmbedInput[] }[] = [];
+	const papoWebhooks = opts.papoWebhookMode ? {
+		userWebhook: async () => ({ webhookId: 'papo-hook', token: 'webhook-token' }),
+		send: async (_ref: unknown, channelId: string, input: { content?: string; embeds?: PapoEmbedInput[] }) => {
+			webhookSends.push(input);
+			return { id: `wh${webhookSends.length}`, channel_id: channelId, author_id: 'webhook-author', content: input.content ?? null, created_at: new Date().toISOString() };
+		},
+		refFor: () => ({ webhookId: 'papo-hook', token: 'webhook-token' }),
+		edit: async (_ref: unknown, id: string, content: string, embeds?: PapoEmbedInput[]) => {
+			webhookEdits.push({ id, content, embeds });
+			return true;
+		},
+		owns: (webhookId?: string | null) => webhookId === 'papo-hook'
+	} : undefined;
+	const bridge = new Bridge(config, store, outbox, api as never, { close: () => {}, connect: () => {} } as never, discord as never, media as never, papoWebhooks as never);
 	const link = store.upsertChannelLink({ papo_channel_id: 'chan-1', discord_channel_id: '111' });
 	if (opts.bridgeEdits === false) store.setChannelLinkFlag(link.id, 'bridge_edits', 0);
 	const settle = (quietMs = 700) => settleQueue(outbox, quietMs, 6000);
-	return { store, outbox, bridge, link, api, discord, settle };
+	return { store, outbox, bridge, link, api, discord, webhookSends, webhookEdits, settle };
 };
 
 const papoMessage = (id: string, content = 'olá', extra: Record<string, unknown> = {}) =>
@@ -282,6 +298,35 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(embeds[0]!.description).toContain('texto');
 		expect(embeds[1]!.title).toBe('convertível');
 		expect(outbox.counts().dead).toBe(0);
+	});
+
+	it('embed personalizado é enviado também no modo webhook do Papo', async () => {
+		const { bridge, webhookSends, settle } = fixture({ papoWebhookMode: true });
+		await bridge.onDiscordMessage(
+			discordMessage('dm-custom-webhook-mode', 'notificação do bot', {
+				authorBot: true,
+				embeds: [richPreview('custom-no-webhook')]
+			})
+		);
+		await settle();
+
+		expect(webhookSends).toHaveLength(1);
+		expect(webhookSends[0]!.embeds).toHaveLength(1);
+		expect(webhookSends[0]!.embeds![0]!.title).toBe('custom-no-webhook');
+	});
+
+	it('edição de embed personalizado também atualiza a cópia de webhook do Papo', async () => {
+		const { bridge, webhookEdits, settle } = fixture({ papoWebhookMode: true });
+		await bridge.onDiscordMessage(discordMessage('dm-custom-webhook-edit', 'status do bot', { authorBot: true }));
+		await settle();
+
+		await bridge.onDiscordEdit(
+			{} as never,
+			discordMessage('dm-custom-webhook-edit', 'status do bot', { authorBot: true, embeds: [richPreview('editado-webhook')] })
+		);
+		await settle();
+
+		expect(webhookEdits.some((edit) => edit.embeds?.[0]?.title === 'editado-webhook')).toBe(true);
 	});
 
 	it('embed personalizado de webhook sem hyperlink é convertido', async () => {
