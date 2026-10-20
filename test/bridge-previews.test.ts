@@ -312,6 +312,26 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(api.sent[0]!.content ?? '').toBe('');
 	});
 
+	it('embed de GIF de bot sem URL no content continua sendo convertido', async () => {
+		const { bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(
+			discordMessage('dm-bot-gif', '', {
+				authorBot: true,
+				embeds: [{
+					type: 'rich',
+					url: 'https://giphy.com/gifs/custom-bot-gif',
+					title: 'GIF personalizado',
+					image: { url: 'https://media.giphy.com/media/custom-bot-gif/giphy.gif', width: 320, height: 240, content_type: 'image/gif' }
+				}]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.embeds).toHaveLength(2);
+		expect(api.sent[0]!.embeds![1]!.title).toBe('GIF personalizado');
+		expect(api.sent[0]!.content ?? '').toBe('');
+	});
+
 	it('embed de usuário sem hyperlink não é convertido e sua URL vai para o crawler nativo', async () => {
 		const { bridge, api, settle } = fixture();
 		await bridge.onDiscordMessage(
