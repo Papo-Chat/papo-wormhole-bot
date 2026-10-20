@@ -828,6 +828,7 @@ describe('preview do Discord que chega depois da mensagem', () => {
 
 		await bridge.onDiscordMessage(
 			discordMessage('dm-embed-only', '', {
+				authorBot: false,
 				embeds: [
 					{
 						type: 'rich',
