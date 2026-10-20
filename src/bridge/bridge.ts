@@ -56,7 +56,13 @@ import {
 	type DiscordMedia,
 	type PreviewMedia
 } from './embeds.js';
-import { prepareAttachments, sanitizeName, SourceGoneError, type PreparedAttachment, type SourceAttachment } from './attachments.js';
+import {
+	prepareAttachments,
+	sanitizeName,
+	SourceGoneError,
+	type PreparedAttachment,
+	type SourceAttachment
+} from './attachments.js';
 import { mergeReactionCounts, reactionSummaryText, type ReactionDisplay } from './reactions.js';
 import { EMBED_CHUNK_CHARS, PAPO_LIMITS, PAPO_EMBED_CHUNK_CHARS, DISCORD_LIMITS, PAPO_VIDEO_MIMES, clampText } from './limits.js';
 import { EmojiBridge, type ApplicationEmojiResolver, type GuildEmojiResolver } from './emoji.js';
@@ -1509,7 +1515,10 @@ export class Bridge {
 			if (link.bridge_attachments) {
 				this.addDiscordMediaSources(
 					fresh.id,
-					discordMediaLinksInContent(fresh.content ?? '').map((url) => ({ url, mime: mimeFromUrl(url) })),
+					discordMediaLinksInContent(fresh.content ?? '').map((url) => ({
+						url,
+						mime: mimeFromUrl(url)
+					})),
 					sources,
 					hosted
 				);
@@ -2436,7 +2445,11 @@ export class Bridge {
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
 		});
 
-		job.linkEmbeds = this.removeMissingEmbedAttachments(job.linkEmbeds, plan.groups, job.discordMessageId);
+		job.linkEmbeds = this.removeMissingEmbedAttachments(
+			job.linkEmbeds,
+			plan.groups,
+			job.discordMessageId
+		);
 
 		// modo webhook: o texto vai no `content` da mensagem (o teto é o da mensagem). Sem
 		// webhook o texto vai no `description` do embed, que é o card da mensagem.
@@ -2775,7 +2788,11 @@ export class Bridge {
 			maxFileBytes: PAPO_LIMITS.attachmentMaxBytes,
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
 		});
-		job.linkEmbeds = this.removeMissingEmbedAttachments(job.linkEmbeds, plan.groups, job.sourceMessageId);
+		job.linkEmbeds = this.removeMissingEmbedAttachments(
+			job.linkEmbeds,
+			plan.groups,
+			job.sourceMessageId
+		);
 		const groups = plan.groups.length ? plan.groups : [[]];
 		const refreshedText = plan.notes.length
 			? `${job.text}${job.text ? '\n\n' : ''}${plan.notes.map((note) => `> ${note}`).join('\n')}`.trim()
