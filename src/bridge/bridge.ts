@@ -56,7 +56,7 @@ import {
 	type DiscordMedia,
 	type PreviewMedia
 } from './embeds.js';
-import { prepareAttachments, sanitizeName, SourceGoneError, type SourceAttachment } from './attachments.js';
+import { prepareAttachments, sanitizeName, SourceGoneError, type PreparedAttachment, type SourceAttachment } from './attachments.js';
 import { mergeReactionCounts, reactionSummaryText, type ReactionDisplay } from './reactions.js';
 import { EMBED_CHUNK_CHARS, PAPO_LIMITS, PAPO_EMBED_CHUNK_CHARS, DISCORD_LIMITS, PAPO_VIDEO_MIMES, clampText } from './limits.js';
 import { EmojiBridge, type ApplicationEmojiResolver, type GuildEmojiResolver } from './emoji.js';
@@ -1528,7 +1528,7 @@ export class Bridge {
 				contentMode,
 				refreshAttachments: true,
 				sources,
-				...(preview ? { linkEmbeds: [preview] } : {}),
+				linkEmbeds: preview ? [preview] : [],
 				replyRefDiscordId: fresh.reference?.messageId ?? undefined
 			};
 			this.outbox.enqueue({
@@ -1906,6 +1906,35 @@ export class Bridge {
 		const prefix = `discord-embed-${messageId}-`;
 		const suffix = this.previewFileName(url, 'image.png').slice(-Math.max(1, 120 - prefix.length));
 		return sanitizeName(`${prefix}${suffix}`).slice(0, 128);
+	}
+
+	/** Remove attachment_name sem upload para não fazer o backend rejeitar a mensagem inteira. */
+	private removeMissingEmbedAttachments(
+		embeds: PapoEmbedInput[] | undefined,
+		groups: PreparedAttachment[][],
+		messageId: string
+	): PapoEmbedInput[] | undefined {
+		if (!embeds?.length) return embeds;
+		const uploadedNames = new Set(groups.flatMap((group) => group.map((file) => file.name)));
+		let changed = false;
+		const result = embeds.map((sourceEmbed) => {
+			let embed = sourceEmbed;
+			for (const key of ['thumbnail', 'image'] as const) {
+				const media = embed[key];
+				if (!media?.attachment_name || uploadedNames.has(media.attachment_name)) continue;
+				changed = true;
+				this.log.warn(
+					{ messageId, attachmentName: media.attachment_name },
+					'a mídia do embed não foi enviada; removendo a referência para não rejeitar a mensagem'
+				);
+				embed = {
+					...embed,
+					[key]: media.url ? { url: media.url, mime_type: media.mime_type } : undefined
+				};
+			}
+			return embed;
+		});
+		return changed ? result : embeds;
 	}
 
 	/**
@@ -2405,25 +2434,7 @@ export class Bridge {
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
 		});
 
-		// Se o arquivo de imagem foi omitido (por exemplo, porque excede o limite do destino),
-		// não envie uma referência attachment_name inexistente: o backend validaria o multipart
-		// e rejeitaria a mensagem toda. O texto/embed restante continua sendo enviado.
-		const uploadedNames = new Set(plan.groups.flatMap((group) => group.map((file) => file.name)));
-		job.linkEmbeds = job.linkEmbeds?.map((sourceEmbed) => {
-			let embed = sourceEmbed;
-			for (const key of ['thumbnail', 'image'] as const) {
-				const media = embed[key];
-				if (media?.attachment_name && !uploadedNames.has(media.attachment_name)) {
-					this.log.warn(
-						{ discordMessageId: job.discordMessageId, attachmentName: media.attachment_name },
-						'a mídia do embed não foi enviada; removendo a referência para não rejeitar a mensagem'
-					);
-					const { attachment_name: _omitted, ...rest } = media;
-					embed = { ...embed, [key]: rest.url ? rest : undefined };
-				}
-			}
-			return embed;
-		});
+		job.linkEmbeds = this.removeMissingEmbedAttachments(job.linkEmbeds, plan.groups, job.discordMessageId);
 
 		// modo webhook: o texto vai no `content` da mensagem (o teto é o da mensagem). Sem
 		// webhook o texto vai no `description` do embed, que é o card da mensagem.
@@ -2762,6 +2773,7 @@ export class Bridge {
 			maxFileBytes: PAPO_LIMITS.attachmentMaxBytes,
 			maxFilesPerMessage: PAPO_LIMITS.attachmentsPerMessage
 		});
+		job.linkEmbeds = this.removeMissingEmbedAttachments(job.linkEmbeds, plan.groups, job.sourceMessageId);
 		const groups = plan.groups.length ? plan.groups : [[]];
 		const refreshedText = plan.notes.length
 			? `${job.text}${job.text ? '\n\n' : ''}${plan.notes.map((note) => `> ${note}`).join('\n')}`.trim()
