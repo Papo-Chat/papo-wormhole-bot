@@ -10,7 +10,7 @@ sentidos, preservando autoria (nome + avatar + data) e ordem de conversa.
 | --- | --- | --- |
 | Texto (markdown) | embed com autor/avatar/data | `content` + embed de autoria |
 | Anexos | reenviados; compactados ou particionados se não cabem | idem |
-| Previews de link | embeds do Papo → embeds do Discord | embeds do Discord → embeds do Papo |
+| Previews de link | embeds do Papo → embeds do Discord | URLs no texto geram preview nativo no Papo; embeds personalizados de bots/webhooks sem URL no texto são convertidos |
 | Emojis custom | `:nome:` ↔ `<:nome:id>`; sem o nome no guild, usa ou cria um emoji da aplicação | idem |
 | Reações | reação nativa + contagem no `description` do embed | idem |
 | Edições / deleções | ✅ | ✅ |
@@ -128,9 +128,11 @@ Papo REST/WS ──► Bridge (tradução, chunking, embeds) ──► SQLite ou
     mensagens no Discord: a referência do reply chega como `*Respondendo:[link da mensagem] de
     @autor*` no topo do `content`.
   - **Discord → Papo**: o webhook do Papo responde mensagem, então o reply continua nativo
-    (`reply_to`) e não vira nota no texto. Os únicos embeds são os link previews, e eles são
-    nativos: o `content` carrega a URL e o backend do Papo faz o preview dela — reenviar o preview
-    como embed duplicaria o mesmo link. O envio leva `external_message_id` (chave de idempotência):
+    (`reply_to`) e não vira nota no texto. Quando o `content` contém hyperlink, o bridge não
+    converte o embed do Discord: mantém a URL para o backend do Papo gerar o preview nativo, sem
+    duplicá-lo. A exceção são embeds personalizados publicados por bots ou webhooks quando o
+    `content` não contém hyperlink; esses são convertidos para embeds do Papo. O envio leva
+    `external_message_id` (chave de idempotência):
     re-tentar um job cujo resultado foi incerto devolve a cópia existente em vez de duplicá-la.
     O token do webhook é salvo em `papo_webhooks` porque o backend o mostra uma única vez, na
     criação.

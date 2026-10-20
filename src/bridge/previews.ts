@@ -117,6 +117,24 @@ export function discordHostedMedia(embeds: readonly APIEmbed[] | undefined): Dis
 
 const CONTENT_URL_RE = /https?:\/\/[^\s<>"'`)\]]+/g;
 
+
+/** Detecta URLs no texto do autor; URLs dentro de blocos de código não contam. */
+export function hasHyperlinkInContent(content?: string | null): boolean {
+	if (!content) return false;
+	const prose = content.replace(/\x60{3}[\s\S]*?\x60{3}/g, ' ').replace(/\x60[^\x60\n]*\x60/g, ' ');
+	return [...prose.matchAll(CONTENT_URL_RE)].length > 0;
+}
+
+/** URL de página de um embed, para deixar o backend do Papo gerar o preview nativo. */
+export function firstDiscordLinkUrl(embeds: readonly APIEmbed[] | undefined): string | undefined {
+	for (const e of embeds ?? []) {
+		if (e.type && !DISCORD_PREVIEW_TYPES.has(e.type)) continue;
+		const url = urlOf(e);
+		if (url && /^https?:\/\//i.test(url)) return url;
+	}
+	return undefined;
+}
+
 /**
  * Links de arquivo do Discord escritos no texto da mensagem. Quem cola
  * `https://cdn.discordapp.com/attachments/…` no Discord quer a mídia, não o link: o bridge

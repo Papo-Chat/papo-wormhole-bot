@@ -59,6 +59,7 @@ interface DiscordSend {
 
 interface PapoSend {
 	channelId: string;
+	content?: string;
 	embeds?: PapoEmbedInput[];
 	attachments?: { name: string }[];
 }
@@ -69,6 +70,7 @@ const fixture = (opts: {
 	maxFileBytes?: number;
 	bridgeEdits?: boolean;
 	avatar?: boolean;
+	papoWebhookMode?: boolean;
 } = {}) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
@@ -139,8 +141,8 @@ const fixture = (opts: {
 			api.sent.push(input);
 			return { id: `pm${api.sent.length}`, channel_id: input.channelId, author_id: 'bot', content: null, created_at: new Date().toISOString() };
 		},
-		edits: [] as { id: string; embeds: EmbedLike[] }[],
-		editMessage: async (id: string, _content: string, embeds: EmbedLike[]) => void api.edits.push({ id, embeds }),
+		edits: [] as { id: string; content: string; embeds: EmbedLike[] }[],
+		editMessage: async (id: string, content: string, embeds: EmbedLike[]) => void api.edits.push({ id, content, embeds }),
 		listMessages: async () => ({ messages: [] })
 	};
 
@@ -172,11 +174,26 @@ const fixture = (opts: {
 		destroy: async () => {}
 	};
 
-	const bridge = new Bridge(config, store, outbox, api as never, { close: () => {}, connect: () => {} } as never, discord as never, media as never);
+	const webhookSends: { content?: string; embeds?: PapoEmbedInput[] }[] = [];
+	const webhookEdits: { id: string; content: string; embeds?: PapoEmbedInput[] }[] = [];
+	const papoWebhooks = opts.papoWebhookMode ? {
+		userWebhook: async () => ({ webhookId: 'papo-hook', token: 'webhook-token' }),
+		send: async (_ref: unknown, channelId: string, input: { content?: string; embeds?: PapoEmbedInput[] }) => {
+			webhookSends.push(input);
+			return { id: `wh${webhookSends.length}`, channel_id: channelId, author_id: 'webhook-author', content: input.content ?? null, created_at: new Date().toISOString() };
+		},
+		refFor: () => ({ webhookId: 'papo-hook', token: 'webhook-token' }),
+		edit: async (_ref: unknown, id: string, content: string, embeds?: PapoEmbedInput[]) => {
+			webhookEdits.push({ id, content, embeds });
+			return true;
+		},
+		owns: (webhookId?: string | null) => webhookId === 'papo-hook'
+	} : undefined;
+	const bridge = new Bridge(config, store, outbox, api as never, { close: () => {}, connect: () => {} } as never, discord as never, media as never, papoWebhooks as never);
 	const link = store.upsertChannelLink({ papo_channel_id: 'chan-1', discord_channel_id: '111' });
 	if (opts.bridgeEdits === false) store.setChannelLinkFlag(link.id, 'bridge_edits', 0);
 	const settle = (quietMs = 700) => settleQueue(outbox, quietMs, 6000);
-	return { store, outbox, bridge, link, api, discord, settle };
+	return { store, outbox, bridge, link, api, discord, webhookSends, webhookEdits, settle };
 };
 
 const papoMessage = (id: string, content = 'olá', extra: Record<string, unknown> = {}) =>
@@ -191,19 +208,21 @@ const papoMessage = (id: string, content = 'olá', extra: Record<string, unknown
 		...extra
 	}) as never;
 
-const discordMessage = (id: string, content: string, extra: Record<string, unknown> = {}) =>
-	({
+const discordMessage = (id: string, content: string, extra: Record<string, unknown> = {}) => {
+	const { authorBot = false, ...messageExtra } = extra;
+	return ({
 		id,
 		channelId: '111',
 		channel: { isThread: () => false },
-		author: { id: 'user-1', username: 'jenga', displayName: 'Jenga', displayAvatarURL: () => 'https://cdn.example.com/a.png' },
+		author: { id: 'user-1', username: 'jenga', displayName: 'Jenga', displayAvatarURL: () => 'https://cdn.example.com/a.png', bot: authorBot !== false },
 		member: { displayName: 'Jenga' },
 		content,
 		createdAt: new Date(),
 		attachments: [],
 		embeds: [],
-		...extra
+		...messageExtra
 	}) as never;
+};
 
 const linkPreview = (title: string, url = 'https://example.com/artigo') => ({
 	id: `e-${title}`,
@@ -241,21 +260,19 @@ const vxTwitterGif = () => ({
 });
 
 describe('preview no bridge Discord → Papo', () => {
-	it('texto + URL cria o cartão principal e um embed extra com o primeiro preview', async () => {
+	it('URL no conteúdo fica para o preview nativo do Papo, sem embed duplicado', async () => {
 		const { bridge, api, settle } = fixture();
 
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'olá https://example.com/a', { embeds: [richPreview('primeiro'), richPreview('segundo')] }));
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'olá https://example.com/a', { authorBot: true, embeds: [richPreview('primeiro'), richPreview('segundo')] }));
 		await settle();
 
 		const embeds = api.sent[0]!.embeds ?? [];
-		expect(embeds).toHaveLength(2);
-		// o cartão da ponte continua primeiro: autor, texto e rodapé da mensagem bridgeada
+		expect(embeds).toHaveLength(1);
+		// O cartão não replica o embed do Discord; o URL no content aciona o crawler nativo do Papo.
 		expect(embeds[0]!.author?.name).toBe('Jenga');
-		expect(embeds[0]!.description).toContain('olá');
-		// o preview entra atrás, sem substituir o cartão
-		expect(embeds[1]!.title).toBe('primeiro');
-		expect(embeds[1]!.url).toBe('https://example.com/primeiro');
-		expect(embeds[1]!.thumbnail?.url).toBe('https://example.com/primeiro/thumb.png');
+		expect(embeds[0]!.description).toBe('');
+		expect(api.sent[0]!.content).toContain('olá');
+		expect(api.sent[0]!.content).toContain('https://example.com/a');
 	});
 
 	it('mensagem sem preview não ganha embed vazio', async () => {
@@ -269,11 +286,11 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(outbox.counts().dead).toBe(0);
 	});
 
-	it('preview que não converte não derruba a mensagem', async () => {
+	it('embed personalizado de bot sem hyperlink é convertido mesmo após embed inválido', async () => {
 		const { bridge, api, outbox, settle } = fixture();
 
 		await bridge.onDiscordMessage(
-			discordMessage('dm-1', 'texto', { embeds: [{ type: 'unknown' }, { type: 'rich', url: 'https://example.com/x', title: 'convertível' }] })
+			discordMessage('dm-1', 'texto', { authorBot: true, embeds: [{ type: 'unknown' }, { type: 'rich', url: 'https://example.com/x', title: 'convertível' }] })
 		);
 		await settle();
 
@@ -283,11 +300,161 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(outbox.counts().dead).toBe(0);
 	});
 
+	it('embed personalizado é enviado também no modo webhook do Papo', async () => {
+		const { bridge, webhookSends, settle } = fixture({ papoWebhookMode: true });
+		await bridge.onDiscordMessage(
+			discordMessage('dm-custom-webhook-mode', '', {
+				authorBot: true,
+				embeds: [richPreview('custom-no-webhook')]
+			})
+		);
+		await settle();
+
+		expect(webhookSends).toHaveLength(1);
+		expect(webhookSends[0]!.embeds).toHaveLength(1);
+		expect(webhookSends[0]!.embeds![0]!.title).toBe('custom-no-webhook');
+	});
+
+	it('edição de embed personalizado também atualiza a cópia de webhook do Papo', async () => {
+		const { bridge, webhookEdits, settle } = fixture({ papoWebhookMode: true });
+		await bridge.onDiscordMessage(discordMessage('dm-custom-webhook-edit', 'status do bot', { authorBot: true }));
+		await settle();
+
+		await bridge.onDiscordEdit(
+			{} as never,
+			discordMessage('dm-custom-webhook-edit', 'status do bot', { authorBot: true, embeds: [richPreview('editado-webhook')] })
+		);
+		await settle();
+
+		expect(webhookEdits.some((edit) => edit.embeds?.[0]?.title === 'editado-webhook')).toBe(true);
+	});
+
+	it('embed personalizado de webhook sem hyperlink é convertido', async () => {
+		const { bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(
+			discordMessage('dm-webhook', 'notificação personalizada', {
+				authorBot: false,
+				webhookId: 'webhook-1',
+				embeds: [richPreview('webhook')]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.embeds).toHaveLength(2);
+		expect(api.sent[0]!.embeds![1]!.title).toBe('webhook');
+	});
+
+	it('embed personalizado de bot com content vazio não aciona um segundo preview nativo', async () => {
+		const { bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(
+			discordMessage('dm-bot-empty', '', {
+				authorBot: true,
+				embeds: [richPreview('custom-vazio')]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.embeds).toHaveLength(2);
+		expect(api.sent[0]!.embeds![1]!.title).toBe('custom-vazio');
+		expect(api.sent[0]!.content ?? '').toBe('');
+	});
+
+	it('imagem em embed personalizado de bot vira thumbnail mesmo sem MIME/extensão ou anexo bridgeado', async () => {
+		const { bridge, api, link, store, settle } = fixture();
+		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
+		const imageUrl = 'https://cdn.discordapp.com/attachments/111/222/imagem-sem-extensao';
+		const proxyUrl = 'https://media.discordapp.net/attachments/111/222/imagem-sem-extensao?width=480&height=480';
+
+		await bridge.onDiscordMessage(
+			discordMessage('dm-bot-image', '', {
+				authorBot: true,
+				attachments: [{ id: 'attachment-1', name: 'imagem-sem-extensao', size: 128, url: imageUrl }],
+				embeds: [{
+					type: 'rich',
+					title: 'Sua imagem de perfil.',
+					image: { url: imageUrl, proxy_url: proxyUrl, width: 480, height: 480 }
+				}]
+			})
+		);
+		await settle();
+
+		const sent = api.sent[0]!;
+		expect(sent.embeds).toHaveLength(2);
+		expect(sent.embeds![1]!.title).toBe('Sua imagem de perfil.');
+		expect(sent.embeds![1]!.thumbnail?.url).toBe(proxyUrl);
+		expect(sent.attachments ?? []).toHaveLength(0);
+	});
+
+	it('imagem de embed components de bot também é preservada sem MIME explícito', async () => {
+		const { bridge, api, settle } = fixture();
+		const imageUrl = 'https://cdn.discordapp.com/attachments/111/222/component-image';
+		const proxyUrl = 'https://media.discordapp.net/attachments/111/222/component-image?width=480';
+
+		await bridge.onDiscordMessage(
+			discordMessage('dm-bot-components', '', {
+				authorBot: true,
+				embeds: [{
+					type: 'components',
+					title: 'Imagem do bot',
+					url: 'https://example.com/profile',
+					components: [{
+						type: 17,
+						components: [{
+							type: 12,
+							items: [{ media: { url: imageUrl, proxy_url: proxyUrl, width: 480, height: 480 } }]
+						}]
+					}]
+				}]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.embeds).toHaveLength(2);
+		expect(api.sent[0]!.embeds![1]!.thumbnail?.url).toBe(proxyUrl);
+	});
+
+	it('embed de GIF de bot sem URL no content continua sendo convertido', async () => {
+		const { bridge, api, link, store, settle } = fixture();
+		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
+		await bridge.onDiscordMessage(
+			discordMessage('dm-bot-gif', '', {
+				authorBot: true,
+				embeds: [{
+					type: 'rich',
+					url: 'https://giphy.com/gifs/custom-bot-gif',
+					title: 'GIF personalizado',
+					image: { url: 'https://media.giphy.com/media/custom-bot-gif/giphy.gif', width: 320, height: 240, content_type: 'image/gif' }
+				}]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.embeds).toHaveLength(2);
+		expect(api.sent[0]!.embeds![1]!.title).toBe('GIF personalizado');
+		expect(api.sent[0]!.content ?? '').toBe('');
+	});
+
+	it('embed de usuário sem hyperlink não é convertido e sua URL vai para o crawler nativo', async () => {
+		const { bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(
+			discordMessage('dm-human', 'mensagem com preview', {
+				authorBot: false,
+				embeds: [richPreview('nativo')]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.embeds).toHaveLength(1);
+		expect(api.sent[0]!.embeds![0]!.description).toBe('');
+		expect(api.sent[0]!.content).toContain('mensagem com preview');
+		expect(api.sent[0]!.content).toContain('https://example.com/nativo');
+	});
+
 	it('GIF do Twitter via espelho chega como vídeo, não como imagem que o backend do Papo descarta', async () => {
 		const { bridge, api, settle } = fixture();
 
 		await bridge.onDiscordMessage(
-			discordMessage('dm-1', 'https://fixvx.com/hardestgifs/status/2108436160964136985', { embeds: [vxTwitterGif()] })
+			discordMessage('dm-1', 'olha o gif', { authorBot: true, embeds: [vxTwitterGif()] })
 		);
 		await settle();
 
@@ -308,6 +475,7 @@ describe('preview no bridge Discord → Papo', () => {
 			const { bridge, api, settle } = fixture();
 			await bridge.onDiscordMessage(
 				discordMessage('dm-1', 'com anexo', {
+					authorBot: false,
 					attachments: [{ id: 'a1', name: 'nota.txt', contentType: 'text/plain', size: 9, url: 'https://cdn.example.com/nota.txt' }],
 					embeds: [richPreview('artigo')]
 				})
@@ -315,7 +483,9 @@ describe('preview no bridge Discord → Papo', () => {
 			await settle();
 
 			expect(api.sent[0]!.attachments?.map((a) => a.name)).toEqual(['nota.txt']);
-			expect(api.sent[0]!.embeds).toHaveLength(2);
+			expect(api.sent[0]!.embeds).toHaveLength(1);
+			expect(api.sent[0]!.content).toContain('com anexo');
+			expect(api.sent[0]!.content).toContain('https://example.com/artigo');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
@@ -328,6 +498,7 @@ describe('preview no bridge Discord → Papo', () => {
 			const { bridge, api, settle } = fixture();
 			await bridge.onDiscordMessage(
 				discordMessage('dm-1', '', {
+					authorBot: false,
 					attachments: [{ id: 'a1', name: 'gif.gif', contentType: 'image/gif', size: 3, url: 'https://cdn.discordapp.com/attachments/111/222/gif.gif' }],
 					embeds: [
 						{
@@ -352,7 +523,7 @@ describe('preview no bridge Discord → Papo', () => {
 	it('o preview fica guardado no mapa: re-render posterior não o perde', async () => {
 		const { bridge, store, settle } = fixture();
 
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'olá', { embeds: [richPreview('artigo')] }));
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'olá', { authorBot: true, embeds: [richPreview('artigo')] }));
 		await settle();
 
 		const map = store.findMapByDiscord('dm-1')[0]!;
@@ -656,82 +827,117 @@ const withFetch = async <T>(handler: (url: string) => Promise<Response>, run: ()
 };
 
 describe('preview do Discord que chega depois da mensagem', () => {
-	it('MESSAGE_UPDATE com o link-preview aplica o preview à cópia do Papo', async () => {
+	it('MESSAGE_UPDATE com hyperlink mantém o preview nativo e não converte o embed', async () => {
 		const { bridge, api, settle } = fixture();
+		const url = 'https://www.oginstagram.com/reel/DeSKFT8BTKO/';
 
-		// o Discord cria a mensagem sem o preview: a cópia sai só com o cartão
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
+		await bridge.onDiscordMessage(discordMessage('dm-1', url, { authorBot: false }));
 		await settle();
 		expect(api.sent[0]!.embeds).toHaveLength(1);
 
 		await bridge.onDiscordEdit(
 			{} as never,
-			discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] })
+			discordMessage('dm-1', url, { authorBot: false, embeds: [ogInstagramPreview()] })
+		);
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(1);
+		expect(last.embeds[0]!.author?.name).toBe('Jenga');
+		expect(last.embeds[0]!.description).toBe('');
+		expect(last.content).toContain(url);
+		expect(last.embeds.some((e) => e.title === 'South America Memes')).toBe(false);
+	});
+
+	it('hyperlink do Discord não é persistido como embed do bridge nas edições', async () => {
+		const { store, bridge, api, settle } = fixture();
+		const url = 'https://www.oginstagram.com/reel/DeSKFT8BTKO/';
+		await bridge.onDiscordMessage(discordMessage('dm-1', url, { authorBot: false }));
+		await settle();
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', url, { authorBot: false, embeds: [ogInstagramPreview()] }));
+		await settle();
+
+		expect(store.findMapByDiscord('dm-1')[0]!.link_embeds).toBeFalsy();
+
+		await bridge.onDiscordEdit(
+			{} as never,
+			discordMessage('dm-1', 'texto corrigido', { authorBot: false, embeds: [ogInstagramPreview()] })
+		);
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(1);
+		expect(last.embeds[0]!.description).toBe('');
+		expect(last.content).toContain('texto corrigido');
+		expect(last.content).toContain(url);
+	});
+
+	it('MESSAGE_UPDATE repetido não duplica o hyperlink como embed', async () => {
+		const { bridge, api, settle } = fixture();
+		const url = 'https://www.oginstagram.com/reel/DeSKFT8BTKO/';
+		await bridge.onDiscordMessage(discordMessage('dm-1', url, { authorBot: false }));
+		await settle();
+
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', url, { authorBot: false, embeds: [ogInstagramPreview()] }));
+		await settle();
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', url, { authorBot: false, embeds: [ogInstagramPreview()] }));
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(1);
+		expect(last.embeds.some((e) => e.title === 'South America Memes')).toBe(false);
+	});
+
+	it('URL de preview que chega tarde é inserida mesmo com edições de texto desligadas', async () => {
+		const { bridge, api, settle } = fixture({ bridgeEdits: false });
+		const content = 'abrindo uma página';
+		await bridge.onDiscordMessage(discordMessage('dm-late-native', content, { authorBot: false }));
+		await settle();
+
+		await bridge.onDiscordEdit(
+			{} as never,
+			discordMessage('dm-late-native', content, { authorBot: false, embeds: [richPreview('nativo-tardio')] })
+		);
+		await settle();
+
+		const last = api.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(1);
+		expect(last.embeds[0]!.description).toBe('');
+		expect(last.content).toContain('abrindo uma página');
+		expect(last.content).toContain('https://example.com/nativo-tardio');
+	});
+
+	it('hyperlink recebido antes do mapeamento não gera embed adiado', async () => {
+		const { store, bridge, api, outbox, settle } = fixture({ bridgeEdits: false });
+		const url = 'https://www.oginstagram.com/reel/DeSKFT8BTKO/';
+
+		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', url, { authorBot: false, embeds: [ogInstagramPreview()] }));
+		expect(store.peekDeferredEvents('discord', 'dm-1')).toEqual([]);
+
+		await bridge.onDiscordMessage(discordMessage('dm-1', url, { authorBot: false }));
+		await settle();
+
+		expect(store.peekDeferredEvents('discord', 'dm-1')).toEqual([]);
+		expect(api.sent[0]!.embeds).toHaveLength(1);
+		expect(outbox.counts().dead).toBe(0);
+	});
+
+	it('embed personalizado de bot sem hyperlink é convertido quando chega por edição', async () => {
+		const { bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(discordMessage('dm-1', 'status do serviço', { authorBot: true }));
+		await settle();
+
+		await bridge.onDiscordEdit(
+			{} as never,
+			discordMessage('dm-1', 'status do serviço', { authorBot: true, embeds: [ogInstagramPreview()] })
 		);
 		await settle();
 
 		const last = api.edits.at(-1)!;
 		expect(last.embeds).toHaveLength(2);
-		// o cartão continua primeiro e intacto; o preview entra atrás
-		expect(last.embeds[0]!.author?.name).toBe('Jenga');
-		expect(last.embeds[0]!.description).toContain('oginstagram');
-		expect(last.embeds[1]!.title).toBe('South America Memes');
-		expect(last.embeds[1]!.description).toContain('ligando pra nada');
-		// o mp4 do carrossel vira vídeo no Papo: é o que faz o preview ter player
-		expect(last.embeds[1]!.video?.mime_type).toBe('video/mp4');
-		expect(last.embeds[1]!.video?.url).toContain('oginstagram.com/offload/DeSKFT8BTKO/1');
-	});
-
-	it('preview do Discord fica no mapa e sobrevive às edições seguintes', async () => {
-		const { store, bridge, api, settle } = fixture();
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
-		await settle();
-		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
-		await settle();
-
-		expect(JSON.parse(store.findMapByDiscord('dm-1')[0]!.link_embeds!) as EmbedLike[]).toHaveLength(1);
-
-		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'texto corrigido', { embeds: [ogInstagramPreview()] }));
-		await settle();
-
-		const last = api.edits.at(-1)!;
-		expect(last.embeds).toHaveLength(2);
-		expect(last.embeds[0]!.description).toContain('texto corrigido');
 		expect(last.embeds[1]!.title).toBe('South America Memes');
 	});
-
-	it('MESSAGE_UPDATE repetido não duplica o preview', async () => {
-		const { bridge, api, settle } = fixture();
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
-		await settle();
-
-		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
-		await settle();
-		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
-		await settle();
-
-		const last = api.edits.at(-1)!;
-		expect(last.embeds.filter((e) => e.title === 'South America Memes')).toHaveLength(1);
-	});
-
-	it('preview que chega antes do mapeamento espera a cópia em vez de se perder', async () => {
-		const { store, bridge, api, outbox, settle } = fixture({ bridgeEdits: false });
-
-		// o MESSAGE_UPDATE chega antes do MESSAGE_CREATE bridgeado: sem destino, o preview fica
-		// adiado e é enfileirado pelo flush que acompanha a criação do mapeamento
-		await bridge.onDiscordEdit({} as never, discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/', { embeds: [ogInstagramPreview()] }));
-		expect(store.peekDeferredEvents('discord', 'dm-1').map((e) => e.kind)).toEqual(['embeds']);
-
-		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://www.oginstagram.com/reel/DeSKFT8BTKO/'));
-		await settle();
-
-		expect(store.peekDeferredEvents('discord', 'dm-1')).toEqual([]);
-		const last = api.edits.at(-1)!;
-		expect(last.embeds).toHaveLength(2);
-		expect(last.embeds[1]!.title).toBe('South America Memes');
-		expect(outbox.counts().dead).toBe(0);
-	});
-
+	
 	it.each([
 		['Tenor', 'https://tenor.com/view/funny-gif-1234567890', 'https://media.tenor.com/abc/tenor.gif'],
 		['Giphy', 'https://giphy.com/gifs/lkdH8FmImcGoylv3t3', 'https://media.giphy.com/media/lkdH8FmImcGoylv3t3/giphy.gif'],
@@ -771,6 +977,7 @@ describe('preview do Discord que chega depois da mensagem', () => {
 
 		await bridge.onDiscordMessage(
 			discordMessage('dm-embed-only', '', {
+				authorBot: false,
 				embeds: [
 					{
 						type: 'rich',
@@ -894,6 +1101,7 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 			async () => {
 				await bridge.onDiscordMessage(
 					discordMessage('dm-1', 'olha a foto', {
+						authorBot: false,
 						embeds: [
 							{
 								type: 'image',
@@ -920,7 +1128,8 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 		expect(urls).toContain('https://cdn.discordapp.com/attachments/111/222/foto.png');
 		// o card da ponte é o único embed: o preview não acrescenta nada além de uma URL que quebra
 		expect(sent.embeds ?? []).toHaveLength(1);
-		expect(sent.embeds![0]!.description).toBe('olha a foto');
+		expect(sent.embeds![0]!.description).toBe('');
+		expect(sent.content).toContain('olha a foto');
 	});
 
 	it('link de arquivo do Discord colado no texto também vira anexo, e sai do texto', async () => {
@@ -946,7 +1155,8 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 		await bridge.onDiscordMessage(discordMessage('dm-1', 'https://cdn.discordapp.com/attachments/111/222/clipe.mp4'));
 		await settle();
 
-		expect(api.sent[0]!.embeds![0]!.description).toBe('https://cdn.discordapp.com/attachments/111/222/clipe.mp4');
+		expect(api.sent[0]!.embeds![0]!.description).toBe('');
+		expect(api.sent[0]!.content).toContain('https://cdn.discordapp.com/attachments/111/222/clipe.mp4');
 	});
 
 	it('a mesma mídia servida por outro host não é baixada duas vezes', async () => {
@@ -956,6 +1166,7 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 			async () => {
 				await bridge.onDiscordMessage(
 					discordMessage('dm-1', 'gif', {
+						authorBot: false,
 						attachments: [{ id: 'att-1', name: 'gif.gif', url: 'https://cdn.discordapp.com/attachments/111/222/gif.gif', size: 12, contentType: 'image/gif' }],
 						embeds: [
 							{
@@ -981,6 +1192,7 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 			async () => {
 				await bridge.onDiscordMessage(
 					discordMessage('dm-1', 'olha o gif', {
+						authorBot: false,
 						embeds: [
 							{
 								type: 'image',
@@ -1003,6 +1215,7 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
 		await bridge.onDiscordMessage(
 			discordMessage('dm-1', 'olha a foto', {
+				authorBot: false,
 				embeds: [
 					{
 						type: 'image',
@@ -1017,8 +1230,8 @@ describe('mídia hospedada pelo Discord vira anexo no Papo', () => {
 
 		const sent = api.sent[0]!;
 		expect(sent.attachments ?? []).toHaveLength(0);
-		expect(sent.embeds ?? []).toHaveLength(2);
-		expect(sent.embeds![1]!.thumbnail?.url).toBe('https://cdn.discordapp.com/attachments/111/222/foto.png');
+		expect(sent.embeds ?? []).toHaveLength(1);
+		expect(sent.content).toContain('https://cdn.discordapp.com/attachments/111/222/foto.png');
 	});
 });
 
@@ -1141,9 +1354,10 @@ describe('link de anexo do Discord com assinatura vencida', () => {
 
 		const sent = api.sent[0]!;
 		expect(sent.attachments ?? []).toHaveLength(0);
-		expect(sent.embeds![0]!.description).toContain('olha o gif');
-		expect(sent.embeds![0]!.description).toContain('morto.gif');
-		expect(sent.embeds![0]!.description).toContain('não está mais disponível');
+		expect(sent.embeds![0]!.description).toBe('');
+		expect(sent.content).toContain('olha o gif');
+		expect(sent.content).toContain('morto.gif');
+		expect(sent.content).toContain('não está mais disponível');
 		// o job não vai para `dead`: perder um arquivo não é motivo para perder a mensagem
 		expect(outbox.counts().dead).toBe(0);
 	});

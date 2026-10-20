@@ -67,7 +67,9 @@ import { copySignatures, signedFooter } from './signature.js';
 import {
 	discordHostedMedia,
 	discordMediaLinksInContent,
+	firstDiscordLinkUrl,
 	firstDiscordPreview,
+	hasHyperlinkInContent,
 	firstPapoPreview,
 	mediaKey,
 	rawDiscordEmbeds,
@@ -121,6 +123,11 @@ const replyNoteFor = (link?: string | null, author?: string | null): string => {
 
 /** Buscas no Discord por menção que o payload não trouxe, por mensagem. */
 const MENTION_LOOKUP_LIMIT = 10;
+
+/** Só converte embeds personalizados de bots/webhooks sem URL no conteúdo da mensagem. */
+function shouldConvertCustomDiscordEmbeds(message: { content?: string | null; webhookId?: string | null; author?: { bot?: boolean } | null }): boolean {
+	return Boolean(message.author?.bot || message.webhookId) && !hasHyperlinkInContent(message.content);
+}
 
 /** Identidade de uma reação do Papo, estável entre o evento WS e a execução do job. */
 const papoReactionKey = (e: { emoji_id: string | null; unicode: string | null }): string =>
@@ -211,8 +218,12 @@ function gifSourceUrlIn(content: string, embeds: readonly { url?: string | null 
 	return embeds.find((embed) => isGifSourceUrl(embed.url))?.url ?? undefined;
 }
 
+function withContentUrl(content: string, sourceUrl: string): string {
+	return content.trim() ? content + '\n' + sourceUrl : sourceUrl;
+}
+
 function withGifSourceUrl(content: string, sourceUrl: string): string {
-	return gifSourceUrlIn(content) ? content : content.trim() ? content + '\n' + sourceUrl : sourceUrl;
+	return gifSourceUrlIn(content) ? content : withContentUrl(content, sourceUrl);
 }
 
 export class Bridge {
@@ -1251,12 +1262,19 @@ export class Bridge {
 
 		const bridgeFiles = Boolean(link.bridge_attachments);
 		const rawEmbeds = rawDiscordEmbeds(m.embeds as APIEmbed[]);
+		const convertCustomEmbeds = shouldConvertCustomDiscordEmbeds(m);
+		const nativePreviewUrl = link.bridge_embeds && !convertCustomEmbeds ? firstDiscordLinkUrl(rawEmbeds) : undefined;
+		const injectNativePreviewUrl = Boolean(nativePreviewUrl && !hasHyperlinkInContent(m.content ?? ''));
 		const gifSourceUrl = gifSourceUrlIn(m.content ?? '', rawEmbeds);
 		// O crawler do backend examina content. Se o Discord trouxe somente o link-preview,
 		// copie a URL da página (não a URL proxy da imagem), sem reescrevê-la.
 		await this.warmPapoEmojis(m.content ?? '');
 		const translated = discordToPapoContent(m.content ?? '', this.resolvers(link));
-		const crawlerText = gifSourceUrl ? withGifSourceUrl(translated, gifSourceUrl) : translated;
+		const crawlerText = !convertCustomEmbeds && gifSourceUrl
+			? withGifSourceUrl(translated, gifSourceUrl)
+			: injectNativePreviewUrl
+				? withContentUrl(translated, nativePreviewUrl!)
+				: translated;
 		// Os links do CDN do Discord continuam passando pelo pipeline de anexos existente.
 		const content = bridgeFiles ? stripDiscordMediaLinks(crawlerText) : crawlerText;
 		const chunks = chunkText(content, PAPO_EMBED_CHUNK_CHARS);
@@ -1273,14 +1291,14 @@ export class Bridge {
 		const attachmentUrls = m.attachments.map((a) => a.url);
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
-		const preview = link.bridge_embeds && !gifSourceUrl
-			? firstDiscordPreview(rawEmbeds, attachmentUrls, { rehostDiscordMedia: bridgeFiles })
+		const preview = link.bridge_embeds && convertCustomEmbeds
+			? firstDiscordPreview(rawEmbeds, bridgeFiles ? attachmentUrls : [])
 			: undefined;
-		// mídia que o Discord hospeda (`cdn.discordapp.com`, `media.discordapp.net`) é volátil:
-		// expira junto com a mensagem original e o hotlink é bloqueado. Ela vira anexo baixado
-		// e re-enviado, nunca URL dentro de embed.
+		// Em previews comuns, a mídia hospedada pelo Discord é re-enviada como anexo porque a URL
+		// expira. Embeds personalizados convertidos são exceção: preservamos a mídia no próprio
+		// embed para o backend do Papo re-hospedá-la e não perder o visual do cartão.
 		const hosted = new Set(attachmentUrls.map(mediaKey).filter(Boolean) as string[]);
-		if (bridgeFiles && link.bridge_embeds) {
+		if (bridgeFiles && link.bridge_embeds && !convertCustomEmbeds) {
 			this.addDiscordMediaSources(m.id, discordHostedMedia(rawEmbeds), sources, hosted);
 		}
 		if (bridgeFiles) {
@@ -1320,7 +1338,7 @@ export class Bridge {
 		for (let i = 0; i < total; i++) {
 			// sem texto mas com anexo/embed o card já mostra a mídia: não precisa de marcador
 			const fallback = sources.length || linkEmbeds.length ? '' : '[mensagem sem texto]';
-			const chunkContent = chunks[i] ?? (i === 0 ? (linkEmbeds[0]?.url ?? fallback) : '');
+			const chunkContent = chunks[i] ?? (i === 0 ? fallback : '');
 			const job: ToPapoMessageJob = {
 				kind: 'message',
 				linkId: link.id,
@@ -1336,7 +1354,7 @@ export class Bridge {
 				authorAvatarHash: m.author.avatar ?? undefined,
 				authorAvatarUrl: avatarUrl,
 				content: chunkContent,
-				contentMode: Boolean(gifSourceUrl),
+				contentMode: Boolean(!convertCustomEmbeds && (gifSourceUrl || (link.bridge_embeds && (hasHyperlinkInContent(m.content ?? '') || injectNativePreviewUrl)))),
 				footerBase: `🕒 ${formatDate(m.createdAt.toISOString(), this.cfg.bridge.timezone)} · Discord${chunkLabel(i, total)}`,
 				notes: [],
 				sources: i === 0 ? sources : [],
@@ -1389,11 +1407,18 @@ export class Bridge {
 		await this.cacheMentionedDiscordUsers(fresh);
 		if (this.propagatesMentions(link) && /@/.test(fresh.content ?? '')) await this.ensurePapoNameIndex();
 		const previewEmbeds = rawDiscordEmbeds(fresh.embeds as APIEmbed[]);
+		const convertCustomEmbeds = shouldConvertCustomDiscordEmbeds(fresh);
+		const nativePreviewUrl = link.bridge_embeds && !convertCustomEmbeds ? firstDiscordLinkUrl(previewEmbeds) : undefined;
+		const injectNativePreviewUrl = Boolean(nativePreviewUrl && !hasHyperlinkInContent(fresh.content ?? ''));
 		const gifSourceUrl = gifSourceUrlIn(fresh.content ?? '', previewEmbeds);
-		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(gifSourceUrl);
+		const contentMode = maps.some((map) => Boolean(map.content_mode)) || Boolean(!convertCustomEmbeds && (gifSourceUrl || (link.bridge_embeds && (hasHyperlinkInContent(fresh.content ?? '') || injectNativePreviewUrl))));
 		await this.warmPapoEmojis(fresh.content ?? '');
 		const translated = discordToPapoContent(fresh.content ?? '', this.resolvers(link));
-		const edited = gifSourceUrl ? withGifSourceUrl(translated, gifSourceUrl) : translated;
+		const edited = !convertCustomEmbeds && gifSourceUrl
+			? withGifSourceUrl(translated, gifSourceUrl)
+			: injectNativePreviewUrl
+				? withContentUrl(translated, nativePreviewUrl!)
+				: translated;
 		const chunks = chunkText(link.bridge_attachments ? stripDiscordMediaLinks(edited) : edited, PAPO_EMBED_CHUNK_CHARS);
 		// sem mapeamento a mensagem ainda está na fila de bridge: o job re-tenta até ela aparecer
 		const targets = maps.length
@@ -1414,7 +1439,7 @@ export class Bridge {
 				url: attachment.url
 			}));
 			const hosted = new Set(fresh.attachments.map((attachment) => mediaKey(attachment.url)).filter(Boolean) as string[]);
-			if (link.bridge_embeds) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
+			if (link.bridge_embeds && !convertCustomEmbeds) this.addDiscordMediaSources(fresh.id, discordHostedMedia(previewEmbeds), sources, hosted);
 			this.addDiscordMediaSources(
 				fresh.id,
 				discordMediaLinksInContent(fresh.content ?? '').map((url) => ({ url, mime: mimeFromUrl(url) })),
@@ -1447,10 +1472,10 @@ export class Bridge {
 		}
 		// o Discord anexa o preview de link depois de criar a mensagem: é por aqui que ele chega,
 		// e sem isso o cartão do Papo fica só com a URL escrita
-		const preview = link.bridge_embeds && !contentMode
-			? firstDiscordPreview(previewEmbeds, fresh.attachments.map((a) => a.url), { rehostDiscordMedia: true })
+		const preview = link.bridge_embeds && convertCustomEmbeds && !contentMode
+			? firstDiscordPreview(previewEmbeds, link.bridge_attachments ? fresh.attachments.map((a) => a.url) : [])
 			: undefined;
-		if (preview && link.bridge_attachments) {
+		if (preview && link.bridge_attachments && !convertCustomEmbeds) {
 			const attachmentKeys = new Set(fresh.attachments.map((a) => mediaKey(a.url)).filter(Boolean));
 			const stripped = discordHostedMedia(previewEmbeds).filter((m) => !attachmentKeys.has(mediaKey(discordMediaSourceUrl(m)) ?? ''));
 			if (stripped.length) {
@@ -1476,7 +1501,7 @@ export class Bridge {
 		for (const target of targets) {
 			// A dedicated job replaces the main copy and all attachment continuation messages.
 			if (attachmentsChanged && (target.chunkIndex === 0 || target.chunkIndex >= EXTRA_CHUNK_BASE)) continue;
-			if (link.bridge_edits) {
+			if (link.bridge_edits || injectNativePreviewUrl) {
 				const job: EditJob = {
 					kind: 'edit',
 					side: 'discord',
@@ -1502,7 +1527,7 @@ export class Bridge {
 		this.scheduleLink(link.id);
 	}
 
-	/** Enfileira o preview de link do Discord para cada cópia do Papo. Sincrono: cabe no flush transacional. */
+	/** Enfileira um embed personalizado convertido do Discord para cada cópia do Papo. */
 	private enqueuePapoPreview(
 		link: ChannelLink,
 		maps: MessageMapRow[],
@@ -2292,10 +2317,10 @@ export class Bridge {
 		}
 
 		// modo webhook (espelho do modo webhook do Discord): cada usuário Discord tem um webhook
-		// próprio no canal Papo, com nick + avatar fixos no webhook. `content` = texto do
-		// Discord e os únicos embeds são os previews de link que vieram com a mensagem; a data é
-		// o timestamp nativo do Papo. Sem pool de webhooks (bot sem `manage_webhooks`) o envio
-		// continua pelo cartão do bot — e o avatar nem chega a ser baixado.
+		// próprio no canal Papo, com nick + avatar fixos no webhook. `content` = texto do Discord;
+		// links ficam para o crawler nativo e embeds personalizados de bots/webhooks são enviados
+		// explicitamente. Sem pool de webhooks (bot sem `manage_webhooks`) o envio continua pelo
+		// cartão do bot — e o avatar nem chega a ser baixado.
 		const avatar = this.papoWebhooks && job.authorId ? await this.discordAvatarFor(job) : undefined;
 		const webhook =
 			this.papoWebhooks && job.authorId
@@ -2333,9 +2358,9 @@ export class Bridge {
 		// Discord, o webhook do Papo responde mensagem: a referência do reply é nativa e não
 		// precisa virar nota no texto. Sem cartão, sem rodapé, sem embed de continuação.
 		//
-		// O preview de link também é nativo: o `content` carrega a URL e o backend faz o crawl
-		// dela em background. Reenviar o preview como embed customizado duplicaria o mesmo link
-		// — o crawler do Papo não deduplica contra os embeds da mensagem.
+		// O preview de link é nativo: o `content` carrega a URL e o backend faz o crawl em
+		// background. `job.linkEmbeds` só contém embeds personalizados convertidos; converter
+		// também o preview de hyperlink duplicaria o mesmo link, pois o crawler não deduplica embeds.
 		const webhookContent = this.webhookCopyContent('', text, summary, PAPO_LIMITS.contentMax);
 
 		const signedBase = signedFooter(job.footerBase, signatures[0]!, PAPO_LIMITS.embedFooterMax);
@@ -2360,13 +2385,14 @@ export class Bridge {
 			const extra = g > 0;
 
 			if (webhook && webhookMode) {
-				if (!extra && !webhookContent && !attachments.length) {
+				if (!extra && !webhookContent && !attachments.length && !job.linkEmbeds?.length) {
 					this.log.debug({ discordMessageId: job.discordMessageId }, 'mensagem sem conteúdo ou anexo: nada a enviar');
 					continue;
 				}
 				markAttempt();
 				const created = await this.sendWebhookSafe(webhook, job, g, extra, lastPapoId, {
 					...(extra ? {} : { content: webhookContent }),
+					...(extra ? {} : { embeds: job.linkEmbeds ?? [] }),
 					attachments
 				});
 				if (!created)
@@ -2480,9 +2506,9 @@ export class Bridge {
 			// seria lido como cartão pelo refresh de rodapé)
 			bridge_embed: extra || webhookCopy || mainEmbed == null ? undefined : mainEmbed,
 			footer_base: extra || webhookCopy ? null : footerBase,
-			// cópia de webhook não tem embed do bridge: o único embed da mensagem é o
-			// link-preview que o Papo faz a partir das URLs do próprio `content`
-			link_embeds: extra || webhookCopy ? null : (job.linkEmbeds ?? []),
+			// Cópias de webhook não têm cartão do bridge, mas guardam embeds personalizados
+			// convertidos para que atualizações posteriores também sejam espelhadas.
+			link_embeds: extra ? null : (job.linkEmbeds ?? []),
 			// autor Discord de origem: é ele que a nota de reply de uma cópia aponta
 			author_label: job.authorName || null,
 			webhook_copy: webhookCopy,
@@ -2835,7 +2861,7 @@ export class Bridge {
 		this.store.updateMapSnapshot(map.id, { link_embeds: previews, embed_revision: job.revision ?? null });
 	}
 
-	/** Preview de link do Discord aplicado à cópia do Papo: o preview do Discord chega atrasado. */
+	/** Aplica um embed personalizado convertido do Discord à cópia do Papo. */
 	private async applyPapoPreviewEdit(env: Envelope, job: EditJob, map: MessageMapRow): Promise<void> {
 		if (map.direction !== 'discord_to_papo') {
 			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'preview ignorado: a cópia editável não está no Papo');
@@ -2849,13 +2875,21 @@ export class Bridge {
 			);
 			return;
 		}
+		const previews = env.papoPreviews ?? [];
 		if (map.webhook_copy) {
-			// cópia de webhook: o preview não é embed do bridge. O `content` carrega a URL e o
-			// Papo faz o link-preview dele mesmo (crawl em background) — não há o que escrever.
-			this.log.debug({ sourceMessageId: job.sourceMessageId }, 'preview ignorado: cópia de webhook tem preview nativo');
+			// Previews nativos não chegam aqui; quando chega um embed personalizado convertido,
+			// atualize-o com o token do webhook sem tocar no conteúdo nem no resumo de reações.
+			const content = this.webhookCopyContent(
+				'',
+				map.rendered ?? '',
+				await this.reactionSummaryForMap(map, 'papo'),
+				PAPO_LIMITS.contentMax
+			);
+			if (await this.editPapoWebhookCopy(map, content, previews)) {
+				this.store.updateMapSnapshot(map.id, { link_embeds: previews, embed_revision: job.revision ?? null });
+			}
 			return;
 		}
-		const previews = env.papoPreviews ?? [];
 		const card = map.bridge_embed ? (JSON.parse(map.bridge_embed) as PapoEmbedInput) : undefined;
 		if (card) {
 			card.description = this.withReactionSummary(
