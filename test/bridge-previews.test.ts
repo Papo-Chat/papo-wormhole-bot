@@ -268,11 +268,11 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(outbox.counts().dead).toBe(0);
 	});
 
-	it('preview que não converte não derruba a mensagem', async () => {
+	it('embed personalizado de bot sem hyperlink é convertido mesmo após embed inválido', async () => {
 		const { bridge, api, outbox, settle } = fixture();
 
 		await bridge.onDiscordMessage(
-			discordMessage('dm-1', 'texto', { embeds: [{ type: 'unknown' }, { type: 'rich', url: 'https://example.com/x', title: 'convertível' }] })
+			discordMessage('dm-1', 'texto', { authorBot: true, embeds: [{ type: 'unknown' }, { type: 'rich', url: 'https://example.com/x', title: 'convertível' }] })
 		);
 		await settle();
 
@@ -280,6 +280,35 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(embeds[0]!.description).toContain('texto');
 		expect(embeds[1]!.title).toBe('convertível');
 		expect(outbox.counts().dead).toBe(0);
+	});
+
+	it('embed personalizado de webhook sem hyperlink é convertido', async () => {
+		const { bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(
+			discordMessage('dm-webhook', 'notificação personalizada', {
+				authorBot: false,
+				webhookId: 'webhook-1',
+				embeds: [richPreview('webhook')]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.embeds).toHaveLength(2);
+		expect(api.sent[0]!.embeds![1]!.title).toBe('webhook');
+	});
+
+	it('embed de usuário sem hyperlink não é convertido e sua URL vai para o crawler nativo', async () => {
+		const { bridge, api, settle } = fixture();
+		await bridge.onDiscordMessage(
+			discordMessage('dm-human', 'mensagem com preview', {
+				authorBot: false,
+				embeds: [richPreview('nativo')]
+			})
+		);
+		await settle();
+
+		expect(api.sent[0]!.embeds).toHaveLength(1);
+		expect(api.sent[0]!.content).toContain('https://example.com/nativo');
 	});
 
 	it('GIF do Twitter via espelho chega como vídeo, não como imagem que o backend do Papo descarta', async () => {
