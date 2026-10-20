@@ -130,7 +130,7 @@ export function firstDiscordLinkUrl(embeds: readonly APIEmbed[] | undefined): st
 	for (const e of embeds ?? []) {
 		if (e.type && !DISCORD_PREVIEW_TYPES.has(e.type)) continue;
 		const url = urlOf(e);
-		if (url && /^https?:\/\//i.test(url) && !isDiscordMediaUrl(url)) return url;
+		if (url && /^https?:\/\//i.test(url)) return url;
 	}
 	return undefined;
 }
