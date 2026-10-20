@@ -109,11 +109,12 @@ Componentes:
   `content` = texto da origem e o bridge não gera cartão.
   - **Discord**: os únicos embeds extras são os previews que vieram do Papo. Webhook não responde
     mensagem lá: a referência do reply vira nota no texto (ver §12).
-  - **Papo**: o webhook responde mensagem, então o reply continua nativo (`reply_to`). Os únicos
-    embeds são os link previews, e eles são **nativos**: o `content` carrega a URL e o backend faz
-    o crawl dela — reenviar o preview como embed duplicaria o mesmo link (o crawler não deduplica
-    contra os embeds da mensagem). O envio leva `external_message_id`, a chave de idempotência que
-    substitui a reconciliação por assinatura de rodapé.
+  - **Papo**: o webhook responde mensagem, então o reply continua nativo (`reply_to`). Hyperlinks
+    no `content` permanecem lá para o backend gerar o preview nativo; o bridge não converte o embed
+    correspondente para evitar duplicidade (o crawler não deduplica contra embeds da mensagem).
+    A exceção são embeds personalizados enviados por bots ou webhooks sem hyperlink no `content`:
+    esses são convertidos em embeds do Papo, sem copiar a URL do embed para o texto. O envio leva
+    `external_message_id`, a chave de idempotência que substitui a reconciliação por assinatura de rodapé.
 - `/link-user` é **opcional**: sem link, usa modo espelho (nome/avatar no embed). Com link,
   habilita: menções traduzidas, `/online` cruzado, reações atribuídas, e futura sincronia de papéis.
 
@@ -306,6 +307,8 @@ reuso de avatar, retries sem novo download, e URLs estáveis no media server.
 ## 8. Embeds e link previews
 
 Mapeamento Discord Embed → Papo `EmbedInput`:
+
+No fluxo Discord → Papo, a política de conversão é: se `content` contém hyperlink, a URL é mantida para o crawler nativo e o embed do Discord não é espelhado. Só se convertem embeds personalizados de autores bot/webhook quando o `content` não contém hyperlink. Para embed de link sem URL no `content` e que não seja de bot/webhook, o bridge coloca a URL da página no `content` para o backend criar o preview.
 
 | Discord | Papo | Observação |
 | --- | --- | --- |
