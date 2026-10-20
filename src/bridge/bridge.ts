@@ -1326,7 +1326,10 @@ export class Bridge {
 				});
 				preview.thumbnail = { attachment_name: name, mime_type: previewImage.mime };
 			} else {
-				this.log.debug({ messageId: m.id }, 'mídia do embed não copiada: anexos estão desativados no link');
+				this.log.debug(
+					{ messageId: m.id },
+					'mídia do embed não copiada: anexos estão desativados no link'
+				);
 				preview.thumbnail = undefined;
 			}
 		}
@@ -1554,7 +1557,9 @@ export class Bridge {
 		}
 		for (const target of targets) {
 			// O job dedicado recria a cópia principal e as continuações de anexos.
-			if (refreshAttachments && (target.chunkIndex === 0 || target.chunkIndex >= EXTRA_CHUNK_BASE)) continue;
+			if (refreshAttachments && (target.chunkIndex === 0 || target.chunkIndex >= EXTRA_CHUNK_BASE)) {
+				continue;
+			}
 			if (link.bridge_edits || injectNativePreviewUrl) {
 				const job: EditJob = {
 					kind: 'edit',
