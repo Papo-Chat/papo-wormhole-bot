@@ -1292,7 +1292,7 @@ export class Bridge {
 		// só o primeiro preview compatível: o cartão da ponte já ocupa um embed, e a URL que
 		// já sai como anexo não precisa de um segundo embed igual
 		const preview = link.bridge_embeds && convertCustomEmbeds
-			? firstDiscordPreview(rawEmbeds, attachmentUrls)
+			? firstDiscordPreview(rawEmbeds, bridgeFiles ? attachmentUrls : [])
 			: undefined;
 		// mídia que o Discord hospeda (`cdn.discordapp.com`, `media.discordapp.net`) é volátil:
 		// expira junto com a mensagem original e o hotlink é bloqueado. Ela vira anexo baixado
