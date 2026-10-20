@@ -359,7 +359,7 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(api.sent[0]!.content ?? '').toBe('');
 	});
 
-	it('imagem em embed personalizado de bot vira thumbnail mesmo sem MIME/extensão ou anexo bridgeado', async () => {
+	it('imagem em embed personalizado vira thumbnail mesmo com attachments comuns desativados', async () => {
 		const { bridge, api, link, store, settle } = fixture();
 		store.setChannelLinkFlag(link.id, 'bridge_attachments', 0);
 		const imageUrl = 'https://cdn.discordapp.com/attachments/111/222/imagem-sem-extensao';
@@ -381,8 +381,9 @@ describe('preview no bridge Discord → Papo', () => {
 		const sent = api.sent[0]!;
 		expect(sent.embeds).toHaveLength(2);
 		expect(sent.embeds![1]!.title).toBe('Sua imagem de perfil.');
-		expect(sent.embeds![1]!.thumbnail?.url).toBe(proxyUrl);
-		expect(sent.attachments ?? []).toHaveLength(0);
+		expect(sent.embeds![1]!.thumbnail?.url).toBeUndefined();
+		expect(sent.embeds![1]!.thumbnail?.attachment_name).toBe(sent.attachments![0]!.name);
+		expect(sent.attachments).toHaveLength(1);
 	});
 
 	it(
@@ -480,7 +481,8 @@ describe('preview no bridge Discord → Papo', () => {
 		expect(urls).toEqual([imageUrl]);
 		expect(api.sent).toHaveLength(2);
 		expect(api.sent[1]!.embeds![1]!.title).toBe('Imagem recebida depois');
-		expect(api.sent[1]!.embeds![1]!.thumbnail).toBeUndefined();
+		expect(api.sent[1]!.embeds![1]!.thumbnail?.url).toBeUndefined();
+		expect(api.sent[1]!.embeds![1]!.thumbnail?.attachment_name).toBe(api.sent[1]!.attachments![0]!.name);
 		expect(api.sent[1]!.attachments).toHaveLength(1);
 	});
 
@@ -533,7 +535,9 @@ describe('preview no bridge Discord → Papo', () => {
 		await settle();
 
 		expect(api.sent[0]!.embeds).toHaveLength(2);
-		expect(api.sent[0]!.embeds![1]!.thumbnail?.url).toBe(proxyUrl);
+		expect(api.sent[0]!.embeds![1]!.thumbnail?.url).toBeUndefined();
+		expect(api.sent[0]!.embeds![1]!.thumbnail?.attachment_name).toBe(api.sent[0]!.attachments![0]!.name);
+		expect(api.sent[0]!.attachments).toHaveLength(1);
 	});
 
 	it('embed de GIF de bot sem URL no content continua sendo convertido', async () => {
