@@ -436,6 +436,29 @@ describe('preview no bridge Discord → Papo', () => {
 		}
 	);
 
+	it('prefere thumbnail do Discord e usa image apenas quando thumbnail falta', async () => {
+		const { bridge, api, settle } = fixture({ mediaBaseUrl: null });
+		const thumbnailUrl = 'https://images.example.com/thumb.png';
+		const imageUrl = 'https://cdn.discordapp.com/avatars/123456789/image.png?size=1024';
+
+		await bridge.onDiscordMessage(
+			discordMessage('dm-bot-both-media', '', {
+				authorBot: true,
+				embeds: [{
+					type: 'rich',
+					title: 'embed com duas imagens',
+					thumbnail: { url: thumbnailUrl, content_type: 'image/png', width: 100, height: 100 },
+					image: { url: imageUrl, content_type: 'image/png', width: 1024, height: 1024 }
+				}]
+			})
+		);
+		await settle();
+
+		const sent = api.sent[0]!;
+		expect(sent.embeds![1]!.thumbnail?.url).toBe(thumbnailUrl);
+		expect(sent.attachments ?? []).toHaveLength(0);
+	});
+
 	it('imagem de embed components de bot também é preservada sem MIME explícito', async () => {
 		const { bridge, api, settle } = fixture();
 		const imageUrl = 'https://cdn.discordapp.com/attachments/111/222/component-image';
