@@ -759,18 +759,16 @@ describe('preview no bridge Papo → Discord', () => {
 		expect(outbox.counts().dead).toBe(0);
 	});
 
-	it('avatar e mídia do preview são anexados uma única vez', async () => {
+	it('avatar é anexado uma única vez quando o link-preview do Papo é descartado', async () => {
 		const { bridge, discord, settle } = fixture({ avatar: true, mediaBaseUrl: null });
 
 		bridge.onPapoEvent(papoMessage('pm1', 'olá https://example.com/a', { embeds: [linkPreview('artigo')] }));
 		await settle();
 
 		const files = discord.sends[0]!.files;
-		// sem media server público o avatar do cartão é um anexo referenciado; reenviá-lo pelo
-		// caminho das referências deixa uma cópia sem embed consumindo-a, e o Discord desenha
-		// no corpo da mensagem todo arquivo órfão — uma foto grande do avatar
+		// O avatar do cartão fica como anexo referenciado; o link-preview do Papo não adiciona mídia.
 		expect(files.filter((f) => f.startsWith('avatar-'))).toHaveLength(1);
-		expect(files.filter((f) => f.startsWith('media-'))).toHaveLength(1);
+		expect(files.filter((f) => f.startsWith('media-'))).toHaveLength(0);
 		expect(discord.sends[0]!.embeds[0]!.author?.icon_url).toMatch(/^attachment:\/\/avatar-[0-9a-f]{64}\.png$/);
 	});
 });
