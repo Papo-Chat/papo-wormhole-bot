@@ -1197,6 +1197,25 @@ describe('mídia do preview no Discord', () => {
 		]);
 	});
 
+	it('preserva o preview quando o link do content é diferente do link do vídeo', async () => {
+		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
+		await withFetch(
+			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm-other-link', 'Leia também https://example.com/noticia', { embeds: [videoPreview()] }));
+				await settle();
+			}
+		);
+
+		const send = discord.sends[0]!;
+		expect(send.embeds).toHaveLength(2);
+		expect(send.embeds[1]!.title).toBe('Vídeo');
+		expect(send.files).toEqual([
+			expect.stringMatching(/^media-[0-9a-f]{64}\\.webp$/),
+			expect.stringMatching(/^media-[0-9a-f]{64}\\.mp4$/)
+		]);
+	});
+
 	it('o edit reenvia a mídia do preview: o Discord resolve a referência no mesmo request', async () => {
 		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
 		await withFetch(
