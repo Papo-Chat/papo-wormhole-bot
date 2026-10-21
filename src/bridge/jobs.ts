@@ -44,6 +44,8 @@ export interface ToDiscordMessageJob {
 	linkEmbeds?: DiscordEmbedPayload[];
 	/** Arquivos de vídeo de previews enviados como anexos independentes, sem embed visual duplicado. */
 	mediaAttachments?: { name: string; sha: string }[];
+	/** Suprime o unfurl automático de URL do Discord quando o vídeo substitui o preview. */
+	suppressLinkPreview?: boolean;
 	/** Mensagem Papo respondida (origem); a cópia Discord é resolvida na execução do job. */
 	replyRefPapoId?: string;
 }
