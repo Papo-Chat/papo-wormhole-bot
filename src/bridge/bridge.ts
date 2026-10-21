@@ -189,6 +189,8 @@ interface Envelope {
 	 * atrasa a entrada na fila — e não é ela que decide a ordem das atualizações.
 	 */
 	papoEmbeds?: PapoEmbed[];
+	/** O conteúdo original contém um link; um embed posterior de vídeo deve sair como anexo. */
+	suppressVideoPreview?: boolean;
 	/**
 	 * Preview de link **já convertido para o Papo** (origem Discord). O Discord anexa o
 	 * preview de link depois de criar a mensagem, então ele chega por `MESSAGE_UPDATE` e é
@@ -854,6 +856,11 @@ export class Bridge {
 	/** Enfileira o preview de uma mensagem Papo para cada cópia Discord. Sincrono: cabe no flush transacional. */
 	private enqueuePapoEmbeds(link: ChannelLink, maps: MessageMapRow[], e: PapoWsEmbedsEvent, revision: string): number {
 		let enqueued = 0;
+		// O evento de preview pode chegar depois da mensagem original. Use o texto salvo em
+		// todas as partes para reconhecer o link; não dependa de igualdade exata das URLs do Papo.
+		const suppressVideoPreview = maps.some(
+			(map) => map.direction === 'papo_to_discord' && hasHyperlinkInContent(map.rendered ?? '')
+		);
 		for (const map of maps) {
 			if (!map.discord_message_id || map.direction !== 'papo_to_discord') continue;
 			const job: EditJob = {
@@ -875,7 +882,7 @@ export class Bridge {
 				kind: 'edit',
 				dedupeKey: `papo-embeds:${e.message_id}:${map.chunk_index}`,
 				revision,
-				payload: { job, embedsOnly: true, papoEmbeds: e.embeds ?? [] } satisfies Envelope
+				payload: { job, embedsOnly: true, papoEmbeds: e.embeds ?? [], suppressVideoPreview } satisfies Envelope
 			});
 			enqueued += 1;
 		}
@@ -2983,7 +2990,31 @@ export class Bridge {
 			);
 			return;
 		}
-		const previews = await this.previewFromEnvelope(env);
+		const sourceEmbeds = env.papoEmbeds ?? [];
+		const videoPreview = sourceEmbeds.find((e) => Boolean(e.video?.url));
+		const suppressVideoPreview =
+			Boolean(videoPreview) && (env.suppressVideoPreview ?? hasHyperlinkInContent(map.rendered ?? ''));
+		let previews: DiscordEmbedPayload[] = [];
+		let standaloneVideoRefs: { name: string; sha: string }[] = [];
+		let removeAttachmentNames: string[] = [];
+		if (suppressVideoPreview && videoPreview) {
+			// O preview veio depois da criação da mensagem. Não gere o embed/thumbnail: reenvie
+			// só o vídeo no trecho que contém o link e remova anexos de preview anteriores.
+			const previousPreviews = this.mapPreviews<DiscordEmbedPayload>(map);
+			removeAttachmentNames = previousPreviews
+				.flatMap((preview) => [
+					attachmentRefName(preview.thumbnail?.url),
+					attachmentRefName(preview.image?.url),
+					...(preview.media_refs ?? []).map((ref) => ref.name)
+				])
+				.filter((name): name is string => Boolean(name));
+			if (hasHyperlinkInContent(map.rendered ?? '')) {
+				const video = await this.embedVideoMedia(videoPreview);
+				if (video) standaloneVideoRefs = [{ name: mediaAttachmentName(video.sha, video.ext), sha: video.sha }];
+			}
+		} else {
+			previews = await this.previewFromEnvelope(env);
+		}
 		const card = map.bridge_embed ? (JSON.parse(map.bridge_embed) as DiscordEmbedPayload) : undefined;
 		if (card) {
 			card.description = this.withReactionSummary(
@@ -2992,12 +3023,14 @@ export class Bridge {
 				DISCORD_LIMITS.embedDescriptionMax
 			);
 		}
+		const standaloneRefs = standaloneVideoRefs.length ? [{ media_refs: standaloneVideoRefs }] : [];
 		const embeds = fitEmbedBudget([...(card ? [card] : []), ...previews], DISCORD_LIMITS.embedTotalChars);
 		// cópia de webhook não tem cartão: sem previews o edit vazio é o que os remove
 		if (!embeds.length && !map.webhook_copy) return;
 		await this.discord.edit(job.targetChannelId, map.discord_message_id, {
 			embeds: this.discordApiEmbeds(embeds),
-			files: this.filesForEmbedRefs(embeds)
+			files: this.filesForEmbedRefs([...embeds, ...standaloneRefs]),
+			...(removeAttachmentNames.length ? { removeAttachmentNames } : {})
 		});
 		this.store.updateMapSnapshot(map.id, { link_embeds: previews, embed_revision: job.revision ?? null });
 	}
