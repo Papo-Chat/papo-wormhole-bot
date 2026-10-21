@@ -1142,7 +1142,7 @@ describe('preview do Discord que chega depois da mensagem', () => {
 });
 
 describe('mídia do preview no Discord', () => {
-	it('preview com mp4 vira anexo da mensagem: é o anexo que traz o player', async () => {
+	it('content com link e preview de vídeo envia o link e só o MP4, sem embed duplicado', async () => {
 		const { bridge, discord, settle } = fixture();
 		const { urls } = await withFetch(
 			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
@@ -1155,13 +1155,12 @@ describe('mídia do preview no Discord', () => {
 		expect(urls).toContain('https://video.twimg.com/amplify_video/1/avc1/1280x720/x.mp4');
 		const send = discord.sends[0]!;
 		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
-		expect(send.embeds[1]!.thumbnail?.url).toMatch(/^http:\/\/media\.local:8080\/media\/[0-9a-f]{64}\.webp$/);
-		// o Discord ignora `video` em embed criado por bot: o payload não pode levar o campo
-		expect(send.embeds[1]).not.toHaveProperty('video');
-		expect(send.embeds[1]).not.toHaveProperty('media_refs');
+		expect(send.embeds).toHaveLength(1);
+		expect(send.embeds[0]!.description).toBe('https://x.com/i/status/1');
+		expect(send.embeds[0]!.thumbnail).toBeUndefined();
 	});
 
-	it('sem media server público a thumbnail também vai como anexo', async () => {
+	it('sem media server público envia o MP4 sem thumbnail duplicada', async () => {
 		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
 		await withFetch(
 			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
@@ -1172,7 +1171,45 @@ describe('mídia do preview no Discord', () => {
 		);
 
 		const send = discord.sends[0]!;
+		expect(send.embeds).toHaveLength(1);
+		expect(send.embeds[0]!.description).toBe('https://x.com/i/status/1');
+		expect(send.embeds[0]!.thumbnail).toBeUndefined();
+		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
+	});
+
+	it('preserva preview e thumbnail de vídeo quando content não contém link', async () => {
+		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
+		await withFetch(
+			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm-text-only', 'Veja este vídeo', { embeds: [videoPreview()] }));
+				await settle();
+			}
+		);
+
+		const send = discord.sends[0]!;
+		expect(send.embeds).toHaveLength(2);
+		expect(send.embeds[1]!.title).toBe('Vídeo');
 		expect(send.embeds[1]!.thumbnail?.url).toMatch(/^attachment:\/\/media-[0-9a-f]{64}\.webp$/);
+		expect(send.files).toEqual([
+			expect.stringMatching(/^media-[0-9a-f]{64}\.webp$/),
+			expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)
+		]);
+	});
+
+	it('preserva o preview quando o link do content é diferente do link do vídeo', async () => {
+		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
+		await withFetch(
+			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm-other-link', 'Leia também https://example.com/noticia', { embeds: [videoPreview()] }));
+				await settle();
+			}
+		);
+
+		const send = discord.sends[0]!;
+		expect(send.embeds).toHaveLength(2);
+		expect(send.embeds[1]!.title).toBe('Vídeo');
 		expect(send.files).toEqual([
 			expect.stringMatching(/^media-[0-9a-f]{64}\.webp$/),
 			expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)
