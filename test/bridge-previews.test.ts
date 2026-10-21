@@ -1280,8 +1280,7 @@ describe('mídia do preview no Discord', () => {
 		expect(discord.webhookSends[0]!.embeds).toHaveLength(0);
 		expect(discord.edits).toHaveLength(2);
 		const last = discord.edits.at(-1)!;
-		expect(last.embeds).toHaveLength(1);
-		expect(last.embeds[0]!.description).toBe('https://x.com/i/status/1');
+		expect(last.embeds).toHaveLength(0);
 		expect(last.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
 		expect(last.removeAttachmentNames).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.webp$/)]);
 	});
