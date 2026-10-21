@@ -149,14 +149,19 @@ const fixture = (opts: {
 	const discord = {
 		selfId: 'bot-1',
 		sends: [] as DiscordSend[],
-		edits: [] as { messageId: string; embeds: EmbedLike[]; files: string[] }[],
+		edits: [] as { messageId: string; embeds: EmbedLike[]; files: string[]; removeAttachmentNames?: string[] }[],
 		send: async (channelId: string, options: { embeds?: EmbedLike[]; files?: { name: string }[] }) => {
 			discord.sends.push({ channelId, embeds: options.embeds ?? [], files: (options.files ?? []).map((f) => f.name) });
 			return { id: `d${discord.sends.length}` };
 		},
-		edit: async (channelId: string, messageId: string, options: { embeds?: EmbedLike[]; files?: { name: string }[] }) => {
+		edit: async (channelId: string, messageId: string, options: { embeds?: EmbedLike[]; files?: { name: string }[]; removeAttachmentNames?: string[] }) => {
 			void channelId;
-			discord.edits.push({ messageId, embeds: options.embeds ?? [], files: (options.files ?? []).map((f) => f.name) });
+			discord.edits.push({
+				messageId,
+				embeds: options.embeds ?? [],
+				files: (options.files ?? []).map((f) => f.name),
+				...(options.removeAttachmentNames ? { removeAttachmentNames: options.removeAttachmentNames } : {})
+			});
 		},
 		recentByAuthor: async () => [],
 		isSelf: (id?: string | null) => id === 'bot-1',
@@ -1229,6 +1234,41 @@ describe('mídia do preview no Discord', () => {
 		expect(send.embeds).toHaveLength(1);
 		expect(send.embeds[0]!.description).toBe('https://example.com/link');
 		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
+	});
+
+	it('message_embeds_update de vídeo remove a thumbnail de preview já enviada', async () => {
+		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
+		await withFetch(
+			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm-late-video', 'https://x.com/i/status/1'));
+				await settle();
+
+				bridge.onPapoEvent({
+					type: 'message_embeds_update',
+					channel_id: 'chan-1',
+					message_id: 'pm-late-video',
+					embeds: [linkPreview('preview inicial')]
+				} as never);
+				await settle();
+
+				bridge.onPapoEvent({
+					type: 'message_embeds_update',
+					channel_id: 'chan-1',
+					message_id: 'pm-late-video',
+					embeds: [videoPreview()]
+				} as never);
+				await settle();
+			}
+		);
+
+		expect(discord.sends).toHaveLength(1);
+		expect(discord.edits).toHaveLength(2);
+		const last = discord.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(1);
+		expect(last.embeds[0]!.description).toBe('https://x.com/i/status/1');
+		expect(last.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\\.mp4$/)]);
+		expect(last.removeAttachmentNames).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\\.webp$/)]);
 	});
 
 	it('o edit reenvia a mídia do preview: o Discord resolve a referência no mesmo request', async () => {
