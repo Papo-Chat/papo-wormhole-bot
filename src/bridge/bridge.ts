@@ -639,7 +639,7 @@ export class Bridge {
 				: undefined;
 			// Se o link já está no content, descarte o preview visual do vídeo para não repetir
 			// thumbnail e card. Mantenha apenas o arquivo de vídeo como anexo independente.
-			if (embed && hasHyperlinkInContent(content) && videoPreview) {
+			if (embed && hasHyperlinkInContent(content) && videoPreview?.url && content.includes(videoPreview.url)) {
 				const mediaAttachments = (embed.media_refs ?? []).filter((ref) => /\.(?:mp4|webm|ogv|ogg)$/i.test(ref.name));
 				return { text: content, mediaAttachments };
 			}
