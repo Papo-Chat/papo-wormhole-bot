@@ -699,16 +699,24 @@ export class DiscordBridge {
 	async edit(
 		channelId: string,
 		messageId: string,
-		options: { content?: string; embeds?: APIEmbed[]; files?: { name: string; buffer: Buffer }[] }
+		options: {
+			content?: string;
+			embeds?: APIEmbed[];
+			files?: { name: string; buffer: Buffer }[];
+			/** Nomes de anexos antigos que devem ser removidos ao atualizar o preview. */
+			removeAttachmentNames?: string[];
+		}
 	): Promise<void> {
 		const message = await this.fetchMessage(channelId, messageId);
 		if (!message) return;
 		const files = options.files ?? [];
 		// `files`/`attachments` reescrevem a lista de anexos da mensagem: o Discord apaga tudo
 		// que não for redeclarado. Mandar só o avatar do embed derrubava a imagem que a
-		// mensagem tinha.
+		// mensagem tinha. Alguns previews são removidos sem reenvio da thumbnail, então esses
+		// anexos antigos precisam ser excluídos explicitamente, enquanto os demais são mantidos.
 		const resending = new Set(files.map((f) => f.name));
-		const keep = message.attachments.filter((a) => !resending.has(a.name)).map((a) => ({ id: a.id }));
+		const removing = new Set(options.removeAttachmentNames ?? []);
+		const keep = message.attachments.filter((a) => !resending.has(a.name) && !removing.has(a.name)).map((a) => ({ id: a.id }));
 		const payload = {
 			...(options.content !== undefined ? { content: options.content } : {}),
 			...(options.embeds ? { embeds: options.embeds } : {}),
