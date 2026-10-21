@@ -597,6 +597,7 @@ export class Bridge {
 				notes: [],
 				sources: i === 0 ? sources : [],
 				linkEmbeds: i === 0 && preview.embed ? [preview.embed] : [],
+				mediaAttachments: i === 0 ? (preview.mediaAttachments ?? []) : [],
 				replyRefPapoId: i === 0 ? (msg.reply_to ?? undefined) : undefined
 			};
 			let embed = buildDiscordBridgeEmbed({
@@ -628,16 +629,21 @@ export class Bridge {
 	private async papoPreview(msg: { content?: string | null; embeds?: PapoEmbed[] | null }): Promise<{
 		text: string;
 		embed?: DiscordEmbedPayload;
+		mediaAttachments?: { name: string; sha: string }[];
 	}> {
 		const content = msg.content ?? '';
 		if (msg.embeds?.length) {
 			const embed = await this.papoPreviewEmbed(msg.embeds);
-			// Com URL no content, o embed de vídeo duplicaria o preview: o Discord não aceita
-			// vídeo em embeds enviados por bots, mas o arquivo materializado segue como anexo.
-			// Neste caso o próprio content mantém o link; não envie também thumbnail/card de preview.
-			if (embed && !(hasHyperlinkInContent(content) && msg.embeds.some((e) => Boolean(e.video?.url)))) {
-				return { text: content, embed };
+			const videoPreview = embed
+				? msg.embeds.find((e) => e.url === embed.url && Boolean(e.video?.url))
+				: undefined;
+			// Se o link já está no content, descarte o preview visual do vídeo para não repetir
+			// thumbnail e card. Mantenha apenas o arquivo de vídeo como anexo independente.
+			if (embed && hasHyperlinkInContent(content) && videoPreview) {
+				const mediaAttachments = (embed.media_refs ?? []).filter((ref) => /\.(?:mp4|webm|ogv|ogg)$/i.test(ref.name));
+				return { text: content, mediaAttachments };
 			}
+			if (embed) return { text: content, embed };
 		}
 		return { text: content };
 	}
@@ -2199,8 +2205,9 @@ export class Bridge {
 		const previewEmbeds = webhookMode ? [...(job.linkEmbeds ?? [])] : [];
 		// avatar e mídia do preview ocupam anexos da mensagem: o orçamento dos anexos da
 		// origem é o que sobra
+		const standaloneMediaRefs = job.mediaAttachments?.length ? [{ media_refs: job.mediaAttachments }] : [];
 		const reservedFiles =
-			(avatar ? 1 : 0) + this.filesForEmbedRefs(webhookMode ? previewEmbeds : (job.linkEmbeds ?? [])).length;
+			(avatar ? 1 : 0) + this.filesForEmbedRefs([...(webhookMode ? previewEmbeds : (job.linkEmbeds ?? [])), ...standaloneMediaRefs]).length;
 		const plan = await prepareAttachments(this.sourcesToAttachments(job.sources), {
 			maxFileBytes: this.cfg.discord.maxFileBytes,
 			maxFilesPerMessage: Math.max(1, DISCORD_LIMITS.attachmentsPerMessage - reservedFiles)
@@ -2294,8 +2301,8 @@ export class Bridge {
 			let embeds: APIEmbed[] = [];
 			if (webhookMode) {
 				if (g === 0) {
-					// a mídia que os previews referenciam por `attachment://` precisa ir junto
-					files.unshift(...this.filesForEmbedRefs(webhookPreviews));
+					// Mídia referenciada por previews e vídeos sem embed precisam ir no mesmo envio.
+					files.unshift(...this.filesForEmbedRefs([...webhookPreviews, ...standaloneMediaRefs]));
 					embeds = this.discordApiEmbeds(webhookPreviews);
 				}
 				if (!extra && !webhookContent && !embeds.length && !files.length) {
@@ -2307,7 +2314,7 @@ export class Bridge {
 				// Discord mostra no corpo todo arquivo que nenhum embed consumiu, então reenviar o
 				// avatar que o cartão já referencia por `attachment://` faz dele uma foto grande
 				if (g === 0) {
-					const refs = this.filesForEmbedRefs(cardEmbeds);
+					const refs = this.filesForEmbedRefs([...cardEmbeds, ...standaloneMediaRefs]);
 					if (avatar && !refs.some((f) => f.name === avatar.name) && built?.author?.icon_url === attachmentRef(avatar.name))
 						refs.unshift(avatar);
 					files.unshift(...refs);
