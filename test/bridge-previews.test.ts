@@ -1210,7 +1210,7 @@ describe('mídia do preview no Discord', () => {
 		const send = discord.sends[0]!;
 		expect(send.embeds).toHaveLength(1);
 		expect(send.embeds[0]!.description).toBe('Leia também https://example.com/noticia');
-		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\\.mp4$/)]);
+		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
 	});
 
 	it('descarta o cartão mesmo quando o embed com vídeo não é o primeiro', async () => {
