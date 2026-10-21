@@ -633,16 +633,19 @@ export class Bridge {
 	}> {
 		const content = msg.content ?? '';
 		if (msg.embeds?.length) {
-			const embed = await this.papoPreviewEmbed(msg.embeds);
-			const videoPreview = embed
-				? msg.embeds.find((e) => e.url === embed.url && Boolean(e.video?.url))
-				: undefined;
-			// Se o link já está no content, descarte o preview visual do vídeo para não repetir
-			// thumbnail e card. Mantenha apenas o arquivo de vídeo como anexo independente.
-			if (embed && hasHyperlinkInContent(content) && videoPreview?.url && content.includes(videoPreview.url)) {
-				const mediaAttachments = (embed.media_refs ?? []).filter((ref) => /\.(?:mp4|webm|ogv|ogg)$/i.test(ref.name));
+			// A conversão só escolhe o primeiro preview; o Papo pode devolver outros embeds
+			// e é possível que o primeiro não seja o que contém o vídeo.
+			const videoPreview = hasHyperlinkInContent(content) ? msg.embeds.find((e) => Boolean(e.video?.url)) : undefined;
+			if (videoPreview) {
+				// Não enviar o embed do preview: ele repete o vídeo com uma thumbnail. Anexe
+				// apenas os bytes do vídeo e mantenha o content original com o link.
+				const video = await this.embedVideoMedia(videoPreview);
+				const mediaAttachments = video
+					? [{ name: mediaAttachmentName(video.sha, video.ext), sha: video.sha }]
+					: [];
 				return { text: content, mediaAttachments };
 			}
+			const embed = await this.papoPreviewEmbed(msg.embeds);
 			if (embed) return { text: content, embed };
 		}
 		return { text: content };
