@@ -632,7 +632,12 @@ export class Bridge {
 		const content = msg.content ?? '';
 		if (msg.embeds?.length) {
 			const embed = await this.papoPreviewEmbed(msg.embeds);
-			if (embed) return { text: content, embed };
+			// Com URL no content, o embed de vídeo duplicaria o preview: o Discord não aceita
+			// vídeo em embeds enviados por bots, mas o arquivo materializado segue como anexo.
+			// Neste caso o próprio content mantém o link; não envie também thumbnail/card de preview.
+			if (embed && !(hasHyperlinkInContent(content) && msg.embeds.some((e) => Boolean(e.video?.url)))) {
+				return { text: content, embed };
+			}
 		}
 		return { text: content };
 	}
