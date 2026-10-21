@@ -71,6 +71,7 @@ const fixture = (opts: {
 	bridgeEdits?: boolean;
 	avatar?: boolean;
 	papoWebhookMode?: boolean;
+	discordWebhookMode?: boolean;
 } = {}) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
@@ -149,7 +150,19 @@ const fixture = (opts: {
 	const discord = {
 		selfId: 'bot-1',
 		sends: [] as DiscordSend[],
+		webhookSends: [] as { channelId: string; userId: string; content?: string; embeds: EmbedLike[]; files: string[] }[],
 		edits: [] as { messageId: string; embeds: EmbedLike[]; files: string[] }[],
+		userWebhook: async () => (opts.discordWebhookMode ? { webhookId: 'discord-user-hook' } : undefined),
+		sendAsWebhook: async (channelId: string, userId: string, options: { content?: string; embeds?: EmbedLike[]; files?: { name: string }[] }) => {
+			discord.webhookSends.push({
+				channelId,
+				userId,
+				...(options.content !== undefined ? { content: options.content } : {}),
+				embeds: options.embeds ?? [],
+				files: (options.files ?? []).map((f) => f.name)
+			});
+			return { id: `dw${discord.webhookSends.length}` };
+		},
 		send: async (channelId: string, options: { embeds?: EmbedLike[]; files?: { name: string }[] }) => {
 			discord.sends.push({ channelId, embeds: options.embeds ?? [], files: (options.files ?? []).map((f) => f.name) });
 			return { id: `d${discord.sends.length}` };
@@ -677,20 +690,51 @@ describe('preview no bridge Discord → Papo', () => {
 });
 
 describe('preview no bridge Papo → Discord', () => {
-	it('mensagem com link-preview cria o cartão e o embed extra com a imagem re-hospedada', async () => {
+	it('content com hyperlink não recebe um segundo embed de link-preview do Papo', async () => {
 		const { bridge, discord, settle } = fixture();
+		const content = 'olá https://example.com/a';
 
-		bridge.onPapoEvent(papoMessage('pm1', 'olá https://example.com/a', { embeds: [linkPreview('primeiro'), linkPreview('segundo')] }));
+		bridge.onPapoEvent(papoMessage('pm1', content, { embeds: [linkPreview('primeiro'), linkPreview('segundo')] }));
 		await settle();
 
 		const embeds = discord.sends[0]!.embeds;
-		expect(embeds).toHaveLength(2);
+		expect(embeds).toHaveLength(1);
 		expect(embeds[0]!.author?.name).toBe('u');
-		expect(embeds[0]!.description).toContain('olá');
-		expect(embeds[1]!.title).toBe('primeiro');
-		expect(embeds[1]!.url).toBe('https://example.com/artigo');
-		// o Papo não expõe a imagem do embed por URL: a ponte re-hospeda e o Discord aponta para cá
-		expect(embeds[1]!.thumbnail?.url).toMatch(/^http:\/\/media\.local:8080\/media\/[0-9a-f]{64}\.webp$/);
+		expect(embeds[0]!.description).toContain(content);
+		expect(discord.sends[0]!.files).toHaveLength(0);
+	});
+
+	it('webhook envia só o content quando há hyperlink e link-preview do Papo', async () => {
+		const { bridge, discord, settle } = fixture({ discordWebhookMode: true });
+		const content = 'Veja https://example.com/artigo';
+
+		bridge.onPapoEvent(papoMessage('pm-native-unfurl', content, { embeds: [linkPreview('artigo')] }));
+		await settle();
+
+		expect(discord.webhookSends).toHaveLength(1);
+		expect(discord.webhookSends[0]!.content).toBe(content);
+		expect(discord.webhookSends[0]!.embeds).toHaveLength(0);
+		expect(discord.webhookSends[0]!.files).toHaveLength(0);
+	});
+
+	it('ignora link-preview tardio quando o content já contém hyperlink', async () => {
+		const { bridge, discord, settle } = fixture({ discordWebhookMode: true });
+		const content = 'https://example.com/artigo';
+
+		bridge.onPapoEvent(papoMessage('pm-native-unfurl-late', content));
+		await settle();
+		bridge.onPapoEvent({
+			type: 'message_embeds_update',
+			channel_id: 'chan-1',
+			message_id: 'pm-native-unfurl-late',
+			embeds: [linkPreview('artigo')]
+		} as never);
+		await settle();
+
+		expect(discord.webhookSends).toHaveLength(1);
+		expect(discord.webhookSends[0]!.content).toBe(content);
+		expect(discord.webhookSends[0]!.embeds).toHaveLength(0);
+		expect(discord.edits).toHaveLength(0);
 	});
 
 	it('URL de GIF de provedor é encaminhada sem resolução local', async () => {
@@ -715,18 +759,16 @@ describe('preview no bridge Papo → Discord', () => {
 		expect(outbox.counts().dead).toBe(0);
 	});
 
-	it('avatar e mídia do preview são anexados uma única vez', async () => {
+	it('avatar é anexado uma única vez quando o link-preview do Papo é descartado', async () => {
 		const { bridge, discord, settle } = fixture({ avatar: true, mediaBaseUrl: null });
 
 		bridge.onPapoEvent(papoMessage('pm1', 'olá https://example.com/a', { embeds: [linkPreview('artigo')] }));
 		await settle();
 
 		const files = discord.sends[0]!.files;
-		// sem media server público o avatar do cartão é um anexo referenciado; reenviá-lo pelo
-		// caminho das referências deixa uma cópia sem embed consumindo-a, e o Discord desenha
-		// no corpo da mensagem todo arquivo órfão — uma foto grande do avatar
+		// O avatar do cartão fica como anexo referenciado; o link-preview do Papo não adiciona mídia.
 		expect(files.filter((f) => f.startsWith('avatar-'))).toHaveLength(1);
-		expect(files.filter((f) => f.startsWith('media-'))).toHaveLength(1);
+		expect(files.filter((f) => f.startsWith('media-'))).toHaveLength(0);
 		expect(discord.sends[0]!.embeds[0]!.author?.icon_url).toMatch(/^attachment:\/\/avatar-[0-9a-f]{64}\.png$/);
 	});
 });
@@ -1142,42 +1184,24 @@ describe('preview do Discord que chega depois da mensagem', () => {
 });
 
 describe('mídia do preview no Discord', () => {
-	it('content com link e preview de vídeo envia o link e só o MP4, sem embed duplicado', async () => {
+	it('com hyperlink e link-preview do Papo, não baixa nem envia mídia do embed', async () => {
 		const { bridge, discord, settle } = fixture();
 		const { urls } = await withFetch(
 			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
 			async () => {
-				bridge.onPapoEvent(papoMessage('pm1', 'https://x.com/i/status/1', { embeds: [videoPreview()] }));
+				bridge.onPapoEvent(papoMessage('pm-video-link', 'https://x.com/i/status/1', { embeds: [videoPreview()] }));
 				await settle();
 			}
 		);
 
-		expect(urls).toContain('https://video.twimg.com/amplify_video/1/avc1/1280x720/x.mp4');
+		expect(urls).toEqual([]);
 		const send = discord.sends[0]!;
-		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
+		expect(send.files).toEqual([]);
 		expect(send.embeds).toHaveLength(1);
 		expect(send.embeds[0]!.description).toBe('https://x.com/i/status/1');
-		expect(send.embeds[0]!.thumbnail).toBeUndefined();
 	});
 
-	it('sem media server público envia o MP4 sem thumbnail duplicada', async () => {
-		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
-		await withFetch(
-			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
-			async () => {
-				bridge.onPapoEvent(papoMessage('pm1', 'https://x.com/i/status/1', { embeds: [videoPreview()] }));
-				await settle();
-			}
-		);
-
-		const send = discord.sends[0]!;
-		expect(send.embeds).toHaveLength(1);
-		expect(send.embeds[0]!.description).toBe('https://x.com/i/status/1');
-		expect(send.embeds[0]!.thumbnail).toBeUndefined();
-		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
-	});
-
-	it('preserva preview e thumbnail de vídeo quando content não contém link', async () => {
+	it('sem hyperlink no content, mantém o preview e seus anexos de mídia', async () => {
 		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
 		await withFetch(
 			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
@@ -1197,33 +1221,14 @@ describe('mídia do preview no Discord', () => {
 		]);
 	});
 
-	it('preserva o preview quando o link do content é diferente do link do vídeo', async () => {
+	it('edição de uma mensagem sem hyperlink conserva o preview de vídeo', async () => {
 		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
 		await withFetch(
 			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
 			async () => {
-				bridge.onPapoEvent(papoMessage('pm-other-link', 'Leia também https://example.com/noticia', { embeds: [videoPreview()] }));
+				bridge.onPapoEvent(papoMessage('pm-edit-preview', 'Veja este vídeo', { embeds: [videoPreview()] }));
 				await settle();
-			}
-		);
-
-		const send = discord.sends[0]!;
-		expect(send.embeds).toHaveLength(2);
-		expect(send.embeds[1]!.title).toBe('Vídeo');
-		expect(send.files).toEqual([
-			expect.stringMatching(/^media-[0-9a-f]{64}\.webp$/),
-			expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)
-		]);
-	});
-
-	it('o edit reenvia a mídia do preview: o Discord resolve a referência no mesmo request', async () => {
-		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
-		await withFetch(
-			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
-			async () => {
-				bridge.onPapoEvent(papoMessage('pm1', 'https://x.com/i/status/1', { embeds: [videoPreview()] }));
-				await settle();
-				bridge.onPapoEvent({ type: 'message_edit', id: 'pm1', channel_id: 'chan-1', content: 'editado', edited_at: '2026-10-09T18:10:00Z' } as never);
+				bridge.onPapoEvent({ type: 'message_edit', id: 'pm-edit-preview', channel_id: 'chan-1', content: 'editado', edited_at: '2026-10-09T18:10:00Z' } as never);
 				await settle();
 			}
 		);
@@ -1236,12 +1241,29 @@ describe('mídia do preview no Discord', () => {
 		]);
 	});
 
-	it('página de player (YouTube) não é arquivo: nada é baixado, o preview segue com a thumbnail', async () => {
-		const { bridge, discord, settle } = fixture();
+	it('link de player do YouTube também deixa o preview nativo do Discord', async () => {
+		const { bridge, discord, settle } = fixture({ discordWebhookMode: true });
 		const { urls } = await withFetch(
 			async () => new Response(Buffer.from('html'), { status: 200, headers: { 'content-type': 'text/html' } }),
 			async () => {
-				bridge.onPapoEvent(papoMessage('pm1', 'https://www.youtube.com/watch?v=dwK9fhsOGK8', { embeds: [youtubePreview()] }));
+				bridge.onPapoEvent(papoMessage('pm-youtube', 'https://www.youtube.com/watch?v=dwK9fhsOGK8', { embeds: [youtubePreview()] }));
+				await settle();
+			}
+		);
+
+		expect(urls).toEqual([]);
+		expect(discord.webhookSends).toHaveLength(1);
+		expect(discord.webhookSends[0]!.content).toBe('https://www.youtube.com/watch?v=dwK9fhsOGK8');
+		expect(discord.webhookSends[0]!.embeds).toHaveLength(0);
+		expect(discord.webhookSends[0]!.files).toHaveLength(0);
+	});
+
+	it('não tenta baixar vídeo quando content contém o hyperlink', async () => {
+		const { bridge, discord, outbox, settle } = fixture({ maxFileBytes: 8 });
+		const { urls } = await withFetch(
+			async () => new Response(Buffer.from('mp4-maior-que-o-limite'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm-limit', 'https://x.com/i/status/1', { embeds: [videoPreview()] }));
 				await settle();
 			}
 		);
@@ -1249,24 +1271,7 @@ describe('mídia do preview no Discord', () => {
 		expect(urls).toEqual([]);
 		const send = discord.sends[0]!;
 		expect(send.files).toEqual([]);
-		expect(send.embeds[1]!.url).toBe('https://www.youtube.com/watch?v=dwK9fhsOGK8');
-		expect(send.embeds[1]!.thumbnail?.url).toMatch(/^http:\/\/media\.local:8080\/media\/[0-9a-f]{64}\.webp$/);
-	});
-
-	it('vídeo que não cabe no limite do Discord fica de fora, e o preview continua', async () => {
-		const { bridge, discord, outbox, settle } = fixture({ maxFileBytes: 8 });
-		await withFetch(
-			async () => new Response(Buffer.from('mp4-maior-que-o-limite'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
-			async () => {
-				bridge.onPapoEvent(papoMessage('pm1', 'https://x.com/i/status/1', { embeds: [videoPreview()] }));
-				await settle();
-			}
-		);
-
-		const send = discord.sends[0]!;
-		expect(send.files).toEqual([]);
-		expect(send.embeds).toHaveLength(2);
-		expect(send.embeds[1]!.title).toBe('Vídeo');
+		expect(send.embeds).toHaveLength(1);
 		expect(outbox.counts().dead).toBe(0);
 	});
 });
