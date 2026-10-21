@@ -1228,7 +1228,7 @@ describe('mídia do preview no Discord', () => {
 		const send = discord.sends[0]!;
 		expect(send.embeds).toHaveLength(1);
 		expect(send.embeds[0]!.description).toBe('https://example.com/link');
-		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\\.mp4$/)]);
+		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
 	});
 
 	it('o edit reenvia a mídia do preview: o Discord resolve a referência no mesmo request', async () => {
