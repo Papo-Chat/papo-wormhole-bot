@@ -632,6 +632,11 @@ export class Bridge {
 		mediaAttachments?: { name: string; sha: string }[];
 	}> {
 		const content = msg.content ?? '';
+		// Se a mensagem já traz a URL, deixe o Discord gerar o unfurl nativo.
+		// Não envie também o link-preview recebido do Papo nem anexe a mídia dele.
+		if (hasHyperlinkInContent(content) && msg.embeds?.some((e) => e.source_type === 'link')) {
+			return { text: content };
+		}
 		if (msg.embeds?.length) {
 			const embed = await this.papoPreviewEmbed(msg.embeds);
 			const videoPreview = embed
@@ -850,6 +855,12 @@ export class Bridge {
 
 	/** Enfileira o preview de uma mensagem Papo para cada cópia Discord. Sincrono: cabe no flush transacional. */
 	private enqueuePapoEmbeds(link: ChannelLink, maps: MessageMapRow[], e: PapoWsEmbedsEvent, revision: string): number {
+		// O link-preview pode chegar após o texto. Se o conteúdo já contém URL, não enfileire
+		// esse embed: o envio de content deixa o Discord criar seu próprio preview nativo.
+		if (
+			e.embeds?.some((embed) => embed.source_type === 'link') &&
+			maps.some((map) => map.direction === 'papo_to_discord' && hasHyperlinkInContent(map.rendered ?? ''))
+		) return 0;
 		let enqueued = 0;
 		for (const map of maps) {
 			if (!map.discord_message_id || map.direction !== 'papo_to_discord') continue;
