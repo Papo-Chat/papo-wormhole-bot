@@ -1212,7 +1212,7 @@ describe('mídia do preview no Discord', () => {
 		expect(send.embeds[1]!.title).toBe('Vídeo');
 		expect(send.files).toEqual([
 			expect.stringMatching(/^media-[0-9a-f]{64}\.webp$/),
-			expect.stringMatching(/^media-[0-9a-f]{64}\\.mp4$/)
+			expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)
 		]);
 	});
 
