@@ -630,7 +630,7 @@ export class Bridge {
 		embed?: DiscordEmbedPayload;
 	}> {
 		const content = msg.content ?? '';
-		// Com hyperlink no texto, o Discord gera o preview nativo. Não duplique com o link-preview do Papo.
+		// No modo webhook o Discord gera o preview nativo pelo content; não replique o link-preview do Papo.
 		if (hasHyperlinkInContent(content) && msg.embeds?.some((e) => e.source_type === 'link')) {
 			return { text: content };
 		}
