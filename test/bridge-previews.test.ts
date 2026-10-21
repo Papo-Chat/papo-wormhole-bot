@@ -1197,7 +1197,7 @@ describe('mídia do preview no Discord', () => {
 		]);
 	});
 
-	it('preserva o preview quando o link do content é diferente do link do vídeo', async () => {
+	it('remove o preview de vídeo mesmo quando o content contém um link diferente', async () => {
 		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
 		await withFetch(
 			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
@@ -1208,12 +1208,27 @@ describe('mídia do preview no Discord', () => {
 		);
 
 		const send = discord.sends[0]!;
-		expect(send.embeds).toHaveLength(2);
-		expect(send.embeds[1]!.title).toBe('Vídeo');
-		expect(send.files).toEqual([
-			expect.stringMatching(/^media-[0-9a-f]{64}\.webp$/),
-			expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)
-		]);
+		expect(send.embeds).toHaveLength(1);
+		expect(send.embeds[0]!.description).toBe('Leia também https://example.com/noticia');
+		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\\.mp4$/)]);
+	});
+
+	it('descarta o cartão mesmo quando o embed com vídeo não é o primeiro', async () => {
+		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
+		await withFetch(
+			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm-video-second', 'https://example.com/link', {
+					embeds: [linkPreview('artigo', 'https://example.com/link'), videoPreview()]
+				}));
+				await settle();
+			}
+		);
+
+		const send = discord.sends[0]!;
+		expect(send.embeds).toHaveLength(1);
+		expect(send.embeds[0]!.description).toBe('https://example.com/link');
+		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\\.mp4$/)]);
 	});
 
 	it('o edit reenvia a mídia do preview: o Discord resolve a referência no mesmo request', async () => {
