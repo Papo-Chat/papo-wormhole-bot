@@ -71,6 +71,7 @@ const fixture = (opts: {
 	bridgeEdits?: boolean;
 	avatar?: boolean;
 	papoWebhookMode?: boolean;
+	discordWebhookMode?: boolean;
 } = {}) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
@@ -149,7 +150,19 @@ const fixture = (opts: {
 	const discord = {
 		selfId: 'bot-1',
 		sends: [] as DiscordSend[],
+		webhookSends: [] as { channelId: string; userId: string; content?: string; embeds: EmbedLike[]; files: string[] }[],
 		edits: [] as { messageId: string; embeds: EmbedLike[]; files: string[]; removeAttachmentNames?: string[] }[],
+		userWebhook: async () => (opts.discordWebhookMode ? { webhookId: 'discord-user-hook' } : undefined),
+		sendAsWebhook: async (channelId: string, userId: string, options: { content?: string; embeds?: EmbedLike[]; files?: { name: string }[] }) => {
+			discord.webhookSends.push({
+				channelId,
+				userId,
+				...(options.content !== undefined ? { content: options.content } : {}),
+				embeds: options.embeds ?? [],
+				files: (options.files ?? []).map((f) => f.name)
+			});
+			return { id: `dw${discord.webhookSends.length}` };
+		},
 		send: async (channelId: string, options: { embeds?: EmbedLike[]; files?: { name: string }[] }) => {
 			discord.sends.push({ channelId, embeds: options.embeds ?? [], files: (options.files ?? []).map((f) => f.name) });
 			return { id: `d${discord.sends.length}` };
@@ -1236,8 +1249,8 @@ describe('mídia do preview no Discord', () => {
 		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
 	});
 
-	it('message_embeds_update de vídeo remove a thumbnail de preview já enviada', async () => {
-		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
+	it('message_embeds_update de vídeo remove a thumbnail anterior em cópias de webhook', async () => {
+		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null, discordWebhookMode: true });
 		await withFetch(
 			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
 			async () => {
@@ -1262,7 +1275,9 @@ describe('mídia do preview no Discord', () => {
 			}
 		);
 
-		expect(discord.sends).toHaveLength(1);
+		expect(discord.webhookSends).toHaveLength(1);
+		expect(discord.webhookSends[0]!.content).toContain('https://x.com/i/status/1');
+		expect(discord.webhookSends[0]!.embeds).toHaveLength(0);
 		expect(discord.edits).toHaveLength(2);
 		const last = discord.edits.at(-1)!;
 		expect(last.embeds).toHaveLength(1);
