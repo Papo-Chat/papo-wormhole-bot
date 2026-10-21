@@ -71,6 +71,7 @@ const fixture = (opts: {
 	bridgeEdits?: boolean;
 	avatar?: boolean;
 	papoWebhookMode?: boolean;
+	discordWebhookMode?: boolean;
 } = {}) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
@@ -149,14 +150,31 @@ const fixture = (opts: {
 	const discord = {
 		selfId: 'bot-1',
 		sends: [] as DiscordSend[],
-		edits: [] as { messageId: string; embeds: EmbedLike[]; files: string[] }[],
+		webhookSends: [] as { channelId: string; userId: string; content?: string; embeds: EmbedLike[]; files: string[] }[],
+		edits: [] as { messageId: string; embeds: EmbedLike[]; files: string[]; removeAttachmentNames?: string[] }[],
+		userWebhook: async () => (opts.discordWebhookMode ? { webhookId: 'discord-user-hook' } : undefined),
+		sendAsWebhook: async (channelId: string, userId: string, options: { content?: string; embeds?: EmbedLike[]; files?: { name: string }[] }) => {
+			discord.webhookSends.push({
+				channelId,
+				userId,
+				...(options.content !== undefined ? { content: options.content } : {}),
+				embeds: options.embeds ?? [],
+				files: (options.files ?? []).map((f) => f.name)
+			});
+			return { id: `dw${discord.webhookSends.length}` };
+		},
 		send: async (channelId: string, options: { embeds?: EmbedLike[]; files?: { name: string }[] }) => {
 			discord.sends.push({ channelId, embeds: options.embeds ?? [], files: (options.files ?? []).map((f) => f.name) });
 			return { id: `d${discord.sends.length}` };
 		},
-		edit: async (channelId: string, messageId: string, options: { embeds?: EmbedLike[]; files?: { name: string }[] }) => {
+		edit: async (channelId: string, messageId: string, options: { embeds?: EmbedLike[]; files?: { name: string }[]; removeAttachmentNames?: string[] }) => {
 			void channelId;
-			discord.edits.push({ messageId, embeds: options.embeds ?? [], files: (options.files ?? []).map((f) => f.name) });
+			discord.edits.push({
+				messageId,
+				embeds: options.embeds ?? [],
+				files: (options.files ?? []).map((f) => f.name),
+				...(options.removeAttachmentNames ? { removeAttachmentNames: options.removeAttachmentNames } : {})
+			});
 		},
 		recentByAuthor: async () => [],
 		isSelf: (id?: string | null) => id === 'bot-1',
@@ -1197,7 +1215,7 @@ describe('mídia do preview no Discord', () => {
 		]);
 	});
 
-	it('preserva o preview quando o link do content é diferente do link do vídeo', async () => {
+	it('remove o preview de vídeo mesmo quando o content contém um link diferente', async () => {
 		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
 		await withFetch(
 			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
@@ -1208,12 +1226,63 @@ describe('mídia do preview no Discord', () => {
 		);
 
 		const send = discord.sends[0]!;
-		expect(send.embeds).toHaveLength(2);
-		expect(send.embeds[1]!.title).toBe('Vídeo');
-		expect(send.files).toEqual([
-			expect.stringMatching(/^media-[0-9a-f]{64}\.webp$/),
-			expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)
-		]);
+		expect(send.embeds).toHaveLength(1);
+		expect(send.embeds[0]!.description).toBe('Leia também https://example.com/noticia');
+		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
+	});
+
+	it('descarta o cartão mesmo quando o embed com vídeo não é o primeiro', async () => {
+		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null });
+		await withFetch(
+			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm-video-second', 'https://example.com/link', {
+					embeds: [linkPreview('artigo', 'https://example.com/link'), videoPreview()]
+				}));
+				await settle();
+			}
+		);
+
+		const send = discord.sends[0]!;
+		expect(send.embeds).toHaveLength(1);
+		expect(send.embeds[0]!.description).toBe('https://example.com/link');
+		expect(send.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
+	});
+
+	it('message_embeds_update de vídeo remove a thumbnail anterior em cópias de webhook', async () => {
+		const { bridge, discord, settle } = fixture({ mediaBaseUrl: null, discordWebhookMode: true });
+		await withFetch(
+			async () => new Response(Buffer.from('bytes-do-mp4'), { status: 200, headers: { 'content-type': 'video/mp4' } }),
+			async () => {
+				bridge.onPapoEvent(papoMessage('pm-late-video', 'https://x.com/i/status/1'));
+				await settle();
+
+				bridge.onPapoEvent({
+					type: 'message_embeds_update',
+					channel_id: 'chan-1',
+					message_id: 'pm-late-video',
+					embeds: [linkPreview('preview inicial')]
+				} as never);
+				await settle();
+
+				bridge.onPapoEvent({
+					type: 'message_embeds_update',
+					channel_id: 'chan-1',
+					message_id: 'pm-late-video',
+					embeds: [videoPreview()]
+				} as never);
+				await settle();
+			}
+		);
+
+		expect(discord.webhookSends).toHaveLength(1);
+		expect(discord.webhookSends[0]!.content).toContain('https://x.com/i/status/1');
+		expect(discord.webhookSends[0]!.embeds).toHaveLength(0);
+		expect(discord.edits).toHaveLength(2);
+		const last = discord.edits.at(-1)!;
+		expect(last.embeds).toHaveLength(0);
+		expect(last.files).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.mp4$/)]);
+		expect(last.removeAttachmentNames).toEqual([expect.stringMatching(/^media-[0-9a-f]{64}\.webp$/)]);
 	});
 
 	it('o edit reenvia a mídia do preview: o Discord resolve a referência no mesmo request', async () => {
