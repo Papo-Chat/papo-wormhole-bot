@@ -639,13 +639,14 @@ export class Bridge {
 			// e é possível que o primeiro não seja o que contém o vídeo.
 			const videoPreview = hasHyperlinkInContent(content) ? msg.embeds.find((e) => Boolean(e.video?.url)) : undefined;
 			if (videoPreview) {
-				// Não enviar o embed do preview: ele repete o vídeo com uma thumbnail. Anexe
-				// apenas os bytes do vídeo e mantenha o content original com o link.
+				// Só descarte o preview quando o arquivo foi obtido para ser enviado como anexo.
 				const video = await this.embedVideoMedia(videoPreview);
-				const mediaAttachments = video
-					? [{ name: mediaAttachmentName(video.sha, video.ext), sha: video.sha }]
-					: [];
-				return { text: content, mediaAttachments };
+				if (video) {
+					return {
+						text: content,
+						mediaAttachments: [{ name: mediaAttachmentName(video.sha, video.ext), sha: video.sha }]
+					};
+				}
 			}
 			const embed = await this.papoPreviewEmbed(msg.embeds);
 			if (embed) return { text: content, embed };
@@ -2998,19 +2999,23 @@ export class Bridge {
 		let standaloneVideoRefs: { name: string; sha: string }[] = [];
 		let removeAttachmentNames: string[] = [];
 		if (suppressVideoPreview && videoPreview) {
-			// O preview veio depois da criação da mensagem. Não gere o embed/thumbnail: reenvie
-			// só o vídeo no trecho que contém o link e remova anexos de preview anteriores.
-			const previousPreviews = this.mapPreviews<DiscordEmbedPayload>(map);
-			removeAttachmentNames = previousPreviews
-				.flatMap((preview) => [
-					attachmentRefName(preview.thumbnail?.url),
-					attachmentRefName(preview.image?.url),
-					...(preview.media_refs ?? []).map((ref) => ref.name)
-				])
-				.filter((name): name is string => Boolean(name));
-			if (hasHyperlinkInContent(map.rendered ?? '')) {
-				const video = await this.embedVideoMedia(videoPreview);
-				if (video) standaloneVideoRefs = [{ name: mediaAttachmentName(video.sha, video.ext), sha: video.sha }];
+			// Só descartar o preview visual se o vídeo pôde ser materializado como attachment.
+			const video = await this.embedVideoMedia(videoPreview);
+			if (video) {
+				const previousPreviews = this.mapPreviews<DiscordEmbedPayload>(map);
+				removeAttachmentNames = [...new Set(previousPreviews
+					.flatMap((preview) => [
+						attachmentRefName(preview.thumbnail?.url),
+						attachmentRefName(preview.image?.url),
+						...(preview.media_refs ?? []).map((ref) => ref.name)
+					])
+					.filter((name): name is string => Boolean(name)))];
+				if (hasHyperlinkInContent(map.rendered ?? '')) {
+					standaloneVideoRefs = [{ name: mediaAttachmentName(video.sha, video.ext), sha: video.sha }];
+				}
+			} else {
+				// Se não há arquivo utilizável (por exemplo, um player do YouTube), mantenha o preview.
+				previews = await this.previewFromEnvelope(env);
 			}
 		} else {
 			previews = await this.previewFromEnvelope(env);
