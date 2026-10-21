@@ -71,6 +71,7 @@ const fixture = (opts: {
 	bridgeEdits?: boolean;
 	avatar?: boolean;
 	papoWebhookMode?: boolean;
+	discordWebhookMode?: boolean;
 } = {}) => {
 	const db = openDb(':memory:');
 	const store = new Store(db);
@@ -149,7 +150,19 @@ const fixture = (opts: {
 	const discord = {
 		selfId: 'bot-1',
 		sends: [] as DiscordSend[],
+		webhookSends: [] as { channelId: string; userId: string; content?: string; embeds: EmbedLike[]; files: string[] }[],
 		edits: [] as { messageId: string; embeds: EmbedLike[]; files: string[] }[],
+		userWebhook: async () => (opts.discordWebhookMode ? { webhookId: 'discord-user-hook' } : undefined),
+		sendAsWebhook: async (channelId: string, userId: string, options: { content?: string; embeds?: EmbedLike[]; files?: { name: string }[] }) => {
+			discord.webhookSends.push({
+				channelId,
+				userId,
+				...(options.content !== undefined ? { content: options.content } : {}),
+				embeds: options.embeds ?? [],
+				files: (options.files ?? []).map((f) => f.name)
+			});
+			return { id: `dw${discord.webhookSends.length}` };
+		},
 		send: async (channelId: string, options: { embeds?: EmbedLike[]; files?: { name: string }[] }) => {
 			discord.sends.push({ channelId, embeds: options.embeds ?? [], files: (options.files ?? []).map((f) => f.name) });
 			return { id: `d${discord.sends.length}` };
@@ -691,6 +704,39 @@ describe('preview no bridge Papo → Discord', () => {
 		expect(embeds[1]!.url).toBe('https://example.com/artigo');
 		// o Papo não expõe a imagem do embed por URL: a ponte re-hospeda e o Discord aponta para cá
 		expect(embeds[1]!.thumbnail?.url).toMatch(/^http:\/\/media\.local:8080\/media\/[0-9a-f]{64}\.webp$/);
+	});
+
+	it('webhook envia só o content quando há hyperlink e link-preview do Papo', async () => {
+		const { bridge, discord, settle } = fixture({ discordWebhookMode: true });
+		const content = 'Veja https://example.com/artigo';
+
+		bridge.onPapoEvent(papoMessage('pm-native-unfurl', content, { embeds: [linkPreview('artigo')] }));
+		await settle();
+
+		expect(discord.webhookSends).toHaveLength(1);
+		expect(discord.webhookSends[0]!.content).toBe(content);
+		expect(discord.webhookSends[0]!.embeds).toHaveLength(0);
+		expect(discord.webhookSends[0]!.files).toHaveLength(0);
+	});
+
+	it('ignora link-preview tardio quando o content já contém hyperlink', async () => {
+		const { bridge, discord, settle } = fixture({ discordWebhookMode: true });
+		const content = 'https://example.com/artigo';
+
+		bridge.onPapoEvent(papoMessage('pm-native-unfurl-late', content));
+		await settle();
+		bridge.onPapoEvent({
+			type: 'message_embeds_update',
+			channel_id: 'chan-1',
+			message_id: 'pm-native-unfurl-late',
+			embeds: [linkPreview('artigo')]
+		} as never);
+		await settle();
+
+		expect(discord.webhookSends).toHaveLength(1);
+		expect(discord.webhookSends[0]!.content).toBe(content);
+		expect(discord.webhookSends[0]!.embeds).toHaveLength(0);
+		expect(discord.edits).toHaveLength(0);
 	});
 
 	it('URL de GIF de provedor é encaminhada sem resolução local', async () => {
