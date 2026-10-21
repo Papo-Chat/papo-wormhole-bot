@@ -42,8 +42,6 @@ export interface ToDiscordMessageJob {
 	notes: string[];
 	sources: SourceRef[];
 	linkEmbeds?: DiscordEmbedPayload[];
-	/** Arquivos de vídeo de previews enviados como anexos independentes, sem embed visual duplicado. */
-	mediaAttachments?: { name: string; sha: string }[];
 	/** Mensagem Papo respondida (origem); a cópia Discord é resolvida na execução do job. */
 	replyRefPapoId?: string;
 }
